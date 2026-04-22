@@ -86,15 +86,6 @@ History response transparency fields (structured):
 - `history_index_rebuilt`
 - `history_index_notes`
 
-AWR snapshot mapping/debug fields (structured):
-
-- `AwrSnapshotWindowMapping.matched_snap_id`
-- `AwrSnapshotWindowMapping.matched_begin_time`
-- `AwrSnapshotWindowMapping.matched_end_time`
-- `AwrSnapshotWindowMapping.instance_count`
-- `AwrSnapshotWindowMapping.instance_rows_found`
-- `AwrRunPairWindowMapping.debug` (previous/current run timestamps, mapped snaps, same-snap flag, per-snap instance row counts)
-
 Historical transition reasoning fields (structured):
 
 - `transition_outcome` (`recovered`, `improved`, `worsened`, `unchanged`, `persisted_but_worsened`, `persisted_but_improved`)
@@ -117,12 +108,6 @@ Historical formatter behavior (standard output):
   - `History source: ...`
   - `AWR source: ...`
   - fallback summary line when applicable
-- Distinguishes AWR reason states clearly:
-  - `AWR disabled`
-  - `AWR unavailable`
-  - `AWR query failure`
-  - `AWR mapping weak / same-window weak`
-  - `AWR mapped with partial metrics`
 
 Current historical report section order:
 
@@ -209,7 +194,7 @@ Common optional env keys:
 - `db/query_deep_dive.py`: SQL_ID deep-dive evidence builder.
 - `db/plan_checks.py`: plan history and formatted plan evidence helpers.
 - `db/ash_checks.py`: ASH capability checks and ASH state extraction.
-- `db/awr_checks.py`: AWR capability checks, logical snapshot mapping (duplicate per-instance SNAP rows collapsed to one logical SNAP interval), run-to-run AWR diff logic, and snapshot-selection debug metadata.
+- `db/awr_checks.py`: AWR capability checks and run-to-run AWR diff logic.
 - `db/logs.py`: recent alert-log extraction helpers.
 - `db/log_checks.py`: ORA/TNS pattern summarization.
 - `db/module_health.py`: module-level summary generation.
@@ -227,7 +212,6 @@ Important schema groups in `models/schemas.py`:
 
 - Health snapshot models: `HealthSnapshot`, `HealthIssue`, `HealthCheckSection`, session/top-sql/tablespace/host models.
 - History models: `HistoricalRun`, `HistoryContext`, `HistoricalStateTransition`, `HistoricalRecoveryDriver`, `HistoricalResidualDriver`, `HistoricalTransitionOutcome`, `AwrFallbackInfo`, plus metric delta/confidence/timeline models.
-- AWR mapping models: `AwrSnapshotWindowMapping` (including `matched_snap_id` + instance row counters) and `AwrRunPairWindowMapping.debug`.
 - Trace/index models: `TraceHealthRunRecord`, `TraceEvidenceChunk`, `RecurringIssueIndexRecord`, `OraclePlannerMemoryRecord`, `OracleDatabaseBehaviorProfile`.
 - Planner/investigation models: `PlannerResponse`, `InvestigationReport`, `InvestigationStep`.
 - Remediation models: `RemediationProposal`, `RemediationReview`, `RemediationExecution`, `RemediationRecord`, plus blocking-specific proposal/review payloads.
@@ -284,7 +268,6 @@ Important schema groups in `models/schemas.py`:
 - `verification/test_sql_id_deep_dive.py`: SQL_ID deep-dive report behavior.
 - `verification/test_remediation_actions.py`: proposal/review/guardrail/formatter behavior for remediation.
 - `verification/test_history_state_diff.py`: historical transition/trend logic plus source transparency tests (indexed recurrence, raw fallback, stale-index handling, recovery-vs-residual ordering, and AWR fallback message sanitization).
-- `verification/test_awr_history_mapping.py`: AWR historical mapping tests (duplicate SNAP rows, enclosing timestamp mapping, run-pair debug metadata, partial metric handling, and successful 211→212-style comparison).
 
 ## History Source Semantics
 
@@ -300,13 +283,6 @@ The output explicitly reports source mode, for example:
 - `Recurring issue analysis used raw health_runs.jsonl because recurring_issues.jsonl was missing.`
 
 Planner structured output (`supporting_data.history_data_sources`) now includes the same metadata for API/debug inspection.
-
-AWR mapping semantics:
-
-- Snapshot mapping uses logical per-`SNAP_ID` aggregation over `DBA_HIST_SNAPSHOT` so duplicate rows from multiple instances do not break mapping.
-- Each run maps to a `matched_snap_id` (enclosing/nearest interval), with per-snap `instance_count` and `instance_rows_found`.
-- Run-pair mapping records internal debug metadata including selected SNAPs and same-snap detection.
-- When snapshots map but metrics are incomplete, partial AWR sections are still produced instead of full fallback.
 
 ## Runtime Artifacts and File Structures
 
@@ -505,3 +481,4 @@ Workspace venv:
 ```bash
 .venv/bin/python -m odb_autodba
 ```
+
