@@ -1,7 +1,4 @@
 # odb_autodba
-***Code is developed and tested by Devarshi Joshi**************
-This is oracle database health check repository 
-# odb_autodba
 
 Oracle AutoDBA is a local Gradio copilot for Oracle health checks, focused SQL_ID analysis, read-only investigation, historical run comparison, and guarded remediation.
 
@@ -89,6 +86,62 @@ History response transparency fields (structured):
 - `history_index_rebuilt`
 - `history_index_notes`
 
+AWR snapshot mapping/debug fields (structured):
+
+- `AwrSnapshotWindowMapping.matched_snap_id`
+- `AwrSnapshotWindowMapping.matched_begin_time`
+- `AwrSnapshotWindowMapping.matched_end_time`
+- `AwrSnapshotWindowMapping.instance_count`
+- `AwrSnapshotWindowMapping.instance_rows_found`
+- `AwrRunPairWindowMapping.debug` (previous/current run timestamps, mapped snaps, same-snap flag, per-snap instance row counts)
+
+Historical transition reasoning fields (structured):
+
+- `transition_outcome` (`recovered`, `improved`, `worsened`, `unchanged`, `persisted_but_worsened`, `persisted_but_improved`)
+- `recovery_detected`
+- `residual_risk_present`
+- `recovery_drivers[]`
+- `residual_warning_drivers[]`
+- `history_source_summary`
+- `awr_source_summary`
+- `fallback_summary`
+- `awr_fallback_info.awr_user_message` (user-safe)
+- `awr_fallback_info.awr_debug_message` (internal/debug)
+
+Historical formatter behavior (standard output):
+
+- Clearly separates **Recovery Drivers** from **Residual Warning Drivers**.
+- Uses transition-outcome-aware wording (for example, recovered/improved wording when severity drops).
+- Keeps raw implementation exceptions out of the user-facing report.
+- Shows concise source transparency:
+  - `History source: ...`
+  - `AWR source: ...`
+  - fallback summary line when applicable
+- Distinguishes AWR reason states clearly:
+  - `AWR disabled`
+  - `AWR unavailable`
+  - `AWR query failure`
+  - `AWR mapping weak / same-window weak`
+  - `AWR mapped with partial metrics`
+
+Current historical report section order:
+
+1. Historical Trend Analysis
+2. History Source
+3. State Transition Summary
+4. Recovery Drivers
+5. Residual Warning Drivers
+6. Change Since Last Report
+7. AWR Workload Changes
+8. Wait Class Shift
+9. SQL Change Summary
+10. Event Timeline
+11. Learning Features
+12. Confidence + Coverage Notes
+13. Recurring Patterns
+14. Historical Metric Points
+15. Metric Trends
+
 ## Environment
 
 The app loads `.env` with `python-dotenv`.
@@ -141,8 +194,8 @@ Common optional env keys:
 - `agents/investigation_agent.py`: read-only SQL investigation planning + execution path.
 - `agents/planner_tool_executor.py`: utility executor for planner tool names.
 - `agents/planner_tools.py`: tool schema metadata definitions.
-- `agents/root_cause_engine.py`: ranked likely-cause summarization helpers.
-- `agents/symptom_evolution.py`: trend/cause evolution helper for historical context.
+- `agents/root_cause_engine.py`: ranked likely-cause summarization helpers, including recovery vs residual historical drivers.
+- `agents/symptom_evolution.py`: trend/cause evolution helper for historical context with explicit transition-outcome/recovery/residual phrasing.
 - `agents/openai_assistant.py`: optional OpenAI helper, not required in default deterministic planner path.
 - `agents/prompts.py`: prompt constants for optional assistant/investigation contexts.
 
@@ -156,7 +209,7 @@ Common optional env keys:
 - `db/query_deep_dive.py`: SQL_ID deep-dive evidence builder.
 - `db/plan_checks.py`: plan history and formatted plan evidence helpers.
 - `db/ash_checks.py`: ASH capability checks and ASH state extraction.
-- `db/awr_checks.py`: AWR capability checks and run-to-run AWR diff logic.
+- `db/awr_checks.py`: AWR capability checks, logical snapshot mapping (duplicate per-instance SNAP rows collapsed to one logical SNAP interval), run-to-run AWR diff logic, and snapshot-selection debug metadata.
 - `db/logs.py`: recent alert-log extraction helpers.
 - `db/log_checks.py`: ORA/TNS pattern summarization.
 - `db/module_health.py`: module-level summary generation.
@@ -173,7 +226,8 @@ Common optional env keys:
 Important schema groups in `models/schemas.py`:
 
 - Health snapshot models: `HealthSnapshot`, `HealthIssue`, `HealthCheckSection`, session/top-sql/tablespace/host models.
-- History models: `HistoricalRun`, `HistoryContext`, `HistoricalStateTransition`, metric delta/confidence/timeline models.
+- History models: `HistoricalRun`, `HistoryContext`, `HistoricalStateTransition`, `HistoricalRecoveryDriver`, `HistoricalResidualDriver`, `HistoricalTransitionOutcome`, `AwrFallbackInfo`, plus metric delta/confidence/timeline models.
+- AWR mapping models: `AwrSnapshotWindowMapping` (including `matched_snap_id` + instance row counters) and `AwrRunPairWindowMapping.debug`.
 - Trace/index models: `TraceHealthRunRecord`, `TraceEvidenceChunk`, `RecurringIssueIndexRecord`, `OraclePlannerMemoryRecord`, `OracleDatabaseBehaviorProfile`.
 - Planner/investigation models: `PlannerResponse`, `InvestigationReport`, `InvestigationStep`.
 - Remediation models: `RemediationProposal`, `RemediationReview`, `RemediationExecution`, `RemediationRecord`, plus blocking-specific proposal/review payloads.
@@ -182,7 +236,7 @@ Important schema groups in `models/schemas.py`:
 
 - `history/__init__.py`: package marker.
 - `history/service.py`: thin facade over JSONL history operations, including `audit_history_pipeline(...)` passthrough for debugging.
-- `history/jsonl_service.py`: core history comparison, trend series, state transition, and source/index audit logic (index freshness, rebuild, recurrence mode, fallback notes).
+- `history/jsonl_service.py`: core history comparison, trend series, transition-outcome reasoning (`recovery_drivers` vs `residual_warning_drivers`), and source/index audit logic (index freshness, rebuild, recurrence mode, fallback notes).
 
 ### `rag/`
 
@@ -229,7 +283,8 @@ Important schema groups in `models/schemas.py`:
 - `verification/test_health_hotspots.py`: host hotspot/health formatting behavior.
 - `verification/test_sql_id_deep_dive.py`: SQL_ID deep-dive report behavior.
 - `verification/test_remediation_actions.py`: proposal/review/guardrail/formatter behavior for remediation.
-- `verification/test_history_state_diff.py`: historical transition/trend logic plus source transparency tests (indexed recurrence, raw fallback, stale-index handling, formatter source note).
+- `verification/test_history_state_diff.py`: historical transition/trend logic plus source transparency tests (indexed recurrence, raw fallback, stale-index handling, recovery-vs-residual ordering, and AWR fallback message sanitization).
+- `verification/test_awr_history_mapping.py`: AWR historical mapping tests (duplicate SNAP rows, enclosing timestamp mapping, run-pair debug metadata, partial metric handling, and successful 211→212-style comparison).
 
 ## History Source Semantics
 
@@ -245,6 +300,13 @@ The output explicitly reports source mode, for example:
 - `Recurring issue analysis used raw health_runs.jsonl because recurring_issues.jsonl was missing.`
 
 Planner structured output (`supporting_data.history_data_sources`) now includes the same metadata for API/debug inspection.
+
+AWR mapping semantics:
+
+- Snapshot mapping uses logical per-`SNAP_ID` aggregation over `DBA_HIST_SNAPSHOT` so duplicate rows from multiple instances do not break mapping.
+- Each run maps to a `matched_snap_id` (enclosing/nearest interval), with per-snap `instance_count` and `instance_rows_found`.
+- Run-pair mapping records internal debug metadata including selected SNAPs and same-snap detection.
+- When snapshots map but metrics are incomplete, partial AWR sections are still produced instead of full fallback.
 
 ## Runtime Artifacts and File Structures
 

@@ -1,0 +1,1404 @@
+from __future__ import annotations
+
+import ast
+from typing import Any
+
+from odb_autodba.agents.root_cause_engine import rank_root_causes
+from odb_autodba.models.schemas import HealthSnapshot, HistoryContext, InvestigationReport, PlannerResponse, RemediationProposal, RemediationRecord, RemediationReview, SqlIdDeepDive
+from odb_autodba.utils.severity import severity_icon, severity_rank
+
+
+STATUS_BADGES = {
+    "OK": "🟢 OK",
+    "WARNING": "🟠 WARNING",
+    "CRITICAL": "🔴 CRITICAL",
+    "INFO": "🔵 INFO",
+}
+
+STATUS_ICONS = {
+    "OK": "🟢",
+    "WARNING": "🟠",
+    "CRITICAL": "🔴",
+    "INFO": "🔵",
+}
+
+SECTION_COLUMNS = {
+    "Database Status": ["db_name", "open_mode", "database_role", "log_mode", "instance_name", "instance_status"],
+    "Alert Log Errors": ["source", "window_hours", "filter", "rows_found", "status", "ts", "severity", "code", "message"],
+    "Tablespace Usage": ["tablespace_name", "used_pct", "used_mb", "free_mb", "total_mb"],
+    "Temp Usage": ["sid", "serial_num", "username", "program", "module", "sql_id", "gb_used"],
+    "Locks And Blocking": ["waiter_sid", "waiter_user", "waiter_sql_id", "seconds_in_wait", "blocker_sid", "blocker_user", "blocker_sql_id", "blocker_program"],
+    "Objects And Validity": ["owner", "object_name", "object_type"],
+    "Redo And Archiving": ["redo_switches", "redo_per_hour", "log_mode", "archive_dest"],
+    "Backup And Recovery": ["session_key", "input_type", "status", "completed"],
+    "Scheduler Jobs": ["owner", "job_name", "status", "error", "started"],
+    "Performance Overview": ["sql_id", "plan_hash_value", "executions", "elapsed_s", "cpu_s", "ela_per_exec_s", "buffer_gets", "disk_reads"],
+    "Current Wait Profile": ["event", "wait_class", "time_waited_s", "total_waits", "avg_wait_ms"],
+    "AWR Wait Events": ["event_name", "ms_per_occ"],
+    "Cache Ratios": ["buffer_hit_pct", "library_hit_pct", "dictionary_hit_pct"],
+    "Transactions And Undo": ["sid", "serial_num", "username", "minutes", "sql_id", "tablespace_name", "used_pct"],
+    "Memory And Configuration": ["sid", "serial_num", "username", "sql_id", "spid", "pga_used_mb", "pga_alloc_mb", "program"],
+    "Init Parameters": ["name", "value"],
+    "CPU Hotspots": [
+        "row_type",
+        "os_pid",
+        "spid",
+        "process_group",
+        "cpu_pct",
+        "memory_pct",
+        "rss_mb",
+        "inst_id",
+        "sid",
+        "serial_num",
+        "username",
+        "sql_id",
+        "module",
+        "program",
+        "event",
+        "pga_used_mb",
+        "pga_alloc_mb",
+    ],
+    "Memory Hotspots": [
+        "row_type",
+        "os_pid",
+        "spid",
+        "process_group",
+        "memory_pct",
+        "rss_mb",
+        "swap_mb",
+        "inst_id",
+        "sid",
+        "serial_num",
+        "username",
+        "sql_id",
+        "module",
+        "program",
+        "event",
+        "pga_used_mb",
+        "pga_alloc_mb",
+        "temp_used_mb",
+    ],
+}
+
+
+def _heading_icon(status: str | None = None, *, informational: bool = False) -> str:
+    normalized = (status or "").upper()
+    if normalized in STATUS_ICONS:
+        return STATUS_ICONS[normalized]
+    return "🔵" if informational else "🟢"
+
+
+def _section_heading(title: str, *, level: int = 2, status: str | None = None, informational: bool = False) -> str:
+    hashes = "#" * max(level, 1)
+    return f"{hashes} {_heading_icon(status, informational=informational)} {title}"
+
+
+def _status_rank(status: str) -> int:
+    normalized = (status or "INFO").upper()
+    if normalized == "INFO":
+        return 0
+    if normalized in {"OK", "WARNING", "CRITICAL"}:
+        return severity_rank(normalized)
+    return 0
+
+
+def _worst_status(statuses: list[str], *, default: str = "OK") -> str:
+    clean = [str(status or "INFO").upper() for status in statuses if status]
+    return max(clean or [default], key=_status_rank)
+
+
+def _overall_snapshot_status(snapshot: HealthSnapshot) -> str:
+    statuses = [issue.severity for issue in snapshot.issues]
+    statuses.extend(item.severity for item in snapshot.actionable_items)
+    statuses.extend(str(section.status) for section in snapshot.health_sections if str(section.status) != "INFO")
+    return _worst_status(statuses)
+
+
+def _findings_status(snapshot: HealthSnapshot) -> str:
+    return _worst_status([item.severity for item in snapshot.actionable_items], default="OK")
+
+
+def _sanitize_fixed_cell(value: Any, width: int) -> str:
+    text = _format_value(value, max_length=max(width, 8))
+    if len(text) > width:
+        return f"{text[: max(width - 1, 1)]}…"
+    return text
+
+
+def format_dba_table(rows: list[dict[str, Any]], columns: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "None"
+    widths = [int(column.get("width", 12)) for column in columns]
+    headers = [str(column.get("header") or column.get("key") or "") for column in columns]
+    lines = [
+        "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)),
+        "  ".join("-" * widths[index] for index in range(len(widths))),
+    ]
+    for row in rows:
+        parts = []
+        for index, column in enumerate(columns):
+            key = column.get("key") or column.get("header")
+            getter = column.get("getter")
+            value = getter(row) if callable(getter) else row.get(key)
+            parts.append(_sanitize_fixed_cell(value, widths[index]).ljust(widths[index]))
+        lines.append("  ".join(parts).rstrip())
+    return "\n".join(lines)
+
+
+def _render_dba_code_table(rows: list[dict[str, Any]], columns: list[dict[str, Any]]) -> str:
+    return "```text\n" + format_dba_table(rows, columns) + "\n```"
+
+
+def _render_markdown_kv_table(rows: list[tuple[str, Any]]) -> str:
+    return _render_dba_code_table(
+        [{"metric": label, "value": value} for label, value in rows],
+        [
+            {"header": "metric", "width": 28, "key": "metric"},
+            {"header": "value", "width": 70, "key": "value"},
+        ],
+    )
+
+
+def _render_horizontal_kv_block(rows: list[tuple[str, Any]], *, columns: int = 2) -> list[str]:
+    formatted = [(str(label), _format_value(value, max_length=80)) for label, value in rows]
+    if not formatted:
+        return ["```text", "None", "```"]
+    effective_columns = max(1, columns)
+    label_widths = [0] * effective_columns
+    value_widths = [0] * effective_columns
+    for index, (label, value) in enumerate(formatted):
+        column_index = index % effective_columns
+        label_widths[column_index] = max(label_widths[column_index], len(label))
+        value_widths[column_index] = max(value_widths[column_index], len(value))
+    lines = ["```text"]
+    for index in range(0, len(formatted), effective_columns):
+        chunk = formatted[index : index + effective_columns]
+        parts = []
+        for offset, (label, value) in enumerate(chunk):
+            parts.append(f"{label:<{label_widths[offset]}} : {value:<{value_widths[offset]}}")
+        lines.append("   ".join(parts).rstrip())
+    lines.append("```")
+    return lines
+
+
+def render_planner_response(response: PlannerResponse) -> str:
+    return response.body_markdown
+
+
+def render_health_snapshot_report(snapshot: HealthSnapshot) -> str:
+    database_name = snapshot.instance_info.db_name or snapshot.instance_info.instance_name or "unknown"
+    overall_status = _overall_snapshot_status(snapshot)
+    lines = [
+        "# Oracle AutoDBA Report",
+        "",
+        f"**Database:** `{database_name}`",
+        f"**Open mode / role:** `{snapshot.instance_info.open_mode}` / `{snapshot.instance_info.database_role}`",
+        f"**Generated at:** `{snapshot.generated_at}`",
+        f"**Overall status:** {_status_badge(overall_status)}",
+        "",
+        _section_heading("Executive Summary", status=overall_status),
+        "",
+        _render_executive_summary(snapshot),
+        "",
+        _section_heading("Key Health Signals", informational=True),
+        "",
+        _render_key_signals(snapshot),
+        "",
+        _section_heading("Findings Needing Attention", status=_findings_status(snapshot)),
+        "",
+        _render_actionable_items(snapshot),
+        "",
+        _section_heading("Likely Causes", informational=True),
+        "",
+        _render_likely_causes(snapshot),
+        "",
+        _section_heading("Top SQL by CPU", status="WARNING" if snapshot.top_sql_by_cpu else "OK"),
+        "",
+        _render_top_cpu_sql(snapshot),
+        "",
+        _section_heading("Top SQL by Elapsed", status="WARNING" if snapshot.top_sql_by_elapsed else "OK"),
+        "",
+        _render_top_elapsed_sql(snapshot),
+        "",
+        _top_sql_overlap_note(snapshot),
+        "",
+        _section_heading("Detailed Evidence", informational=True),
+        "",
+    ]
+    for section in snapshot.health_sections:
+        lines.extend(_render_health_section(section))
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def render_history_answer(answer: dict[str, Any]) -> str:
+    context: HistoryContext | None = answer.get("context")
+    series = answer.get("series") or []
+    summary_lines = answer.get("summary_lines") or []
+    domain = answer.get("domain")
+    time_scope = answer.get("time_scope") or {}
+    transition = answer.get("state_transition") or (context.state_transition if context else None)
+    awr_state_diff = answer.get("awr_state_diff") or (transition.awr_state_diff if transition else None)
+    history_source = answer.get("history_source_summary") or answer.get("history_source_note") or (
+        f"History source: {answer.get('history_source_used') or (context.history_source_used if context else 'raw JSONL only')}."
+    )
+    awr_source_summary = answer.get("awr_source_summary") or (transition.awr_source_summary if transition else None)
+    fallback_summary = answer.get("fallback_summary") or (transition.fallback_summary if transition else None)
+    transition_data = _history_mapping(transition)
+    awr_data = _history_mapping(awr_state_diff)
+    learning_data = _history_mapping(answer.get("learning_features") or (transition.learning_features if transition else None))
+    fallback_info = _history_mapping(transition_data.get("awr_fallback_info"))
+    section_naming = _history_mapping(transition_data.get("section_naming"))
+    primary_driver_title = section_naming.get("primary_driver_section_title") or _primary_driver_title_for_outcome(
+        str(transition_data.get("transition_outcome") or "unchanged")
+    )
+    secondary_driver_title = section_naming.get("secondary_driver_section_title") or _secondary_driver_title_for_outcome(
+        str(transition_data.get("transition_outcome") or "unchanged")
+    )
+    lines = [
+        "# Oracle Historical Trend Analysis",
+        "",
+    ]
+    header_rows: list[tuple[str, Any]] = []
+    if time_scope.get("label"):
+        header_rows.append(("Window", time_scope["label"]))
+    if domain:
+        header_rows.append(("Focus", domain))
+    if context is not None:
+        header_rows.extend(
+            [
+                ("Saved runs", len(context.recent_runs)),
+                ("Recurring findings", len(context.recurring_findings)),
+                ("Trace references", len(context.trace_paths)),
+            ]
+        )
+    if header_rows:
+        lines.extend(_render_horizontal_kv_block(header_rows, columns=2))
+        lines.append("")
+
+    lines.extend([_section_heading("History Source", informational=True), ""])
+    lines.append(f"- {history_source}")
+    if awr_source_summary:
+        lines.append(f"- {awr_source_summary}")
+    if fallback_summary and str(fallback_summary).strip():
+        lines.append(f"- {fallback_summary}")
+
+    lines.extend(["", _section_heading("State Transition Summary", informational=True), ""])
+    if transition_data.get("available"):
+        outcome = transition_data.get("transition_outcome") or "unchanged"
+        lines.append(
+            "- "
+            + (
+                f"Status transition: {transition_data.get('status_transition') or 'unknown'} "
+                f"(outcome={outcome}, confidence={transition_data.get('confidence') or 'LOW'})."
+            )
+        )
+    else:
+        lines.append("- State transition data unavailable.")
+    summary_without_source = [
+        line
+        for line in (summary_lines or [])
+        if not str(line).lower().startswith("history source:")
+    ]
+    lines.extend(f"- {line}" for line in (summary_without_source[:4] or ["No saved Oracle health traces matched this request."]))
+
+    lines.extend(["", _section_heading(primary_driver_title, informational=True), ""])
+    recovery_rows = transition_data.get("recovery_drivers") if isinstance(transition_data.get("recovery_drivers"), list) else []
+    if recovery_rows:
+        rows = [
+            {
+                "driver": row.get("title"),
+                "category": row.get("category"),
+                "score": row.get("score"),
+                "evidence": "; ".join((row.get("evidence") or [])[:2]),
+            }
+            for row in recovery_rows[:5]
+        ]
+        lines.append(_render_table(rows, ["driver", "category", "score", "evidence"]))
+    else:
+        lines.append(_primary_driver_empty_text(primary_driver_title))
+
+    lines.extend(["", _section_heading(secondary_driver_title, informational=True), ""])
+    residual_rows = transition_data.get("residual_warning_drivers") if isinstance(transition_data.get("residual_warning_drivers"), list) else []
+    if residual_rows:
+        rows = [
+            {
+                "driver": row.get("title"),
+                "category": row.get("category"),
+                "score": row.get("score"),
+                "evidence": "; ".join((row.get("evidence") or [])[:2]),
+                "follow_up": row.get("follow_up_reason"),
+            }
+            for row in residual_rows[:6]
+        ]
+        lines.append(_render_table(rows, ["driver", "category", "score", "evidence", "follow_up"]))
+    else:
+        lines.append(_secondary_driver_empty_text(secondary_driver_title))
+
+    lines.extend(["", _section_heading("Change Since Last Report", informational=True), ""])
+    issue_rows = transition_data.get("historical_issue_states") or transition_data.get("issue_transitions")
+    if issue_rows:
+        cols = ["title", "category", "state_label", "transition", "previous_severity", "current_severity", "impact_changed"]
+        lines.append(_render_table(issue_rows[:16], cols))
+    else:
+        lines.append("No issue-transition rows were captured.")
+
+    lines.extend(["", _section_heading("AWR Workload Changes", informational=True), ""])
+    workload_metric_rows = awr_data.get("workload_metrics") if isinstance(awr_data.get("workload_metrics"), list) else []
+    if not workload_metric_rows:
+        load_profile_rows = awr_data.get("load_profile") if isinstance(awr_data.get("load_profile"), list) else []
+        workload_metric_rows = [
+            {
+                "metric_name": row.get("metric_name"),
+                "previous_value": row.get("previous"),
+                "current_value": row.get("current"),
+                "delta_value": row.get("delta"),
+                "percent_delta": row.get("pct_change"),
+                "significance": row.get("significance"),
+                "interpretation": row.get("interpretation"),
+            }
+            for row in load_profile_rows
+        ]
+    historical_confidence = _history_mapping(transition_data.get("historical_confidence"))
+    if workload_metric_rows:
+        awr_rows = []
+        for row in workload_metric_rows[:20]:
+            awr_rows.append(
+                {
+                    "metric": row.get("metric_name"),
+                    "previous": _format_metric_number(row.get("previous_value")),
+                    "current": _format_metric_number(row.get("current_value")),
+                    "delta": _format_signed_metric_number(row.get("delta_value")),
+                    "%delta": _format_percent_delta(row.get("percent_delta")),
+                    "significance": row.get("significance") or "-",
+                    "interpretation": row.get("interpretation") or "-",
+                }
+            )
+        lines.append(_render_table(awr_rows, ["metric", "previous", "current", "delta", "%delta", "significance", "interpretation"]))
+        awr_workload_interpretation = transition_data.get("awr_workload_interpretation") or _history_mapping(awr_data.get("workload_interpretation")).get("summary")
+        if awr_workload_interpretation:
+            lines.append(f"- {awr_workload_interpretation}")
+    else:
+        fallback_reason = fallback_info.get("awr_user_message") or historical_confidence.get("fallback_reason") or "AWR workload comparison unavailable; JSONL fallback used."
+        lines.append(f"AWR workload comparison fallback: {fallback_reason}")
+
+    lines.extend(["", _section_heading("Wait Class Shift", informational=True), ""])
+    wait_shift = _history_mapping(awr_data.get("wait_shift_summary")) or _history_mapping(awr_data.get("wait_class_shift"))
+    if wait_shift:
+        wait_summary_rows = [
+            {
+                "previous_dominant_wait_class": wait_shift.get("previous_dominant_wait_class") or wait_shift.get("dominant_wait_class_previous") or "-",
+                "current_dominant_wait_class": wait_shift.get("current_dominant_wait_class") or wait_shift.get("dominant_wait_class_current") or "-",
+                "previous_top_event": wait_shift.get("previous_top_event") or "-",
+                "current_top_event": wait_shift.get("current_top_event") or "-",
+                "wait_class_shift_flag": wait_shift.get("wait_class_shift_flag"),
+                "cpu_to_io_shift": wait_shift.get("cpu_to_io_shift"),
+                "cpu_to_concurrency_shift": wait_shift.get("cpu_to_concurrency_shift"),
+                "interpretation": wait_shift.get("interpretation") or "No material wait-class shift detected.",
+            }
+        ]
+        lines.append(_render_table(wait_summary_rows, list(wait_summary_rows[0].keys())))
+    else:
+        lines.append("Wait-class shift evidence unavailable.")
+
+    lines.extend(["", _section_heading("SQL Change Summary", informational=True), ""])
+    sql_change = _history_mapping(awr_data.get("sql_change_summary")) or _history_mapping(awr_data.get("sql_change"))
+    if sql_change:
+        sql_summary_rows = [
+            {
+                "dominant_sql_id_previous": sql_change.get("dominant_sql_id_previous"),
+                "dominant_sql_id_current": sql_change.get("dominant_sql_id_current"),
+                "dominant_sql_schema_previous": sql_change.get("dominant_sql_schema_previous") or "-",
+                "dominant_sql_schema_current": sql_change.get("dominant_sql_schema_current") or "-",
+                "dominant_sql_module_previous": sql_change.get("dominant_sql_module_previous") or "-",
+                "dominant_sql_module_current": sql_change.get("dominant_sql_module_current") or "-",
+                "dominant_sql_class_previous": sql_change.get("dominant_sql_class_previous") or "-",
+                "dominant_sql_class_current": sql_change.get("dominant_sql_class_current") or "-",
+                "sql_regression_flag": sql_change.get("sql_regression_flag"),
+                "sql_regression_severity": sql_change.get("sql_regression_severity") or "-",
+                "plan_hash_changed_flag": sql_change.get("plan_hash_changed_flag"),
+                "elapsed_per_exec_spike": sql_change.get("elapsed_per_exec_spike"),
+                "cpu_per_exec_spike": sql_change.get("cpu_per_exec_spike"),
+                "interpretation": sql_change.get("interpretation") or "-",
+            }
+        ]
+        lines.append(_render_table(sql_summary_rows, list(sql_summary_rows[0].keys())))
+    else:
+        lines.append("AWR SQL-change intelligence unavailable; SQL regression inferred from JSONL metric deltas when possible.")
+
+    lines.extend(["", _section_heading("Event Timeline", informational=True), ""])
+    timeline_entries = transition_data.get("event_timeline_entries")
+    if isinstance(timeline_entries, list) and timeline_entries:
+        for row in timeline_entries[:8]:
+            notes = "; ".join((row.get("change_notes") or [])[:3])
+            lines.append(f"- {row.get('at')}: {row.get('summary')} ({notes})")
+    elif context is not None and context.recent_runs:
+        lines.extend(f"- {run.completed_at}: {run.summary}" for run in context.recent_runs[:8])
+    else:
+        lines.append("- Event timeline unavailable.")
+
+    lines.extend(["", _section_heading("Learning Features", informational=True), ""])
+    if learning_data:
+        learning_rows = [{"feature": key, "value": value} for key, value in learning_data.items()]
+        lines.append(_render_table(learning_rows, ["feature", "value"]))
+    else:
+        lines.append("Learning-feature vector unavailable.")
+
+    lines.extend(["", _section_heading("Confidence + Coverage Notes", informational=True), ""])
+    coverage_notes = transition_data.get("coverage_notes") if isinstance(transition_data.get("coverage_notes"), list) else []
+    snapshot_mapping_summary = transition_data.get("snapshot_mapping_summary")
+    window_mapping = _history_mapping(awr_data.get("window_mapping"))
+    previous_window = _history_mapping(window_mapping.get("previous"))
+    current_window = _history_mapping(window_mapping.get("current"))
+    if historical_confidence:
+        history_source_note = str(transition_data.get("history_source_summary") or historical_confidence.get("history_source_used") or "-")
+        awr_source_note = str(transition_data.get("awr_source_summary") or "-")
+        if history_source_note.lower().startswith("history source:"):
+            history_source_note = history_source_note.split(":", 1)[1].strip()
+        if awr_source_note.lower().startswith("awr source:"):
+            awr_source_note = awr_source_note.split(":", 1)[1].strip()
+        lines.append(f"- Confidence: {historical_confidence.get('confidence_level') or 'LOW'}")
+        lines.append(f"- Coverage: {historical_confidence.get('coverage_quality') or 'LOW'}")
+        lines.append(f"- History source: {history_source_note}")
+        lines.append(f"- AWR source: {awr_source_note}")
+        if historical_confidence.get("confidence_reason"):
+            lines.append(f"- Confidence reason: {historical_confidence.get('confidence_reason')}")
+        if historical_confidence.get("fallback_reason"):
+            lines.append(f"- Fallback: {historical_confidence.get('fallback_reason')}")
+    else:
+        snapshot_quality = _history_mapping(awr_data.get("snapshot_quality"))
+        if snapshot_quality:
+            lines.append(
+                "- "
+                + (
+                    f"AWR coverage={snapshot_quality.get('coverage_quality')}, "
+                    f"comparability={snapshot_quality.get('comparability_score')}, "
+                    f"confidence={snapshot_quality.get('confidence')}."
+                )
+            )
+    if previous_window.get("begin_snap_id") is not None:
+        lines.append(f"- Previous window: SNAP {previous_window.get('begin_snap_id')}..{previous_window.get('end_snap_id')}")
+    if current_window.get("begin_snap_id") is not None:
+        lines.append(f"- Current window: SNAP {current_window.get('begin_snap_id')}..{current_window.get('end_snap_id')}")
+    if snapshot_mapping_summary and previous_window.get("begin_snap_id") is None and current_window.get("begin_snap_id") is None:
+        lines.append(f"- Snapshot mapping: {snapshot_mapping_summary}")
+    if coverage_notes:
+        deduped = _dedupe_strings(coverage_notes)
+        lines.extend(f"- {note}" for note in deduped[:3])
+
+    lines.extend(["", _section_heading("Recurring Patterns", status="WARNING" if context and context.recurring_findings else "OK"), ""])
+    ranked_recurring = transition_data.get("recurring_patterns_ranked") or (context.recurring_findings if context else [])
+    if ranked_recurring:
+        lines.extend(f"- {finding}" for finding in ranked_recurring[:10])
+    else:
+        lines.append("- No recurring patterns were detected.")
+
+    if series:
+        keys = _history_series_columns(series)
+        lines.extend(["", _section_heading("Historical Metric Points", informational=True), "", _render_table(series[-20:], keys)])
+
+    if context is not None and context.trend_summaries:
+        trend_rows = [
+            {
+                "Metric": trend.metric_name,
+                "Direction": trend.direction,
+                "Latest": trend.latest_value,
+                "Previous": trend.previous_value,
+                "Min": trend.min_value,
+                "Max": trend.max_value,
+                "Samples": trend.sample_count,
+            }
+            for trend in context.trend_summaries[:14]
+        ]
+        lines.extend(["", _section_heading("Metric Trends", informational=True), "", _render_table(trend_rows, ["Metric", "Direction", "Latest", "Previous", "Min", "Max", "Samples"])])
+    return "\n".join(lines).strip()
+
+
+def render_sql_id_deep_dive_report(deep_dive: SqlIdDeepDive) -> str:
+    classification = _deep_dive_mapping(deep_dive.classification)
+    wait_profile = _deep_dive_mapping(deep_dive.wait_profile)
+    impact = _deep_dive_mapping(deep_dive.impact_summary)
+    execution_plan = _deep_dive_mapping(deep_dive.execution_plan)
+    dba_recommendation = _deep_dive_mapping(deep_dive.dba_recommendation)
+    plan_analysis = _deep_dive_mapping(deep_dive.plan_analysis)
+    history_analysis = _deep_dive_mapping(deep_dive.history_analysis)
+    risk_summary = _deep_dive_mapping(deep_dive.risk_summary)
+    lock_analysis = _deep_dive_mapping(deep_dive.lock_analysis)
+    ash = _deep_dive_mapping(deep_dive.ash)
+    awr = _deep_dive_mapping(deep_dive.awr)
+
+    wait_events = wait_profile.get("event_breakdown") if isinstance(wait_profile.get("event_breakdown"), list) else []
+    plan_lines = execution_plan.get("lines") if isinstance(execution_plan.get("lines"), list) else []
+    history_runs = history_analysis.get("matched_runs") if isinstance(history_analysis.get("matched_runs"), list) else []
+    risk_reasons = risk_summary.get("reason_lines") if isinstance(risk_summary.get("reason_lines"), list) else []
+    lock_rows = lock_analysis.get("blocking_rows") if isinstance(lock_analysis.get("blocking_rows"), list) else []
+    awr_plan_changes = awr.get("plan_changes") if isinstance(awr.get("plan_changes"), list) else []
+    ash_top_waits = ash.get("top_waits") if isinstance(ash.get("top_waits"), list) else []
+
+    lines = [
+        f"# SQL_ID Deep Dive — {deep_dive.sql_id}",
+        "",
+        "## SQL Text",
+        "```sql",
+        deep_dive.sql_text or "SQL text not found.",
+        "```",
+        "",
+        "## SQL Classification",
+        _render_sql_metric_table(classification, default_text="Classification evidence was not available."),
+        "",
+        "## Current Cursor Evidence",
+        _render_sql_metric_table(deep_dive.current_stats, default_text="No current cursor statistics were captured."),
+        "",
+        "## Live Session Correlation",
+        _render_sql_rows(deep_dive.active_queries[:25], default_text="No live session currently executing this SQL_ID."),
+        "",
+        _render_sql_rows(lock_rows[:20], default_text="This SQL_ID was not found in current blocking chains."),
+        "",
+        "## SQL Wait Profile",
+        _render_sql_metric_table(
+            {k: v for k, v in wait_profile.items() if k not in {"event_breakdown", "notes", "interpretation"}},
+            default_text="Wait-profile summary is unavailable.",
+        ),
+        "",
+        _render_sql_rows(wait_events[:15], default_text="No wait-event breakdown rows were captured."),
+        "",
+        (wait_profile.get("interpretation") or "No wait-profile interpretation available."),
+        "",
+        "## Impact Summary",
+        _render_sql_metric_table(impact, default_text="Impact summary is unavailable."),
+        "",
+        "## Child Cursor Summary",
+        _render_sql_rows(deep_dive.child_cursors[:20], default_text="No child cursor rows were captured."),
+        "",
+        "## Execution Plan",
+        _render_execution_plan_block(plan_lines) if plan_lines else _render_sql_rows(deep_dive.plan_lines[:40], default_text="No execution plan rows were captured."),
+        "",
+        "## Plan Interpretation",
+        (execution_plan.get("interpretation") or "Plan interpretation was not available."),
+        "",
+        _render_sql_metric_table(
+            {
+                "source_used": execution_plan.get("source_used"),
+                "join_types": execution_plan.get("join_types"),
+                "access_paths": execution_plan.get("access_paths"),
+                "full_scan_objects": execution_plan.get("full_scan_objects"),
+                "index_access_objects": execution_plan.get("index_access_objects"),
+                "predicate_summary": execution_plan.get("predicate_summary"),
+            },
+            default_text="No additional plan interpretation details were captured.",
+        ),
+        "",
+        "## Plan Stability Analysis",
+        _render_sql_metric_table(plan_analysis, default_text="Plan stability evidence was unavailable."),
+        "",
+        _render_sql_metric_table(
+            {k: v for k, v in awr.items() if k not in {"plan_changes"}},
+            default_text="AWR summary was unavailable.",
+        ),
+        "",
+        _render_sql_rows(awr_plan_changes[:10], default_text="No AWR plan-change rows were captured."),
+        "",
+        _render_sql_metric_table(
+            {k: v for k, v in ash.items() if k not in {"top_waits"}},
+            default_text="ASH summary was unavailable.",
+        ),
+        "",
+        _render_sql_rows(ash_top_waits[:10], default_text="No ASH wait rows were captured."),
+        "",
+        "## Historical Recurrence",
+        _render_sql_metric_table(
+            {k: v for k, v in history_analysis.items() if k not in {"matched_runs", "cpu_seconds_samples", "elapsed_seconds_samples"}},
+            default_text="Historical recurrence evidence was unavailable.",
+        ),
+        "",
+        _render_sql_rows(history_runs[:10], default_text="No historical run matched this SQL_ID in saved traces."),
+        "",
+        "## Risk Verdict",
+        _render_sql_metric_table(
+            {k: v for k, v in risk_summary.items() if k != "reason_lines"},
+            default_text="Risk summary was unavailable.",
+        ),
+        "",
+        "\n".join(f"- {reason}" for reason in risk_reasons) if risk_reasons else "- No risk reasons were captured.",
+        "",
+        "## DBA Recommendation",
+        _render_sql_metric_table(
+            {
+                "severity": dba_recommendation.get("severity"),
+                "recommendation": dba_recommendation.get("recommendation"),
+                "rationale": dba_recommendation.get("rationale"),
+                "next_actions": dba_recommendation.get("next_actions"),
+            },
+            default_text="No DBA recommendation was produced.",
+        ),
+        "",
+        "## Collector Notes",
+        "\n".join(f"- {note}" for note in deep_dive.notes[:20]) if deep_dive.notes else "- No collection warnings.",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _render_execution_plan_block(lines: list[Any]) -> str:
+    if not lines:
+        return "No execution plan lines were captured."
+    text = "\n".join(str(line) for line in lines[:500])
+    return f"```text\n{text}\n```"
+
+
+def _render_sql_metric_table(payload: Any, *, default_text: str) -> str:
+    mapping = _deep_dive_mapping(payload)
+    if not mapping:
+        return default_text
+    rows = [{"metric": key, "value": value} for key, value in mapping.items()]
+    return _render_dba_code_table(
+        rows,
+        [
+            {"header": "metric", "width": 34, "key": "metric"},
+            {"header": "value", "width": 78, "key": "value"},
+        ],
+    )
+
+
+def _render_sql_rows(rows: list[dict[str, Any]], *, default_text: str) -> str:
+    if not rows:
+        return default_text
+    return _render_table(rows, _infer_columns(rows, limit=8))
+
+
+def _deep_dive_mapping(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if hasattr(payload, "model_dump"):
+        try:
+            out = payload.model_dump(mode="json")
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _history_mapping(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if hasattr(payload, "model_dump"):
+        try:
+            dumped = payload.model_dump(mode="json")
+            return dumped if isinstance(dumped, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _primary_driver_title_for_outcome(outcome: str) -> str:
+    if outcome in {"recovered", "improved", "persisted_but_improved"}:
+        return "Recovery Drivers"
+    if outcome in {"worsened", "persisted_but_worsened"}:
+        return "Incident Drivers"
+    return "Persistent Drivers"
+
+
+def _secondary_driver_title_for_outcome(outcome: str) -> str:
+    if outcome in {"recovered", "improved", "persisted_but_improved"}:
+        return "Residual Warning Drivers"
+    if outcome in {"worsened", "persisted_but_worsened"}:
+        return "Persistent Background Risks"
+    return "Worsening Signals"
+
+
+def _primary_driver_empty_text(title: str) -> str:
+    if "Recovery" in title:
+        return "No material recovery drivers identified."
+    if "Incident" in title or "Risk" in title:
+        return "No material incident drivers identified."
+    return "No material persistent drivers identified."
+
+
+def _secondary_driver_empty_text(title: str) -> str:
+    if "Residual" in title:
+        return "No residual warning drivers identified."
+    if "Risk" in title:
+        return "No persistent background risks identified."
+    return "No worsening signals identified."
+
+
+def _format_metric_number(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    if abs(number) >= 1000:
+        return f"{number:,.1f}"
+    if abs(number) >= 100:
+        return f"{number:.1f}"
+    return f"{number:.2f}"
+
+
+def _format_signed_metric_number(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    if number > 0:
+        return f"+{_format_metric_number(number)}"
+    return _format_metric_number(number)
+
+
+def _format_percent_delta(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    sign = "+" if number > 0 else ""
+    return f"{sign}{number:.2f}%"
+
+
+def _dedupe_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
+
+
+def _render_executive_summary(snapshot: HealthSnapshot) -> str:
+    rows = []
+    if snapshot.health_sections:
+        for section in snapshot.health_sections:
+            rows.append(
+                {
+                    "Check": section.name,
+                    "Status": _status_badge(str(section.status)),
+                    "Summary": section.summary,
+                }
+            )
+    else:
+        rows = [
+            {"Check": "Active Sessions", "Status": _status_badge("INFO"), "Summary": f"{snapshot.session_summary.active_sessions} active session(s)."},
+            {"Check": "Blocking Chains", "Status": _status_badge("CRITICAL" if snapshot.blocking_chains else "OK"), "Summary": f"{len(snapshot.blocking_chains)} blocking chain(s)."},
+            {"Check": "Tablespace Usage", "Status": _status_badge("INFO"), "Summary": _highest_tablespace(snapshot)},
+        ]
+    return _render_table(rows, ["Check", "Status", "Summary"])
+
+
+def _render_key_signals(snapshot: HealthSnapshot) -> str:
+    critical_count = sum(1 for item in snapshot.actionable_items if item.severity == "CRITICAL")
+    warning_count = sum(1 for item in snapshot.actionable_items if item.severity == "WARNING")
+    return "\n".join(
+        _render_horizontal_kv_block(
+            [
+                ("Active sessions", snapshot.session_summary.active_sessions),
+                ("Blocking chains", len(snapshot.blocking_chains)),
+                ("ORA/TNS rows", len(snapshot.raw_evidence.get("alert_log") or [])),
+                ("Highest tablespace", _highest_tablespace(snapshot)),
+                ("Actionable findings", f"{len(snapshot.actionable_items)} ({critical_count} critical, {warning_count} warning)"),
+                ("Host checks", "Included" if snapshot.host_snapshot else "Disabled"),
+            ],
+            columns=2,
+        )
+    )
+
+
+def _render_actionable_items(snapshot: HealthSnapshot) -> str:
+    if not snapshot.actionable_items:
+        return f"{_status_badge('OK')} No critical or warning action items were generated by the rules."
+    sorted_items = sorted(snapshot.actionable_items, key=lambda item: 0 if item.severity == "CRITICAL" else 1)
+    summary_rows = [
+        {
+            "Status": _status_badge(item.severity),
+            "Finding": item.title,
+            "Detail": item.detail,
+            "Recommended Next Step": item.recommendation,
+        }
+        for item in sorted_items
+    ]
+    blocks: list[str] = [_render_table(summary_rows, ["Status", "Finding", "Detail", "Recommended Next Step"])]
+    evidence_blocks: list[str] = []
+    for item in sorted_items:
+        block = [
+            f"### Evidence: {item.title}",
+            "",
+            f"**Status:** {_status_badge(item.severity)}",
+        ]
+        evidence_rows = [_coerce_mapping(row) for row in item.evidence[:5]]
+        evidence_rows = [row for row in evidence_rows if row]
+        if evidence_rows:
+            block.extend(["", "**Evidence:**", "", _render_compact_evidence(evidence_rows)])
+        elif item.evidence:
+            block.extend(["", "**Evidence:**"])
+            block.extend(f"- {_format_value(row)}" for row in item.evidence[:5])
+        else:
+            continue
+        evidence_blocks.append("\n".join(block))
+    output = blocks[0]
+    if evidence_blocks:
+        output += "\n\n#### Supporting Evidence\n\n" + "\n\n".join(evidence_blocks)
+    return output
+
+
+def _render_likely_causes(snapshot: HealthSnapshot) -> str:
+    causes = rank_root_causes(snapshot) or ["No dominant root cause identified from the current evidence."]
+    return "\n".join(f"- {cause}" for cause in causes)
+
+
+def _render_issue_evidence(snapshot: HealthSnapshot) -> str:
+    if not snapshot.issues:
+        return f"{_status_badge('OK')} No issues generated from the current evidence."
+    rows = [
+        {
+            "Status": _status_badge(issue.severity),
+            "Issue": issue.title,
+            "Evidence": issue.description,
+            "Recommendation": issue.recommendation,
+        }
+        for issue in snapshot.issues[:12]
+    ]
+    return _render_table(rows, ["Status", "Issue", "Evidence", "Recommendation"])
+
+
+def _render_top_cpu_sql(snapshot: HealthSnapshot) -> str:
+    if not snapshot.top_sql_by_cpu:
+        return "No top SQL by CPU rows were captured."
+    rows = [
+        {
+            "SQL_ID": row.sql_id,
+            "Schema/User": row.parsing_schema_name or row.username,
+            "Module": row.module,
+            "Program": row.program,
+            "CPU(s)": row.cpu_s,
+            "CPU/Exec(s)": row.cpu_per_exec_s,
+            "Elapsed(s)": row.elapsed_s,
+            "Ela/Exec(s)": row.ela_per_exec_s,
+            "Execs": row.executions,
+            "LIO/Exec": row.buffer_gets_per_exec,
+            "PIO/Exec": row.disk_reads_per_exec,
+            "Rows/Exec": row.rows_processed_per_exec,
+            "Last Active": row.last_active_time,
+            "Class": row.sql_classification,
+            "Workload": row.workload_interpretation,
+        }
+        for row in snapshot.top_sql_by_cpu[:5]
+    ]
+    return _render_top_sql_table(rows)
+
+
+def _render_top_elapsed_sql(snapshot: HealthSnapshot) -> str:
+    if not snapshot.top_sql_by_elapsed:
+        return "No top SQL by elapsed time rows were captured."
+    rows = [
+        {
+            "SQL_ID": row.sql_id,
+            "Schema/User": row.parsing_schema_name or row.username,
+            "Module": row.module,
+            "Program": row.program,
+            "Elapsed(s)": row.elapsed_s,
+            "Ela/Exec(s)": row.ela_per_exec_s,
+            "CPU(s)": row.cpu_s,
+            "CPU/Exec(s)": row.cpu_per_exec_s,
+            "Execs": row.executions,
+            "LIO/Exec": row.buffer_gets_per_exec,
+            "PIO/Exec": row.disk_reads_per_exec,
+            "Rows/Exec": row.rows_processed_per_exec,
+            "Last Active": row.last_active_time,
+            "Class": row.sql_classification,
+            "Workload": row.workload_interpretation,
+        }
+        for row in snapshot.top_sql_by_elapsed[:5]
+    ]
+    return _render_top_sql_table(rows)
+
+
+def _top_sql_overlap_note(snapshot: HealthSnapshot) -> str:
+    cpu_ids = [row.sql_id for row in (snapshot.top_sql_by_cpu or [])[:5] if row.sql_id]
+    elapsed_ids = [row.sql_id for row in (snapshot.top_sql_by_elapsed or [])[:5] if row.sql_id]
+    if not cpu_ids or not elapsed_ids:
+        return "Top SQL overlap note unavailable."
+    overlap = sorted(set(cpu_ids) & set(elapsed_ids))
+    if not overlap:
+        return "Top elapsed and top CPU SQL sets do not overlap materially in this snapshot."
+    overlap_ratio = len(overlap) / float(max(min(len(cpu_ids), len(elapsed_ids)), 1))
+    if overlap_ratio >= 0.6:
+        return f"Top elapsed and top CPU SQL sets largely overlap: {', '.join(overlap[:5])}."
+    return f"Top elapsed and top CPU SQL sets partially overlap: {', '.join(overlap[:5])}."
+
+
+def _render_top_sql_table(rows: list[dict[str, Any]]) -> str:
+    return _render_dba_code_table(
+        rows,
+        [
+            {"header": "sql_id", "width": 13, "key": "SQL_ID"},
+            {"header": "schema_user", "width": 14, "key": "Schema/User"},
+            {"header": "module", "width": 24, "key": "Module"},
+            {"header": "program", "width": 22, "key": "Program"},
+            {"header": "elapsed_s", "width": 10, "key": "Elapsed(s)"},
+            {"header": "ela_exec_s", "width": 10, "key": "Ela/Exec(s)"},
+            {"header": "cpu_s", "width": 10, "key": "CPU(s)"},
+            {"header": "cpu_exec_s", "width": 10, "key": "CPU/Exec(s)"},
+            {"header": "execs", "width": 8, "key": "Execs"},
+            {"header": "lio_exec", "width": 10, "key": "LIO/Exec"},
+            {"header": "pio_exec", "width": 10, "key": "PIO/Exec"},
+            {"header": "class", "width": 14, "key": "Class"},
+            {"header": "workload", "width": 22, "key": "Workload"},
+        ],
+    )
+
+
+def _render_health_section(section) -> list[str]:
+    lines = [
+        _section_heading(section.name, level=3, status=str(section.status), informational=str(section.status) == "INFO"),
+        "",
+        f"**Status:** {_status_badge(str(section.status))}",
+        "",
+        section.summary or "Evidence captured.",
+    ]
+    if section.notes:
+        lines.extend(["", "**Notes:**"])
+        lines.extend(f"- {_format_value(note)}" for note in section.notes[:5])
+    if section.rows:
+        lines.extend(["", _render_section_rows(section.name, section.rows[:12])])
+    return lines + [""]
+
+
+def _render_section_rows(section_name: str, rows: list[dict[str, Any]]) -> str:
+    if section_name == "Host And OS":
+        return _render_host_rows(rows)
+    columns = SECTION_COLUMNS.get(section_name) or _infer_columns(rows)
+    return _render_table(rows, columns)
+
+
+def _render_host_rows(rows: list[dict[str, Any]]) -> str:
+    host_rows = [row for row in rows if row.get("scope") in {"host", "oracle_container"}]
+    hotspot_rows = [row for row in rows if row.get("scope") == "hotspot_analysis"]
+    fs_rows = [row for row in rows if row.get("scope") == "filesystem"]
+    parts = []
+    if host_rows:
+        parts.append(_render_table(host_rows, ["scope", "container", "cpu_pct", "memory_pct", "swap_pct", "memory_usage", "load_average"]))
+    if hotspot_rows:
+        parts.extend(
+            [
+                "",
+                "**Hotspot Analysis:**",
+                "",
+                _render_table(
+                    hotspot_rows,
+                    [
+                        "cpu_hotspot_triggered",
+                        "memory_hotspot_triggered",
+                        "cpu_correlation_success",
+                        "memory_correlation_success",
+                        "cpu_correlation_confidence",
+                        "memory_correlation_confidence",
+                        "top_oracle_fg_cpu",
+                        "top_oracle_bg_cpu",
+                        "top_non_oracle_cpu",
+                        "top_oracle_fg_mem",
+                        "top_oracle_bg_mem",
+                        "top_non_oracle_mem",
+                    ],
+                ),
+            ]
+        )
+    if fs_rows:
+        parts.extend(["", "**Filesystems:**", "", _render_table(fs_rows, ["filesystem", "size", "used", "avail", "use_pct", "mount"])])
+    return "\n".join(parts) if parts else _render_table(rows, _infer_columns(rows))
+
+
+def _render_compact_evidence(rows: list[dict[str, Any]]) -> str:
+    columns = _infer_columns(rows, limit=5)
+    return _render_table(rows, columns)
+
+
+def _render_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    if not rows:
+        return ""
+    useful_columns = [column for column in columns if any(_has_value(row.get(column)) for row in rows)]
+    if not useful_columns:
+        useful_columns = columns[:3]
+    table_columns = [_text_column_spec(column, rows) for column in useful_columns]
+    return _render_dba_code_table(rows, table_columns)
+
+
+def _infer_columns(rows: list[dict[str, Any]], limit: int = 8) -> list[str]:
+    columns: list[str] = []
+    for row in rows:
+        for key, value in row.items():
+            if key not in columns and _has_value(value):
+                columns.append(key)
+            if len(columns) >= limit:
+                return columns
+    return columns or list(rows[0].keys())[:limit]
+
+
+def _text_header(column: str) -> str:
+    normalized = str(column).strip()
+    replacements = {
+        "SQL_ID": "sql_id",
+        "CPU(s)": "cpu_s",
+        "Elapsed(s)": "elapsed_s",
+        "Recommended Next Step": "next_step",
+        "Completed At": "completed_at",
+    }
+    if normalized in replacements:
+        return replacements[normalized]
+    normalized = normalized.replace("%", "pct")
+    normalized = normalized.replace("(", "_").replace(")", "")
+    normalized = normalized.replace("/", "_").replace("-", "_")
+    normalized = normalized.replace(" ", "_")
+    normalized = normalized.lower()
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_") or "value"
+
+
+def _text_column_spec(column: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    header = _text_header(column)
+    values = [_format_value(row.get(column), max_length=120) for row in rows]
+    max_value_width = max([len(header), *(len(value) for value in values)], default=len(header))
+    if header in {"summary", "detail", "recommendation", "next_step", "trace", "message"}:
+        width = min(max(max_value_width, 32), 72)
+    elif header in {"finding", "issue", "check", "event", "module", "program", "archive_dest"}:
+        width = min(max(max_value_width, 20), 46)
+    elif header in {"status", "severity"}:
+        width = min(max(max_value_width, 10), 14)
+    elif header in {"completed_at", "generated_at", "last_analyzed", "completed"}:
+        width = min(max(max_value_width, 19), 32)
+    else:
+        width = min(max(max_value_width, len(header), 8), 24)
+    return {"header": header, "width": width, "key": column}
+
+
+def _history_series_columns(rows: list[dict[str, Any]]) -> list[str]:
+    preferred = [
+        "completed_at",
+        "overall_status",
+        "host_cpu_pct",
+        "host_memory_pct",
+        "container_cpu_pct",
+        "container_memory_pct",
+        "active_sessions",
+        "blocking_count",
+        "alert_log_count",
+        "hottest_tablespace_pct",
+        "top_cpu_sql_cpu_s",
+    ]
+    selected = [key for key in preferred if any(_has_value(row.get(key)) for row in rows)]
+    if len(selected) >= 8:
+        return selected[:8]
+    for row in rows:
+        for key in row:
+            if key == "trace_path":
+                continue
+            if key not in selected and _has_value(row.get(key)):
+                selected.append(key)
+            if len(selected) >= 8:
+                return selected
+    return selected or _infer_columns(rows)
+
+
+def _status_badge(status: str) -> str:
+    return STATUS_BADGES.get(status.upper(), f"🔵 **{status or 'INFO'}**")
+
+
+def _highest_tablespace(snapshot: HealthSnapshot) -> str:
+    if not snapshot.tablespaces:
+        return "n/a"
+    top = snapshot.tablespaces[0]
+    return f"{top.tablespace_name} {top.used_pct:.1f}%"
+
+
+def _coerce_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            parsed = ast.literal_eval(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _table_cell(value: Any) -> str:
+    return _escape_cell(_format_value(value, max_length=140))
+
+
+def _format_value(value: Any, max_length: int = 240) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    if isinstance(value, dict):
+        text = ", ".join(f"{_header(str(key))}={_format_value(val, max_length=80)}" for key, val in value.items() if _has_value(val))
+    elif isinstance(value, list):
+        text = ", ".join(_format_value(item, max_length=80) for item in value[:5])
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if len(text) > max_length:
+        return text[: max_length - 1] + "…"
+    return text
+
+
+def _escape_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
+
+
+def _header(name: str) -> str:
+    return str(name).replace("_", " ").title()
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and value != "" and value != []
+
+
+def render_investigation_final_report(report: InvestigationReport) -> str:
+    sections = [
+        "# AI Investigation Report",
+        "",
+        "## Problem Understood",
+        report.problem_statement,
+        "",
+        "## Investigation Summary",
+        report.summary,
+        "",
+        "## Likely Cause",
+        report.likely_cause,
+        "",
+        "## Supporting Evidence",
+    ]
+    if report.evidence:
+        sections.extend(f"- {line}" for line in report.evidence)
+    else:
+        sections.append("- No strong evidence captured.")
+    sections.extend(["", "## Recommended Next Actions"])
+    sections.extend(f"- {line}" for line in (report.recommended_next_actions or ["Review the SQL steps and confirm the suspected cause."]))
+    sections.extend(["", "## SQL Steps Run"])
+    for step in report.steps:
+        sections.extend([
+            f"### Step {step.step_number}: {step.goal}",
+            "",
+            "```sql",
+            step.sql,
+            "```",
+            "",
+            step.result_preview,
+            "",
+        ])
+        sections.extend(_render_investigation_step_output(step))
+    return "\n".join(sections)
+
+
+def _render_investigation_step_output(step: InvestigationStep) -> list[str]:
+    if step.status != "success":
+        return []
+    if not step.result_rows:
+        return ["No row output returned.", ""]
+    keys = _investigation_output_columns(step)
+    columns = [{"header": key, "width": 18, "key": key} for key in keys]
+    lines = [
+        "**SQL Output:**",
+        "",
+        "```text",
+        format_dba_table(step.result_rows, columns),
+        "```",
+    ]
+    if step.result_truncated:
+        lines.append(f"Displayed first {len(step.result_rows)} row(s).")
+    lines.append("")
+    return lines
+
+
+def _investigation_output_columns(step: InvestigationStep) -> list[str]:
+    keys: list[str] = []
+    preferred = [str(col) for col in (step.result_columns or []) if col]
+    for key in preferred:
+        if key not in keys:
+            keys.append(key)
+        if len(keys) >= 8:
+            return keys
+    for row in step.result_rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row:
+            if key not in keys:
+                keys.append(str(key))
+            if len(keys) >= 8:
+                return keys
+    return keys[:8]
+
+
+def render_remediation_card_markdown(proposal: RemediationProposal | None, review: RemediationReview | dict[str, Any] | None = None) -> str:
+    if proposal is None:
+        return "No remediation proposed for the current analysis."
+    parsed_review: RemediationReview | None = None
+    if isinstance(review, RemediationReview):
+        parsed_review = review
+    elif isinstance(review, dict):
+        try:
+            parsed_review = RemediationReview.model_validate(review)
+        except Exception:
+            parsed_review = None
+    why_line = _remediation_why_line(proposal)
+    reviewer_line = _reviewer_decision_line(proposal, parsed_review)
+    sql = proposal.execution_sql or proposal.sql
+    risk_line = _compact_risk_line(proposal)
+    lines = [
+        "## Proposed Action",
+        f"**{proposal.title}**",
+        "",
+        "### Why it is suggested",
+        why_line,
+        "",
+        "### Reviewer Decision",
+        reviewer_line,
+    ]
+    if risk_line:
+        lines.extend(["", risk_line])
+    lines.extend(["", "### SQL", "```sql", sql or "-- No executable SQL generated for this proposal.", "```"])
+    return "\n".join(lines)
+
+
+def _remediation_why_line(proposal: RemediationProposal) -> str:
+    if proposal.action_type not in {"clear_blocking_lock", "kill_session"}:
+        return proposal.reason_for_action or proposal.rationale or proposal.description
+    target = proposal.target or {}
+    sid = _coerce_int(target.get("sid"))
+    sid_label = str(sid) if sid is not None else "unknown"
+    username = str(target.get("username") or "-")
+    classification = str(target.get("blocker_classification") or "unknown")
+    idle_in_tx = bool(target.get("blocker_idle_in_transaction")) or classification == "idle_in_transaction_blocker"
+    reason = "idle in transaction" if idle_in_tx else "a blocking session"
+    blocked_count = _coerce_int(target.get("blocked_session_count"))
+    blocked_label = str(blocked_count) if blocked_count is not None else "unknown"
+    session_label = "session" if blocked_count == 1 else "sessions"
+    max_wait_s = _coerce_int(target.get("max_blocked_wait_seconds"))
+    wait_label = str(max_wait_s) if max_wait_s is not None else "unknown"
+    object_name = str(target.get("object_name") or "").strip()
+    object_owner = str(target.get("object_owner") or "").strip()
+    object_label = f"{object_owner}.{object_name}" if object_owner and object_name else object_name
+    object_fragment = f" on {object_label}" if object_label else ""
+    return (
+        f"SID {sid_label} (user {username}) is {reason} and blocking {blocked_label} {session_label} "
+        f"for {wait_label} seconds{object_fragment}."
+    )
+
+
+def _reviewer_decision_line(proposal: RemediationProposal, review: RemediationReview | None) -> str:
+    if review is None:
+        return "Pending - reviewer decision not available."
+    status = str(review.status or "pending").lower()
+    if status == "approved":
+        if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+            target = proposal.target or {}
+            classification = str(target.get("blocker_classification") or "unknown")
+            blocked_count = _coerce_int(target.get("blocked_session_count")) or 0
+            max_wait_s = _coerce_int(target.get("max_blocked_wait_seconds")) or 0
+            sustained_impact = blocked_count >= 2 or max_wait_s >= 300
+            if classification in {"application_session", "idle_in_transaction_blocker"} and sustained_impact:
+                return "Approved - guardrail checks passed for a foreground user blocker with sustained wait impact."
+        return "Approved - guardrail checks passed for the proposed remediation."
+    if status == "rejected":
+        failed = {str(item) for item in review.guardrail_checks_failed}
+        protected_failures = {
+            "target_not_protected_user",
+            "target_not_background_process",
+            "target_not_protected_maintenance_session",
+            "blocker_not_internal_or_background",
+            "protected_user",
+            "background_process",
+            "protected_maintenance_session",
+            "protected_blocker_class",
+        }
+        if failed & protected_failures:
+            return "Denied - target session is protected by guardrails."
+        return "Denied - guardrail checks failed for this remediation action."
+    if status == "not_needed":
+        return "Not needed - no reviewer action required."
+    return "Pending - reviewer decision in progress."
+
+
+def _compact_risk_line(proposal: RemediationProposal) -> str | None:
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"} and proposal.risks:
+        return "Risk: killing the session may roll back the active transaction; validate ownership first."
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _render_remediation_evidence_lines(proposal: RemediationProposal) -> list[str]:
+    target = proposal.target or {}
+    lines: list[str] = []
+    blocker = (
+        f"Blocker: SID {target.get('sid')}, SERIAL# {target.get('serial#')}, INST {target.get('inst_id')}, "
+        f"user={target.get('username') or '-'}, status={target.get('status') or '-'}, "
+        f"class={target.get('blocker_classification') or 'unknown'}."
+    )
+    lines.append(f"- {blocker}")
+    lines.append(
+        "- "
+        + (
+            f"Context: program={target.get('program') or '-'}, module={target.get('module') or '-'}, "
+            f"machine={target.get('machine') or '-'}."
+        )
+    )
+    blocked_count = target.get("blocked_session_count")
+    max_wait = target.get("max_blocked_wait_seconds")
+    lines.append(
+        f"- Impact: blocked_session_count={blocked_count if blocked_count is not None else 'unknown'}, "
+        f"max_wait_s={max_wait if max_wait is not None else 'unknown'}."
+    )
+    if target.get("blocker_idle_in_transaction") is not None:
+        lines.append(
+            f"- Transaction state: has_transaction={target.get('blocker_has_transaction')}, "
+            f"idle_in_transaction={target.get('blocker_idle_in_transaction')}."
+        )
+    object_owner = target.get("object_owner")
+    object_name = target.get("object_name")
+    object_type = target.get("object_type")
+    if object_name:
+        lines.append(f"- Object: {object_owner}.{object_name} ({object_type or 'unknown type'}).")
+    else:
+        lines.append("- Object: unavailable from current lock evidence.")
+    blocked_sessions = target.get("blocked_session_details")
+    if isinstance(blocked_sessions, list) and blocked_sessions:
+        first = blocked_sessions[0]
+        lines.append(
+            "- Blocked sample: "
+            f"SID {first.get('sid')}, user={first.get('username')}, sql_id={first.get('sql_id')}, "
+            f"event={first.get('event')}, wait_s={first.get('seconds_in_wait')}."
+        )
+    else:
+        lines.append("- Blocked sample: unavailable.")
+    lines.append(f"- Evidence completeness: {target.get('evidence_complete')}.")
+    return lines
+
+
+def render_action_history_markdown(records: list[RemediationRecord]) -> str:
+    if not records:
+        return "No remediation actions have been executed yet."
+    lines = []
+    for record in records[-10:][::-1]:
+        icon = severity_icon("WARNING" if record.execution.status == "succeeded" else "CRITICAL")
+        review_icon = "🟢" if record.review.status == "approved" else "🔴" if record.review.status == "rejected" else "🔵"
+        rationale = record.review.rationale or "No reviewer rationale provided."
+        notes = "; ".join(record.review.reviewer_notes[:2]) if record.review.reviewer_notes else "No reviewer notes."
+        lines.append(
+            f"- {icon} {record.created_at} — {record.proposal.title} — "
+            f"review={review_icon} {record.review.status} ({rationale}; {notes}) — execution={record.execution.status}"
+        )
+    return "\n".join(lines)

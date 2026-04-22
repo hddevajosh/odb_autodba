@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odb-autodba"
+version = "0.1.0"
+description = "Oracle AutoDBA copilot with planner chat, investigation mode, and guarded remediation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "gradio>=4.44.0",
+  "pydantic>=2.7.0",
+  "python-dotenv>=1.0.0",
+  "oracledb>=2.4.0",
+  "openai>=1.30.0",
+]
+
+[project.scripts]
+odb-autodba = "odb_autodba.frontend.gradio_app:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["odb_autodba*"]
