@@ -16,6 +16,7 @@ from odb_autodba.db.running_sessions import (
     get_top_session_resource_candidates,
     map_top_processes_to_sessions,
 )
+from odb_autodba.db.sql_monitor import summarize_current_sql
 from odb_autodba.db.sql_text import get_sql_text
 from odb_autodba.host.health_checks import collect_host_snapshot
 from odb_autodba.models.schemas import (
@@ -267,10 +268,15 @@ def collect_health_snapshot() -> HealthSnapshot:
     listener_errors = collect_listener_error_summary()
     host_snapshot = collect_host_snapshot() if env_flag("ENABLE_HOST_CHECKS", True) else None
     top_session_candidates = get_top_session_resource_candidates(limit=10)
+    try:
+        current_sql_candidates = summarize_current_sql(limit=10)
+    except Exception:
+        current_sql_candidates = []
 
     plan_evidence = collect_plan_evidence_for_top_sql([row.sql_id for row in top_elapsed[:5]])
     extended_sections, actionable_items, raw_evidence = collect_extended_health(window_hours=window_hours)
     raw_evidence["top_session_resource_candidates"] = top_session_candidates
+    raw_evidence["current_sql_candidates"] = current_sql_candidates
 
     if host_snapshot is not None:
         host_snapshot = _correlate_host_hotspots_with_db(
@@ -278,8 +284,10 @@ def collect_health_snapshot() -> HealthSnapshot:
             notes=notes,
             top_sql_by_cpu=top_cpu,
             top_session_candidates=top_session_candidates,
+            current_sql_candidates=current_sql_candidates,
             top_pga_candidates=(raw_evidence.get("memory_config") or {}).get("top_pga_sessions") or [],
         )
+        _apply_memory_compact_note(snapshot_sections=extended_sections, host_snapshot=host_snapshot, raw_evidence=raw_evidence, notes=notes)
 
     if host_snapshot:
         extended_sections.append(_host_health_section(host_snapshot))
@@ -545,6 +553,7 @@ def _correlate_host_hotspots_with_db(
     notes: list[str],
     top_sql_by_cpu: list[TopSqlRow],
     top_session_candidates: list[dict[str, Any]],
+    current_sql_candidates: list[dict[str, Any]],
     top_pga_candidates: list[dict[str, Any]],
 ) -> HostSnapshot:
     _apply_hotspot_correlation(
@@ -553,6 +562,7 @@ def _correlate_host_hotspots_with_db(
         metric="cpu",
         top_sql_by_cpu=top_sql_by_cpu,
         top_session_candidates=top_session_candidates,
+        current_sql_candidates=current_sql_candidates,
         top_pga_candidates=top_pga_candidates,
     )
     _apply_hotspot_correlation(
@@ -561,6 +571,7 @@ def _correlate_host_hotspots_with_db(
         metric="memory",
         top_sql_by_cpu=top_sql_by_cpu,
         top_session_candidates=top_session_candidates,
+        current_sql_candidates=current_sql_candidates,
         top_pga_candidates=top_pga_candidates,
     )
     return host
@@ -573,6 +584,7 @@ def _apply_hotspot_correlation(
     metric: str,
     top_sql_by_cpu: list[TopSqlRow],
     top_session_candidates: list[dict[str, Any]],
+    current_sql_candidates: list[dict[str, Any]],
     top_pga_candidates: list[dict[str, Any]],
 ) -> None:
     if not hotspot.triggered or not hotspot.top_processes:
@@ -586,6 +598,7 @@ def _apply_hotspot_correlation(
         metric=metric,
         top_sql_by_cpu=top_sql_by_cpu,
         top_session_candidates=top_session_candidates,
+        current_sql_candidates=current_sql_candidates,
         top_pga_candidates=top_pga_candidates,
     )
     confidence = _hotspot_correlation_confidence(
@@ -594,12 +607,18 @@ def _apply_hotspot_correlation(
         has_candidates=bool(sql_candidates),
     )
     ratio = (float(mapped_count) / float(attempted_count)) if attempted_count > 0 else 0.0
+    candidate_sql_ids = [candidate.sql_id for candidate in sql_candidates if candidate.sql_id][:5]
     summary = HotspotCorrelationSummary(
         attempted_count=attempted_count,
         correlation_success_count=mapped_count,
+        hotspot_correlation_success=f"{mapped_count}/{attempted_count}",
         correlation_ratio=round(ratio, 2),
         correlation_confidence=confidence,
-        top_oracle_candidate_sql_ids=[candidate.sql_id for candidate in sql_candidates if candidate.sql_id][:5],
+        direct_oracle_mapping_found=bool(mapped_count),
+        oracle_evidence_available=bool(sql_candidates),
+        correlation_incomplete=(mapped_count < attempted_count and bool(sql_candidates)),
+        top_oracle_candidate_sql_ids=candidate_sql_ids,
+        oracle_cpu_candidate_sql_ids=candidate_sql_ids if metric == "cpu" else [],
         notes=list(mapping_notes),
     )
     hotspot.oracle_correlated_rows = correlated_rows
@@ -634,6 +653,11 @@ def _apply_hotspot_correlation(
     else:
         hotspot.interpretation = (
             f"{hotspot.interpretation} No Oracle session correlation was found for sampled SPIDs and no fallback Oracle candidates were identified."
+        ).strip()
+
+    if "Non-Oracle process activity is the primary host consumer" in hotspot.interpretation and sql_candidates:
+        hotspot.interpretation = (
+            f"{hotspot.interpretation} Sampled OS rows were non-Oracle heavy, but DB-side SQL/session evidence still indicates Oracle {metric.upper()} pressure."
         ).strip()
 
     container_cpu = _as_float(getattr(hotspot, "container_cpu_pct", None))
@@ -681,7 +705,7 @@ def _oracle_correlated_hotspot_rows(processes: list[HostProcessRow]) -> list[Hot
                     pga_used_mb=session.pga_used_mb,
                     pga_alloc_mb=session.pga_alloc_mb,
                     temp_used_mb=session.temp_used_mb,
-                    process_group=process.process_group,
+                    process_group=_normalized_process_group(process.process_group),
                 )
             )
     return rows[:12]
@@ -692,56 +716,110 @@ def _oracle_hotspot_candidates(
     metric: str,
     top_sql_by_cpu: list[TopSqlRow],
     top_session_candidates: list[dict[str, Any]],
+    current_sql_candidates: list[dict[str, Any]],
     top_pga_candidates: list[dict[str, Any]],
 ) -> list[OracleHotspotCandidate]:
     candidates: list[OracleHotspotCandidate] = []
+    top_sql_map: dict[str, TopSqlRow] = {row.sql_id: row for row in top_sql_by_cpu if row.sql_id}
     for row in top_sql_by_cpu[:5]:
         candidates.append(
             OracleHotspotCandidate(
                 sql_id=row.sql_id,
+                parsing_schema_name=row.parsing_schema_name,
                 username=row.parsing_schema_name or row.username,
                 module=row.module,
                 program=row.program,
+                machine=row.machine,
                 sql_classification=row.sql_classification,
                 workload_interpretation=row.workload_interpretation,
                 cpu_s=row.cpu_s,
                 cpu_per_exec_s=row.cpu_per_exec_s,
                 elapsed_s=row.elapsed_s,
                 ela_per_exec_s=row.ela_per_exec_s,
+                source_metric="cpu" if metric == "cpu" else "mixed",
                 source="top_sql_by_cpu",
             )
         )
 
     if metric == "memory":
         for row in (top_pga_candidates or [])[:5]:
+            sql_id = _nullable_text(row.get("sql_id"))
+            sql_top = top_sql_map.get(sql_id or "")
             candidates.append(
                 OracleHotspotCandidate(
-                    sql_id=_nullable_text(row.get("sql_id")),
+                    sql_id=sql_id,
                     username=_nullable_text(row.get("username")),
                     module=_nullable_text(row.get("module")),
                     program=_nullable_text(row.get("program")),
+                    machine=_nullable_text(row.get("machine")),
+                    osuser=_nullable_text(row.get("osuser")),
+                    inst_id=_as_int(row.get("inst_id")),
+                    sid=_as_int(row.get("sid")),
+                    serial_num=_as_int(row.get("serial_num")),
+                    pga_used_mb=_as_float(row.get("pga_used_mb")),
+                    pga_alloc_mb=_as_float(row.get("pga_alloc_mb")),
+                    temp_used_mb=_as_float(row.get("temp_used_mb")),
+                    sql_classification=(sql_top.sql_classification if sql_top else _candidate_sql_classification(row)),
                     workload_interpretation="top_pga_session",
+                    source_metric="memory",
                     source="top_pga_sessions",
                 )
             )
     for row in (top_session_candidates or [])[:5]:
+        sql_id = _nullable_text(row.get("sql_id"))
+        sql_top = top_sql_map.get(sql_id or "")
         candidates.append(
             OracleHotspotCandidate(
-                sql_id=_nullable_text(row.get("sql_id")),
+                sql_id=sql_id,
                 username=_nullable_text(row.get("username")),
                 module=_nullable_text(row.get("module")),
                 program=_nullable_text(row.get("program")),
+                machine=_nullable_text(row.get("machine")),
+                osuser=_nullable_text(row.get("osuser")),
+                status=_nullable_text(row.get("status")),
+                event=_nullable_text(row.get("event")),
+                wait_class=_nullable_text(row.get("wait_class")),
+                inst_id=_as_int(row.get("inst_id")),
+                sid=_as_int(row.get("sid")),
+                serial_num=_as_int(row.get("serial_num")),
+                cpu_s=_as_float(row.get("cpu_seconds")),
+                pga_used_mb=_as_float(row.get("pga_used_mb")),
+                pga_alloc_mb=_as_float(row.get("pga_alloc_mb")),
+                temp_used_mb=_as_float(row.get("temp_used_mb")),
+                sql_classification=(sql_top.sql_classification if sql_top else _candidate_sql_classification(row)),
                 workload_interpretation="top_session_resource_candidate",
+                source_metric="mixed",
                 source="top_session_resources",
             )
         )
+    for row in (current_sql_candidates or [])[:5]:
+        sql_id = _nullable_text(row.get("sql_id"))
+        sql_top = top_sql_map.get(sql_id or "")
+        candidates.append(
+            OracleHotspotCandidate(
+                sql_id=sql_id,
+                username=_nullable_text(row.get("username")),
+                module=_nullable_text(row.get("module")),
+                program=_nullable_text(row.get("program")),
+                inst_id=_as_int(row.get("inst_id")),
+                sid=_as_int(row.get("sid")),
+                serial_num=_as_int(row.get("serial_num")),
+                cpu_s=_as_float(row.get("cpu_s")),
+                elapsed_s=_as_float(row.get("elapsed_s")),
+                sql_classification=(sql_top.sql_classification if sql_top else _candidate_sql_classification(row)),
+                workload_interpretation="active_sql_monitor_candidate",
+                source_metric="cpu",
+                source="sql_monitor_current_sql",
+            )
+        )
     deduped: list[OracleHotspotCandidate] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, int | None]] = set()
     for candidate in candidates:
         key = (
             str(candidate.sql_id or ""),
             str(candidate.username or ""),
             str(candidate.source or ""),
+            candidate.sid,
         )
         if key in seen:
             continue
@@ -761,6 +839,36 @@ def _hotspot_correlation_confidence(*, attempted_count: int, mapped_count: int, 
     return "medium"
 
 
+def _normalized_process_group(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"oracle_foreground", "oracle_fg"}:
+        return "oracle_fg"
+    if text in {"oracle_background", "oracle_bg"}:
+        return "oracle_bg"
+    if text == "non_oracle":
+        return "non_oracle"
+    return "unknown"
+
+
+def _candidate_sql_classification(row: dict[str, Any]) -> str:
+    user = str(row.get("username") or "").upper()
+    module = str(row.get("module") or "").lower()
+    program = str(row.get("program") or "").lower()
+    event = str(row.get("event") or "").lower()
+    combined = f"{module} {program} {event}"
+    if user in {"SYS", "SYSTEM"} and ("scheduler" in combined or "job" in combined):
+        return "internal scheduler workload"
+    if user in {"SYS", "SYSTEM"}:
+        return "oracle_internal_sql"
+    if any(token in combined for token in ("scheduler", "dbms_scheduler", "jobq", "cjq")):
+        return "maintenance_sql"
+    if any(token in combined for token in ("rman", "stats", "datapump")):
+        return "maintenance_sql"
+    if user and user not in {"-", "UNKNOWN"}:
+        return "application_sql"
+    return "unknown"
+
+
 def _oracle_candidate_notes(candidates: list[OracleHotspotCandidate]) -> list[str]:
     notes: list[str] = []
     for candidate in candidates[:3]:
@@ -768,9 +876,9 @@ def _oracle_candidate_notes(candidates: list[OracleHotspotCandidate]) -> list[st
             continue
         notes.append(
             "Oracle candidate SQL "
-            f"{candidate.sql_id} user={candidate.username or '-'} module={candidate.module or '-'} "
+            f"{candidate.sql_id} user={candidate.username or candidate.parsing_schema_name or '-'} module={candidate.module or '-'} "
             f"program={candidate.program or '-'} cpu_per_exec={candidate.cpu_per_exec_s if candidate.cpu_per_exec_s is not None else '-'} "
-            f"class={candidate.sql_classification or '-'} source={candidate.source}."
+            f"class={candidate.sql_classification or '-'} source={candidate.source} metric={candidate.source_metric or '-'}."
         )
     return notes
 
@@ -782,7 +890,7 @@ def _cpu_hotspot_section(host: HostSnapshot) -> HealthCheckSection:
     rows.extend(_hotspot_candidate_rows(hotspot.oracle_candidate_sql, metric="cpu"))
     summary = (
         f"CPU hotspot triggered (host={_fmt_pct(hotspot.host_cpu_pct)}, container={_fmt_pct(hotspot.container_cpu_pct)}). "
-        f"Correlated {hotspot.correlation_success_count}/{len(hotspot.top_processes)} sampled process(es) to Oracle sessions "
+        f"Correlated {hotspot.correlation_summary.hotspot_correlation_success} sampled process(es) to Oracle sessions "
         f"(confidence={hotspot.correlation_confidence})."
     )
     notes = [
@@ -807,7 +915,7 @@ def _memory_hotspot_section(host: HostSnapshot) -> HealthCheckSection:
     rows.extend(_hotspot_candidate_rows(hotspot.oracle_candidate_sql, metric="memory"))
     summary = (
         f"Memory hotspot triggered (host={_fmt_pct(hotspot.host_memory_pct)}, container={_fmt_pct(hotspot.container_memory_pct)}). "
-        f"Correlated {hotspot.correlation_success_count}/{len(hotspot.top_processes)} sampled process(es) to Oracle sessions "
+        f"Correlated {hotspot.correlation_summary.hotspot_correlation_success} sampled process(es) to Oracle sessions "
         f"(confidence={hotspot.correlation_confidence})."
     )
     notes = [
@@ -832,7 +940,7 @@ def _flatten_hotspot_process_rows(processes: list[HostProcessRow]) -> list[dict[
             "row_type": "os_sample",
             "os_pid": process.pid,
             "spid": process.spid,
-            "process_group": process.process_group,
+            "process_group": _normalized_process_group(process.process_group),
             "process_name": process.process_name,
             "oracle_process_type": process.oracle_process_type_guess,
             "cpu_pct": process.cpu_pct,
@@ -877,15 +985,28 @@ def _hotspot_candidate_rows(candidates: list[OracleHotspotCandidate], *, metric:
             {
                 "row_type": f"oracle_{metric}_candidate",
                 "sql_id": candidate.sql_id,
+                "parsing_schema_name": candidate.parsing_schema_name,
                 "username": candidate.username,
                 "module": candidate.module,
                 "program": candidate.program,
+                "machine": candidate.machine,
+                "osuser": candidate.osuser,
+                "inst_id": candidate.inst_id,
+                "sid": candidate.sid,
+                "serial_num": candidate.serial_num,
+                "status": candidate.status,
+                "event": candidate.event,
+                "wait_class": candidate.wait_class,
                 "cpu_s": candidate.cpu_s,
                 "cpu_per_exec_s": candidate.cpu_per_exec_s,
                 "elapsed_s": candidate.elapsed_s,
                 "ela_per_exec_s": candidate.ela_per_exec_s,
+                "pga_used_mb": candidate.pga_used_mb,
+                "pga_alloc_mb": candidate.pga_alloc_mb,
+                "temp_used_mb": candidate.temp_used_mb,
                 "sql_classification": candidate.sql_classification,
                 "workload_interpretation": candidate.workload_interpretation,
+                "source_metric": candidate.source_metric,
                 "source": candidate.source,
             }
         )
@@ -923,9 +1044,13 @@ def _host_health_section(host: HostSnapshot) -> HealthCheckSection:
             "cpu_hotspot_triggered": host.cpu_hotspot.triggered,
             "memory_hotspot_triggered": host.memory_hotspot.triggered,
             "cpu_correlation_success": host.cpu_hotspot.correlation_success_count,
+            "cpu_hotspot_correlation_success": host.cpu_hotspot.correlation_summary.hotspot_correlation_success,
             "memory_correlation_success": host.memory_hotspot.correlation_success_count,
+            "memory_hotspot_correlation_success": host.memory_hotspot.correlation_summary.hotspot_correlation_success,
             "cpu_correlation_confidence": host.cpu_hotspot.correlation_confidence,
             "memory_correlation_confidence": host.memory_hotspot.correlation_confidence,
+            "cpu_candidate_sql_ids": ",".join(host.cpu_hotspot.correlation_summary.top_oracle_candidate_sql_ids[:5]),
+            "memory_candidate_sql_ids": ",".join(host.memory_hotspot.correlation_summary.top_oracle_candidate_sql_ids[:5]),
             "top_oracle_fg_cpu": host.cpu_hotspot.top_oracle_foreground,
             "top_oracle_bg_cpu": host.cpu_hotspot.top_oracle_background,
             "top_non_oracle_cpu": host.cpu_hotspot.top_non_oracle,
@@ -944,6 +1069,12 @@ def _host_health_section(host: HostSnapshot) -> HealthCheckSection:
     summary += (
         f" Hotspot analysis: CPU={'triggered' if host.cpu_hotspot.triggered else 'normal'}, "
         f"memory={'triggered' if host.memory_hotspot.triggered else 'normal'}."
+    )
+    summary += (
+        f" Correlation CPU={host.cpu_hotspot.correlation_summary.hotspot_correlation_success}"
+        f" ({host.cpu_hotspot.correlation_confidence}), "
+        f"memory={host.memory_hotspot.correlation_summary.hotspot_correlation_success}"
+        f" ({host.memory_hotspot.correlation_confidence})."
     )
     if docker_cpu is not None and docker_cpu >= 85.0 and (host.cpu_pct is None or host.cpu_pct < 70.0):
         summary += (
@@ -1039,6 +1170,46 @@ def _apply_tablespace_allocation_anomaly(snapshot: HealthSnapshot) -> None:
         if section.name in {"Tablespace Usage", "Alert Log Errors"} and note not in section.notes:
             section.notes.append(note)
     snapshot.notes.append(note)
+
+
+def _apply_memory_compact_note(
+    *,
+    snapshot_sections: list[HealthCheckSection],
+    host_snapshot: HostSnapshot | None,
+    raw_evidence: dict[str, Any],
+    notes: list[str],
+) -> None:
+    if host_snapshot is None or host_snapshot.memory_hotspot.triggered:
+        return
+    memory_config = raw_evidence.get("memory_config") or {}
+    pga_rows = memory_config.get("top_pga_sessions") or []
+    if not isinstance(pga_rows, list) or not pga_rows:
+        return
+    top = pga_rows[0]
+    pga_used_mb = _as_float(top.get("pga_used_mb")) or 0.0
+    if pga_used_mb < 512.0:
+        return
+    sid = _as_int(top.get("sid"))
+    serial_num = _as_int(top.get("serial_num"))
+    sql_id = _nullable_text(top.get("sql_id")) or "-"
+    username = _nullable_text(top.get("username")) or "-"
+    module = _nullable_text(top.get("module")) or "-"
+    program = _nullable_text(top.get("program")) or "-"
+    top_cpu_sessions = memory_config.get("top_cpu_sessions") or []
+    aligned_cpu = any(str(row.get("sql_id") or "") == sql_id for row in (top_cpu_sessions if isinstance(top_cpu_sessions, list) else []))
+    note = (
+        "Memory hotspot thresholds were not crossed, but "
+        f"SID {sid or '-'} serial {serial_num or '-'} user {username} SQL_ID {sql_id} is the largest Oracle PGA consumer "
+        f"({pga_used_mb:.2f} MB, module={module}, program={program})."
+    )
+    if aligned_cpu:
+        note += " This session aligns with current top DB CPU session evidence."
+    for section in snapshot_sections:
+        if section.name == "Memory And Configuration" and note not in section.notes:
+            section.notes.append(note)
+            break
+    if note not in notes:
+        notes.append(note)
 
 
 def _tablespace_allocation_anomaly(
@@ -1142,6 +1313,7 @@ def enrich_host_snapshot_with_db_activity(host_snapshot: HostSnapshot | None, sn
         notes=snapshot.notes if snapshot else [],
         top_sql_by_cpu=(snapshot.top_sql_by_cpu if snapshot else []),
         top_session_candidates=(snapshot.raw_evidence.get("top_session_resource_candidates") if snapshot else []) or [],
+        current_sql_candidates=(snapshot.raw_evidence.get("current_sql_candidates") if snapshot else []) or [],
         top_pga_candidates=((snapshot.raw_evidence.get("memory_config") or {}).get("top_pga_sessions") if snapshot else []) or [],
     )
 

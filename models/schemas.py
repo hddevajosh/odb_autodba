@@ -293,29 +293,62 @@ class HotspotProcessRow(BaseModel):
     pga_used_mb: float | None = None
     pga_alloc_mb: float | None = None
     temp_used_mb: float | None = None
-    process_group: Literal["oracle_foreground", "oracle_background", "non_oracle", "unknown"] = "unknown"
+    process_group: Literal[
+        "oracle_fg",
+        "oracle_bg",
+        "oracle_foreground",
+        "oracle_background",
+        "non_oracle",
+        "unknown",
+    ] = "unknown"
 
 
 class OracleHotspotCandidate(BaseModel):
     sql_id: str | None = None
+    parsing_schema_name: str | None = None
     username: str | None = None
     module: str | None = None
     program: str | None = None
+    machine: str | None = None
+    osuser: str | None = None
+    status: str | None = None
+    event: str | None = None
+    wait_class: str | None = None
+    inst_id: int | None = None
+    sid: int | None = None
+    serial_num: int | None = None
     sql_classification: str | None = None
     workload_interpretation: str | None = None
     cpu_s: float | None = None
     cpu_per_exec_s: float | None = None
     elapsed_s: float | None = None
     ela_per_exec_s: float | None = None
+    pga_used_mb: float | None = None
+    pga_alloc_mb: float | None = None
+    temp_used_mb: float | None = None
+    process_group: Literal[
+        "oracle_fg",
+        "oracle_bg",
+        "oracle_foreground",
+        "oracle_background",
+        "non_oracle",
+        "unknown",
+    ] | None = None
+    source_metric: Literal["cpu", "memory", "mixed"] | None = None
     source: str = "top_sql_by_cpu"
 
 
 class HotspotCorrelationSummary(BaseModel):
     attempted_count: int = 0
     correlation_success_count: int = 0
+    hotspot_correlation_success: str = "0/0"
     correlation_ratio: float = 0.0
     correlation_confidence: Literal["high", "medium", "low", "none"] = "none"
+    direct_oracle_mapping_found: bool = False
+    oracle_evidence_available: bool = False
+    correlation_incomplete: bool = False
     top_oracle_candidate_sql_ids: list[str] = Field(default_factory=list)
+    oracle_cpu_candidate_sql_ids: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -345,7 +378,14 @@ class HostProcessRow(BaseModel):
     swap_mb: float | None = None
     command: str | None = None
     process_name: str | None = None
-    process_group: Literal["oracle_foreground", "oracle_background", "non_oracle", "unknown"] = "unknown"
+    process_group: Literal[
+        "oracle_fg",
+        "oracle_bg",
+        "oracle_foreground",
+        "oracle_background",
+        "non_oracle",
+        "unknown",
+    ] = "unknown"
     oracle_process_type_guess: str | None = None
     session_correlations: list[SessionProcessCorrelationRow] = Field(default_factory=list)
 

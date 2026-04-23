@@ -102,6 +102,12 @@ class PlannerAgent:
             report_markdown=body,
             history_context=history_context,
         )
+        trace_metadata = self._resolve_trace_metadata(
+            trace_record=trace_record,
+            database_name=database_name,
+            runtime_context=runtime_context,
+            history_context=history_context,
+        )
         recommendations = [issue.recommendation for issue in snapshot.issues[:4]] or ["No urgent Oracle issues were detected in the current snapshot."]
         return PlannerResponse(
             mode="full_health_report",
@@ -112,11 +118,36 @@ class PlannerAgent:
             remediation_proposal=proposal,
             supporting_data={
                 "review": review.model_dump(),
-                "trace_path": trace_record.trace_path,
-                "trace_run_id": trace_record.run_id,
+                **trace_metadata,
                 "history_context": history_context.model_dump(mode="json"),
             },
         )
+
+    def _resolve_trace_metadata(self, *, trace_record, database_name: str | None, runtime_context: dict, history_context) -> dict:
+        trace_path = getattr(trace_record, "trace_path", None)
+        run_id = getattr(trace_record, "run_id", None)
+        recorded_at = getattr(trace_record, "recorded_at", None)
+        completed_at = getattr(trace_record, "completed_at", None)
+
+        latest = self.history.jsonl.get_latest_jsonl_run(database_name=database_name)
+        if latest and (not run_id or run_id == latest.run_id):
+            trace_path = trace_path or latest.trace_path
+            run_id = run_id or latest.run_id
+            recorded_at = recorded_at or latest.recorded_at
+            completed_at = completed_at or latest.completed_at
+
+        payload = {
+            "trace_path": trace_path,
+            "run_id": run_id,
+            "trace_run_id": run_id,
+            "recorded_at": recorded_at,
+            "completed_at": completed_at,
+        }
+        if "history_index_rebuilt" in runtime_context:
+            payload["history_index_rebuilt"] = bool(runtime_context.get("history_index_rebuilt"))
+        elif getattr(history_context, "history_index_rebuilt", False):
+            payload["history_index_rebuilt"] = True
+        return payload
 
     def _render_snapshot_response(self, snapshot) -> str:
         return render_health_snapshot_report(snapshot)

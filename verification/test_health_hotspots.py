@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from odb_autodba.db.extended_health_checks import _lock_wait_without_blocker_note, _tablespace_allocation_note
 from odb_autodba.db.health_checks import (
+    _apply_memory_compact_note,
     _build_hotspot_sections,
     _correlate_host_hotspots_with_db,
     _enrich_top_sql_row,
@@ -160,14 +161,17 @@ class HealthHotspotTests(unittest.TestCase):
                 notes=[],
                 top_sql_by_cpu=[TopSqlRow(sql_id="abc123def45", parsing_schema_name="APP", module="order_api", program="python", cpu_s=120.0)],
                 top_session_candidates=[],
+                current_sql_candidates=[],
                 top_pga_candidates=[],
             )
         self.assertEqual(enriched.cpu_hotspot.correlation_confidence, "high")
+        self.assertEqual(enriched.cpu_hotspot.correlation_summary.hotspot_correlation_success, "1/1")
         self.assertTrue(enriched.cpu_hotspot.oracle_correlated_rows)
         row = enriched.cpu_hotspot.oracle_correlated_rows[0]
         self.assertEqual(row.sql_id, "abc123def45")
         self.assertEqual(row.module, "order_api")
         self.assertEqual(row.program, "python")
+        self.assertEqual(row.process_group, "oracle_fg")
 
     def test_cpu_hotspot_failed_os_mapping_uses_db_cpu_candidates(self) -> None:
         host = HostSnapshot(
@@ -197,6 +201,7 @@ class HealthHotspotTests(unittest.TestCase):
                     )
                 ],
                 top_session_candidates=[],
+                current_sql_candidates=[],
                 top_pga_candidates=[],
             )
         self.assertEqual(enriched.cpu_hotspot.correlation_confidence, "low")
@@ -241,11 +246,80 @@ class HealthHotspotTests(unittest.TestCase):
                 notes=[],
                 top_sql_by_cpu=[],
                 top_session_candidates=[],
+                current_sql_candidates=[],
                 top_pga_candidates=[],
             )
         self.assertEqual(enriched.memory_hotspot.correlation_confidence, "high")
         self.assertTrue(enriched.memory_hotspot.oracle_correlated_rows)
         self.assertGreater(enriched.memory_hotspot.oracle_correlated_rows[0].pga_used_mb or 0, 700)
+
+    def test_cpu_hotspot_uses_sql_monitor_candidates_when_os_mapping_fails(self) -> None:
+        host = HostSnapshot(
+            cpu_hotspot=CpuHotspotSection(
+                triggered=True,
+                host_cpu_pct=87.0,
+                top_processes=[HostProcessRow(pid="8001", spid="8001", cpu_pct=31.0, process_group="oracle_foreground")],
+            ),
+            memory_hotspot=MemoryHotspotSection(triggered=False),
+        )
+        with patch(
+            "odb_autodba.db.health_checks.map_top_processes_to_sessions",
+            return_value=(host.cpu_hotspot.top_processes, 0, ["Oracle process-to-session correlation returned no rows for sampled SPIDs."]),
+        ):
+            enriched = _correlate_host_hotspots_with_db(
+                host,
+                notes=[],
+                top_sql_by_cpu=[],
+                top_session_candidates=[],
+                current_sql_candidates=[
+                    {
+                        "inst_id": 1,
+                        "sid": 88,
+                        "serial_num": 9021,
+                        "username": "DEVA1",
+                        "sql_id": "20sagypbxp6vk",
+                        "cpu_s": 99.0,
+                        "program": "python",
+                        "module": "api_worker",
+                    }
+                ],
+                top_pga_candidates=[],
+            )
+        self.assertEqual(enriched.cpu_hotspot.correlation_confidence, "low")
+        self.assertIn("20sagypbxp6vk", enriched.cpu_hotspot.correlation_summary.top_oracle_candidate_sql_ids)
+        self.assertTrue(any(row.source == "sql_monitor_current_sql" for row in enriched.cpu_hotspot.oracle_candidate_sql))
+
+    def test_memory_compact_note_added_when_no_memory_hotspot_but_pga_heavy(self) -> None:
+        sections = [HealthCheckSection(name="Memory And Configuration", status="OK", summary="summary", rows=[], notes=[])]
+        host = HostSnapshot(
+            cpu_hotspot=CpuHotspotSection(triggered=False),
+            memory_hotspot=MemoryHotspotSection(triggered=False),
+        )
+        notes: list[str] = []
+        _apply_memory_compact_note(
+            snapshot_sections=sections,
+            host_snapshot=host,
+            raw_evidence={
+                "memory_config": {
+                    "top_pga_sessions": [
+                        {
+                            "sid": 41,
+                            "serial_num": 112,
+                            "username": "APP",
+                            "sql_id": "memsql01",
+                            "module": "etl",
+                            "program": "python",
+                            "pga_used_mb": 950.0,
+                        }
+                    ],
+                    "top_cpu_sessions": [{"sid": 41, "sql_id": "memsql01"}],
+                }
+            },
+            notes=notes,
+        )
+        self.assertTrue(sections[0].notes)
+        self.assertIn("largest Oracle PGA consumer", sections[0].notes[0])
+        self.assertIn("memsql01", sections[0].notes[0])
 
     def test_ora_01653_with_low_tablespace_usage_note(self) -> None:
         note = _tablespace_allocation_note(

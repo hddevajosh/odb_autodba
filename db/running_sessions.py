@@ -266,6 +266,15 @@ where p.spid = :spid
 """
 
 TOP_SESSION_RESOURCE_SQL = """
+with temp_usage as (
+    select u.inst_id,
+           u.session_addr,
+           round(sum(u.blocks * ts.block_size) / 1024 / 1024, 2) as temp_used_mb
+    from gv$tempseg_usage u
+    join dba_tablespaces ts
+      on ts.tablespace_name = u.tablespace
+    group by u.inst_id, u.session_addr
+)
 select * from (
     select s.inst_id,
            s.sid,
@@ -277,14 +286,20 @@ select * from (
            nvl(s.program, '-') as program,
            nvl(s.machine, '-') as machine,
            nvl(s.osuser, '-') as osuser,
+           nvl(s.event, '-') as event,
+           nvl(s.wait_class, '-') as wait_class,
            p.spid,
            round(p.pga_used_mem / 1024 / 1024, 2) as pga_used_mb,
            round(p.pga_alloc_mem / 1024 / 1024, 2) as pga_alloc_mb,
+           nvl(tu.temp_used_mb, 0) as temp_used_mb,
            round(ss.value / 100, 2) as cpu_seconds
     from gv$session s
     join gv$process p
       on p.inst_id = s.inst_id
      and p.addr = s.paddr
+    left join temp_usage tu
+      on tu.inst_id = s.inst_id
+     and tu.session_addr = s.saddr
     left join gv$sesstat ss
       on ss.inst_id = s.inst_id
      and ss.sid = s.sid
@@ -342,7 +357,7 @@ def map_top_processes_to_sessions(process_rows: list[HostProcessRow]) -> tuple[l
     notes: list[str] = []
     for process in process_rows:
         row = process if isinstance(process, HostProcessRow) else HostProcessRow.model_validate(process)
-        should_attempt = row.process_group in {"oracle_foreground", "oracle_background"} or "oracle" in str(row.process_name or "").lower()
+        should_attempt = row.process_group in {"oracle_foreground", "oracle_background", "oracle_fg", "oracle_bg"} or "oracle" in str(row.process_name or "").lower()
         if not should_attempt:
             mapped_rows.append(row.model_copy(update={"session_correlations": []}))
             continue
@@ -351,7 +366,7 @@ def map_top_processes_to_sessions(process_rows: list[HostProcessRow]) -> tuple[l
         if correlations:
             mapped_count += 1
         mapped_rows.append(row.model_copy(update={"session_correlations": correlations}))
-    if mapped_count == 0 and any(row.process_group in {"oracle_foreground", "oracle_background"} for row in mapped_rows):
+    if mapped_count == 0 and any(row.process_group in {"oracle_foreground", "oracle_background", "oracle_fg", "oracle_bg"} for row in mapped_rows):
         notes.append("Oracle process-to-session correlation returned no rows for sampled SPIDs.")
     return mapped_rows, mapped_count, notes
 

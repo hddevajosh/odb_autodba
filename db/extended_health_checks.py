@@ -747,16 +747,22 @@ def _memory_section(memory: dict[str, Any]) -> HealthCheckSection:
     notes = [f"Top DB CPU sessions captured: {len(top_cpu_sessions)}"]
     if top_pga_sessions:
         top = top_pga_sessions[0]
+        top_sid = top.get("sid")
+        top_sql_id = top.get("sql_id")
+        top_user = top.get("username")
+        top_module = top.get("module") or "-"
+        top_program = top.get("program") or "-"
         summary += (
-            f" Session SID {top.get('sid')} (SQL_ID {top.get('sql_id')}) is the largest Oracle PGA consumer in the current snapshot."
+            f" Session SID {top_sid} (SQL_ID {top_sql_id}) user={top_user or '-'} "
+            f"module={top_module} program={top_program} is the largest Oracle PGA consumer in the current snapshot."
         )
-        if any(str(cpu_row.get("sql_id") or "") == str(top.get("sql_id") or "") for cpu_row in top_cpu_sessions):
+        if any(str(cpu_row.get("sql_id") or "") == str(top_sql_id or "") for cpu_row in top_cpu_sessions):
             notes.append(
-                f"Largest PGA consumer SQL_ID {top.get('sql_id')} also appears in top DB CPU sessions."
+                f"Largest PGA consumer SQL_ID {top_sql_id} also appears in top DB CPU sessions."
             )
         if (_float(top.get("pga_used_mb")) or 0.0) >= 512:
             notes.append(
-                f"High single-session PGA observed: SID {top.get('sid')} uses {top.get('pga_used_mb')} MB."
+                f"High single-session PGA observed: SID {top_sid} uses {top.get('pga_used_mb')} MB."
             )
     return _section("Memory And Configuration", status, summary, top_pga_sessions[:10], notes=notes)
 

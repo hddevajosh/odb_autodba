@@ -25,7 +25,54 @@ WORKFLOW_PROMPTS = (
 
 APP_CSS = """
 #app-shell { max-width: 1440px; margin: 0 auto; }
-#action-rail { position: sticky; top: 16px; align-self: flex-start; padding-right: 20px; }
+#action-rail {
+  position: sticky;
+  top: 16px;
+  align-self: flex-start;
+  padding-right: 14px;
+  height: fit-content;
+  max-height: calc(100vh - 24px);
+}
+#shortcut-rail-card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 2px 0 0 0;
+}
+#shortcut-rail-card > div {
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+#workflow-shortcuts-title {
+  margin-bottom: 6px;
+}
+#workflow-shortcuts-title .title-main {
+  font-size: 1.08rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: #f6c343;
+}
+#workflow-shortcuts-title .title-sub {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #9ca3af;
+}
+.workflow-shortcut-btn button {
+  width: 100%;
+  min-height: 40px;
+  border-radius: 10px !important;
+  text-align: center;
+  justify-content: center;
+  padding: 8px 12px !important;
+  margin: 0 !important;
+}
+.workflow-shortcut-btn {
+  width: 100%;
+}
 #remediation-card { border: 1px solid #d6dee8; border-radius: 20px; padding: 18px; background: linear-gradient(180deg, #f9fbfd 0%, #eef4f8 100%); }
 #app-shell button {
   background: #f6c343 !important;
@@ -121,15 +168,17 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(css=APP_CSS, title="Oracle AutoDBA", elem_id="app-shell") as app:
         chat_state = gr.State([])
         response_state = gr.State({})
+        shortcut_clicks: list[tuple[gr.Button, str]] = []
         with gr.Row():
             with gr.Column(scale=1, elem_id="action-rail"):
-                gr.Markdown("### Oracle AutoDBA\nWorkflow shortcuts")
-                prompt_target = gr.Textbox(visible=False)
-                shortcut_buttons = []
-                for label, prompt in WORKFLOW_PROMPTS:
-                    btn = gr.Button(label, variant="secondary")
-                    btn.click(fn=lambda p=prompt: p, outputs=prompt_target)
-                    shortcut_buttons.append(btn)
+                gr.Markdown(
+                    "<div class='title-main'>Oracle AutoDBA</div><div class='title-sub'>Workflow shortcuts</div>",
+                    elem_id="workflow-shortcuts-title",
+                )
+                with gr.Group(elem_id="shortcut-rail-card"):
+                    for label, prompt in WORKFLOW_PROMPTS:
+                        btn = gr.Button(label, variant="primary", elem_classes=["workflow-shortcut-btn"])
+                        shortcut_clicks.append((btn, prompt))
             with gr.Column(scale=4, elem_id="center-panel"):
                 chatbot = gr.Chatbot(type="messages", label="Planner Chat", height=550)
                 message = gr.Textbox(lines=4, placeholder="Ask about Oracle health, SQL_ID, ORA errors, blocking, or trends.", label="Message")
@@ -145,7 +194,12 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("Action History", open=False):
                     action_history_md = gr.Markdown(render_action_history_markdown(load_action_records()))
 
-        prompt_target.change(fn=lambda x: x, inputs=prompt_target, outputs=message)
+        for btn, prompt in shortcut_clicks:
+            btn.click(
+                fn=lambda cs, rs, p=prompt: _submit_message(p, cs, rs),
+                inputs=[chat_state, response_state],
+                outputs=[chatbot, chat_state, response_state, remediation_md, confirm_checkbox, execute_btn, validation_md, action_history_md],
+            )
         send_btn.click(_submit_message, inputs=[message, chat_state, response_state], outputs=[chatbot, chat_state, response_state, remediation_md, confirm_checkbox, execute_btn, validation_md, action_history_md])
         investigate_btn.click(_submit_investigation, inputs=[message, chat_state], outputs=[chatbot, chat_state])
         clear_btn.click(_clear_chat, outputs=[chatbot, chat_state, response_state, remediation_md, confirm_checkbox, execute_btn, validation_md, action_history_md])

@@ -273,7 +273,7 @@ def _sum_metric(rows: list[HostProcessRow], *, metric: str, group: str) -> float
     field = "cpu_pct" if metric == "cpu" else "memory_pct"
     total = 0.0
     for row in rows:
-        if row.process_group != group:
+        if _normalized_group(row.process_group) != _normalized_group(group):
             continue
         value = getattr(row, field, None)
         if value is not None:
@@ -283,7 +283,7 @@ def _sum_metric(rows: list[HostProcessRow], *, metric: str, group: str) -> float
 
 def _top_process_label(rows: list[HostProcessRow], *, metric: str, group: str) -> str | None:
     field = "cpu_pct" if metric == "cpu" else "memory_pct"
-    candidates = [row for row in rows if row.process_group == group]
+    candidates = [row for row in rows if _normalized_group(row.process_group) == _normalized_group(group)]
     if not candidates:
         return None
     top = max(candidates, key=lambda row: getattr(row, field, 0.0) or 0.0)
@@ -444,6 +444,17 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _normalized_group(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"oracle_foreground", "oracle_fg"}:
+        return "oracle_foreground"
+    if text in {"oracle_background", "oracle_bg"}:
+        return "oracle_background"
+    if text == "non_oracle":
+        return "non_oracle"
+    return "unknown"
 
 
 def _kb_to_mb(value: Any) -> float | None:
