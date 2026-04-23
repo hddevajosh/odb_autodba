@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 from odb_autodba.history.jsonl_service import JsonlHistoryService
 from odb_autodba.models.schemas import (
+    AwrCapabilities,
     AwrMetricDelta,
     AwrMemoryState,
+    AwrReportTextSummary,
     AwrRunPairWindowMapping,
     AwrSnapshotQuality,
     AwrSnapshotWindowMapping,
@@ -20,6 +22,7 @@ from odb_autodba.models.schemas import (
     AwrWaitShiftSummary,
     AwrWaitClassShift,
     HealthIssue,
+    HistoricalComparisonWindow,
     HistoryContext,
     RecurringIssueIndexRecord,
     TraceHealthRunRecord,
@@ -218,6 +221,72 @@ class HistoryStateDiffTests(unittest.TestCase):
             context = JsonlHistoryService().compare_recent_runs(limit=2)
 
         self.assertEqual(context.state_transition.confidence, "LOW")
+
+    def test_metric_sparse_awr_is_enriched_with_report_text_summary(self) -> None:
+        service = JsonlHistoryService()
+        previous = _trace(run_id="r1", completed_at="2026-04-22T02:25:07Z", status="WARNING", summary="Previous")
+        current = _trace(run_id="r2", completed_at="2026-04-22T02:48:26Z", status="WARNING", summary="Current")
+        mapping = AwrRunPairWindowMapping(
+            previous=AwrSnapshotWindowMapping(
+                dbid=1234,
+                begin_snap_id=210,
+                end_snap_id=211,
+                matched_snap_id=211,
+                begin_time="2026-04-22T02:04:00",
+                end_time="2026-04-22T03:00:00",
+                mapping_quality="HIGH",
+            ),
+            current=AwrSnapshotWindowMapping(
+                dbid=1234,
+                begin_snap_id=211,
+                end_snap_id=212,
+                matched_snap_id=212,
+                begin_time="2026-04-22T03:00:00",
+                end_time="2026-04-22T04:00:00",
+                mapping_quality="HIGH",
+            ),
+            comparability_score=0.7,
+            confidence="MEDIUM",
+            debug={"same_snap_selected": False},
+        )
+        awr_diff = AwrStateDiff(
+            available=True,
+            snapshot_quality=AwrSnapshotQuality(coverage_quality="LOW", confidence="LOW", comparability_score=0.4),
+            workload_metrics=[
+                AwrMetricDelta(metric_name="DB Time", previous_value=None, current_value=None, significance="LOW"),
+                AwrMetricDelta(metric_name="DB CPU", previous_value=None, current_value=None, significance="LOW"),
+            ],
+        )
+        report_text_summary = AwrReportTextSummary(
+            available=True,
+            source="DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+            dbid=1234,
+            instance_number=1,
+            begin_snap_id=211,
+            end_snap_id=212,
+            load_profile_summary=["DB Time(s): 120.0", "DB CPU(s): 75.0"],
+            main_bottlenecks=["enq: TX - row lock contention 11234"],
+            sql_contributors=["3nkd7x4r8w1pb 95.3"],
+            recommended_follow_up=["Review blocking chains for transient row-lock contention."],
+        )
+        with (
+            patch("odb_autodba.history.jsonl_service.get_awr_capabilities", return_value=AwrCapabilities(available=True, dbid=1234)),
+            patch("odb_autodba.history.jsonl_service.map_run_pair_to_awr_windows", return_value=mapping),
+            patch("odb_autodba.history.jsonl_service.build_awr_state_diff", return_value=awr_diff),
+            patch("odb_autodba.history.jsonl_service.get_awr_report_text_summary_for_window", return_value=report_text_summary),
+        ):
+            out_diff, notes, fallback_mode, _ = service._build_optional_awr_diff(
+                previous,
+                current,
+                comparison_window=HistoricalComparisonWindow(
+                    window_start="2026-04-22T02:00:00Z",
+                    window_end="2026-04-22T04:00:00Z",
+                ),
+            )
+        self.assertIsNotNone(out_diff)
+        self.assertTrue(out_diff.awr_report_text_summary.available)
+        self.assertEqual(fallback_mode, "awr_metric_incomplete")
+        self.assertTrue(any("report-text summary" in note.lower() for note in notes))
 
     def test_formatter_renders_transition_sections(self) -> None:
         traces = [

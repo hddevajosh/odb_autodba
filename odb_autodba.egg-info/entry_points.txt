@@ -1,0 +1,2 @@
+[console_scripts]
+odb-autodba = odb_autodba.frontend.gradio_app:main

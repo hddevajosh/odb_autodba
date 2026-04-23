@@ -10,6 +10,7 @@ from typing import Any
 
 from odb_autodba.db.awr_checks import (
     build_awr_state_diff,
+    get_awr_report_text_summary_for_window,
     get_awr_capabilities,
     map_run_pair_to_awr_windows,
 )
@@ -909,10 +910,17 @@ class JsonlHistoryService:
             debug_message = json.dumps(mapping.debug or {}, ensure_ascii=True, default=str)
             awr_diff = build_awr_state_diff(window_mapping=mapping, capabilities=caps)
             notes.extend(awr_diff.snapshot_quality.notes[:4] if awr_diff.snapshot_quality else [])
+            awr_diff = self._enrich_awr_with_report_text_if_needed(awr_diff=awr_diff, mapping=mapping, capabilities=caps, notes=notes)
             if not awr_diff.available:
                 notes.append("AWR snapshot mapping was weak; JSONL fallback used for transition reasoning.")
                 return awr_diff, notes, "awr_mapping_weak", debug_message
-            if bool((mapping.debug or {}).get("same_snap_selected")):
+            same_window = (
+                mapping.previous.begin_snap_id is not None
+                and mapping.previous.end_snap_id is not None
+                and mapping.previous.begin_snap_id == mapping.current.begin_snap_id
+                and mapping.previous.end_snap_id == mapping.current.end_snap_id
+            )
+            if same_window or bool((mapping.debug or {}).get("same_snap_selected")):
                 notes.append("AWR snapshots mapped successfully but same-window comparison is weak.")
                 return awr_diff, notes, "awr_same_window_weak", debug_message
             if awr_diff.snapshot_quality and awr_diff.snapshot_quality.coverage_quality in {"LOW", "NONE"}:
@@ -923,6 +931,65 @@ class JsonlHistoryService:
             debug_message = str(exc)
             notes.append("AWR query failed while building workload comparison; JSONL fallback used.")
             return None, notes, "awr_query_failure", debug_message
+
+    def _enrich_awr_with_report_text_if_needed(
+        self,
+        *,
+        awr_diff: AwrStateDiff,
+        mapping: AwrRunPairWindowMapping,
+        capabilities: Any,
+        notes: list[str],
+    ) -> AwrStateDiff:
+        if not awr_diff.available:
+            return awr_diff
+        if awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available:
+            return awr_diff
+        if not self._should_use_awr_report_text_enrichment(awr_diff=awr_diff, mapping=mapping):
+            return awr_diff
+
+        summary = get_awr_report_text_summary_for_window(
+            window=mapping.current,
+            dbid=getattr(capabilities, "dbid", None),
+        )
+        if not summary.available:
+            notes.extend(summary.notes[:2])
+            if mapping.previous.begin_snap_id is not None and mapping.previous.end_snap_id is not None:
+                fallback_summary = get_awr_report_text_summary_for_window(
+                    window=mapping.previous,
+                    dbid=getattr(capabilities, "dbid", None),
+                )
+                if fallback_summary.available:
+                    summary = fallback_summary
+                else:
+                    notes.extend(fallback_summary.notes[:2])
+
+        if summary.available:
+            notes.append(
+                f"AWR report-text summary added for SNAP {summary.begin_snap_id}..{summary.end_snap_id} to enrich sparse metric extraction."
+            )
+            awr_diff = awr_diff.model_copy(update={"awr_report_text_summary": summary})
+        return awr_diff
+
+    def _should_use_awr_report_text_enrichment(
+        self,
+        *,
+        awr_diff: AwrStateDiff,
+        mapping: AwrRunPairWindowMapping,
+    ) -> bool:
+        if not awr_diff.available:
+            return False
+        same_snap_selected = bool((mapping.debug or {}).get("same_snap_selected"))
+        same_window_expansion_applied = bool((mapping.debug or {}).get("same_window_expansion_applied"))
+        coverage_quality = str((awr_diff.snapshot_quality.coverage_quality if awr_diff.snapshot_quality else "NONE") or "NONE").upper()
+        mostly_unavailable = False
+        if awr_diff.workload_metrics:
+            unavailable = sum(
+                1
+                for item in awr_diff.workload_metrics
+                if item.previous_value is None or item.current_value is None
+            )
+            mostly_unavailable = unavailable >= max(2, int(len(awr_diff.workload_metrics) * 0.6))
+        return same_snap_selected or same_window_expansion_applied or coverage_quality in {"LOW", "NONE"} or mostly_unavailable
 
     def _classify_issue_transitions(
         self,
@@ -1540,11 +1607,24 @@ class JsonlHistoryService:
         }.get(category, "other")
 
     def _awr_user_message(self, *, awr_diff: AwrStateDiff | None, fallback_mode: str, notes: list[str]) -> str:
+        text_enriched = bool(awr_diff and awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available)
         if fallback_mode == "none" and awr_diff and awr_diff.available:
+            if awr_diff.awr_mode == "single_window_interpretation":
+                if text_enriched:
+                    return "AWR used single-window interpretation with report-text enrichment; historical context was applied."
+                return "AWR used single-window interpretation; historical context was applied."
+            if text_enriched:
+                return "AWR workload comparison used run-pair snapshot windows and was enriched with AWR report-text summaries."
             return "AWR workload comparison used run-pair snapshot windows."
         if fallback_mode == "awr_same_window_weak":
-            return "AWR snapshots mapped successfully but both runs resolved to the same comparison window; AWR sections are low confidence."
+            if text_enriched:
+                return "AWR used single-window interpretation with report-text enrichment; comparison is not applicable."
+            return "AWR used single-window interpretation because both runs resolved to the same snapshot window."
         if fallback_mode == "awr_metric_incomplete":
+            if text_enriched:
+                return (
+                    "AWR snapshots mapped successfully, but structured metric rows were incomplete; AWR report-text summaries were used for richer context."
+                )
             return "AWR snapshots mapped successfully, but metric rows were incomplete; partial AWR comparison was used."
         if fallback_mode == "awr_query_failure":
             return "AWR query failed while building workload comparison; JSONL fallback used."
@@ -1561,11 +1641,22 @@ class JsonlHistoryService:
         return "AWR workload comparison unavailable; JSONL fallback used."
 
     def _awr_source_summary(self, *, awr_diff: AwrStateDiff | None, fallback_mode: str) -> str:
+        text_enriched = bool(awr_diff and awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available)
         if awr_diff and awr_diff.available:
+            if awr_diff.awr_mode == "single_window_interpretation":
+                if text_enriched:
+                    return "AWR source: single-window analysis with report-text enrichment (comparison not applicable)"
+                return "AWR source: single-window analysis (comparison not applicable)"
             if fallback_mode == "awr_same_window_weak":
-                return "AWR source: available, same-window comparison weak"
+                if text_enriched:
+                    return "AWR source: single-window analysis with report-text enrichment (comparison not applicable)"
+                return "AWR source: single-window analysis (comparison not applicable)"
             if fallback_mode == "awr_metric_incomplete":
+                if text_enriched:
+                    return "AWR source: available, partial metrics + report-text enrichment"
                 return "AWR source: available, partial metrics"
+            if text_enriched:
+                return "AWR source: available, run-pair diff + report-text enrichment"
             return "AWR source: available, run-pair workload diff used"
         if fallback_mode == "awr_disabled":
             return "AWR source: disabled, JSONL fallback used"
@@ -1580,7 +1671,11 @@ class JsonlHistoryService:
         return "AWR source: unavailable, JSONL fallback used"
 
     def _awr_workload_interpretation(self, *, awr_diff: AwrStateDiff | None, fallback_mode: str) -> str:
+        if awr_diff and awr_diff.awr_mode == "single_window_interpretation":
+            return "AWR single-window interpretation is used because previous and current runs mapped to the same snapshot interval."
         if awr_diff and awr_diff.available and awr_diff.workload_interpretation.summary:
+            if awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available:
+                return awr_diff.workload_interpretation.summary + " AWR report-text summary was used to supplement sparse sections."
             return awr_diff.workload_interpretation.summary
         if fallback_mode in {"awr_metric_incomplete", "awr_same_window_weak"}:
             return "AWR workload interpretation is partial due to limited snapshot comparability or incomplete metric rows."

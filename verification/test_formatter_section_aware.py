@@ -140,6 +140,80 @@ class FormatterCleanupTests(unittest.TestCase):
         self.assertIn("AWR wait-class shift details were unavailable", rendered)
         self.assertIn("AWR SQL-change details were unavailable", rendered)
 
+    def test_awr_text_summary_sections_are_stable_and_no_raw_dump(self) -> None:
+        answer = {
+            "summary_lines": [],
+            "awr_state_diff": {
+                "window_mapping": {
+                    "previous": {"begin_snap_id": 210, "end_snap_id": 211, "mapping_quality": "HIGH"},
+                    "current": {"begin_snap_id": 211, "end_snap_id": 212, "mapping_quality": "HIGH"},
+                },
+                "awr_report_text_summary": {
+                    "available": True,
+                    "source": "DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+                    "begin_snap_id": 211,
+                    "end_snap_id": 212,
+                    "load_profile_summary": ["DB Time: low workload (2.00 mins total)", "DB CPU: moderate usage (1.25 mins total)"],
+                    "main_bottlenecks": ["enq: TX - row lock contention\n  -> application/concurrency wait\n  -> impact: contention-sensitive"],
+                    "sql_contributors": ["SQL_ID: 3nkd7x4r8w1pb\n  -> elapsed: 1.59 mins\n  -> classification: SQL contributor from AWR text"],
+                    "recommended_follow_up": ["Review blocking chains for transient row-lock contention."],
+                    "interpretation_summary": ["Workload is low overall with no clear system-level saturation in the AWR window."],
+                    "notes": ["RAW_AWR_DUMP_THIS_SHOULD_NOT_APPEAR"],
+                },
+            },
+        }
+        rendered = render_history_answer(answer)
+        self.assertIn("AWR Snapshot Window", rendered)
+        self.assertIn("Load Profile Summary", rendered)
+        self.assertIn("Main Bottlenecks", rendered)
+        self.assertIn("SQL Contributors", rendered)
+        self.assertIn("Recommended Follow-up", rendered)
+        self.assertIn("AWR Interpretation Summary", rendered)
+        self.assertNotIn("RAW_AWR_DUMP_THIS_SHOULD_NOT_APPEAR", rendered)
+
+    def test_same_window_awr_uses_single_window_mode_not_workload_changes(self) -> None:
+        answer = {
+            "summary_lines": [],
+            "awr_state_diff": {
+                "awr_mode": "single_window_interpretation",
+                "window_mapping": {
+                    "previous": {"begin_snap_id": 216, "end_snap_id": 217, "mapping_quality": "MEDIUM"},
+                    "current": {"begin_snap_id": 216, "end_snap_id": 217, "mapping_quality": "MEDIUM"},
+                },
+                "awr_report_text_summary": {
+                    "available": True,
+                    "load_profile_summary": ["DB Time: low workload (0.60 mins total)"],
+                    "main_bottlenecks": ["db file sequential read\n  -> dominant User I/O wait\n  -> avg latency: 177 us\n  -> impact: moderate"],
+                    "sql_contributors": [],
+                    "recommended_follow_up": ["Validate storage latency and top I/O SQL plans for the AWR window."],
+                    "interpretation_summary": ["Dominant waits are I/O-related; impact should be judged with latency and SQL plan context."],
+                },
+            },
+        }
+        rendered = render_history_answer(answer)
+        self.assertIn("AWR Analysis Mode: Single-window interpretation (historical context applied)", rendered)
+        self.assertNotIn("AWR Workload Changes", rendered)
+        self.assertIn("AWR source: single-window analysis with report-text enrichment (comparison not applicable)", rendered)
+        self.assertIn("AWR mode: Single-window interpretation", rendered)
+        self.assertNotIn("Window-based mapping used", rendered)
+
+    def test_awr_sql_contributors_fallback_message_when_empty(self) -> None:
+        answer = {
+            "summary_lines": [],
+            "awr_state_diff": {
+                "awr_report_text_summary": {
+                    "available": True,
+                    "load_profile_summary": ["DB Time: low workload (0.60 mins total)"],
+                    "main_bottlenecks": [],
+                    "sql_contributors": [],
+                    "recommended_follow_up": [],
+                },
+            },
+        }
+        rendered = render_history_answer(answer)
+        self.assertIn("SQL contributor details were not available for this snapshot window.", rendered)
+        self.assertNotIn("SQL ordered by", rendered)
+
     def test_historical_summary_does_not_repeat_transition_line(self) -> None:
         answer = {
             "summary_lines": [

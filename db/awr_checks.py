@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ from odb_autodba.models.schemas import (
     AwrMemoryState,
     AwrMetricDiff,
     AwrRunPairWindowMapping,
+    AwrReportTextSummary,
     AwrSnapshotQuality,
     AwrSnapshotWindowMapping,
     AwrSqlChangeSummary,
@@ -292,6 +294,9 @@ def map_run_pair_to_awr_windows(
     current_window_start: str | datetime | None = None,
     current_window_end: str | datetime | None = None,
 ) -> AwrRunPairWindowMapping:
+    previous_run_dt = _coerce_dt(previous_run_completed_at)
+    current_run_dt = _coerce_dt(current_run_completed_at)
+
     previous = map_run_to_snapshot_window(
         previous_run_completed_at,
         dbid=dbid,
@@ -308,6 +313,17 @@ def map_run_pair_to_awr_windows(
     notes: list[str] = []
     notes.extend([f"previous: {note}" for note in previous.notes])
     notes.extend([f"current: {note}" for note in current.notes])
+
+    expansion_applied = False
+    expansion_reasons: list[str] = []
+    previous, current, expansion_reasons, expansion_applied = _expand_same_window_pair_if_needed(
+        previous=previous,
+        current=current,
+        dbid=dbid,
+        previous_run_dt=previous_run_dt,
+        current_run_dt=current_run_dt,
+    )
+    notes.extend(expansion_reasons)
 
     prev_quality = _mapping_quality_score(previous.mapping_quality)
     curr_quality = _mapping_quality_score(current.mapping_quality)
@@ -328,18 +344,19 @@ def map_run_pair_to_awr_windows(
         comparability *= 0.4
         notes.append("Both runs map to the same snapshot window; AWR transition confidence is low.")
 
-    previous_run_dt = _coerce_dt(previous_run_completed_at)
-    current_run_dt = _coerce_dt(current_run_completed_at)
     same_matched_snap = (
         previous.matched_snap_id is not None
         and current.matched_snap_id is not None
         and previous.matched_snap_id == current.matched_snap_id
     )
-    if same_matched_snap:
+    if same_matched_snap and not expansion_applied:
         comparability *= 0.5
         notes.append("Both runs mapped to the same matched SNAP_ID; comparison is weak but still reported.")
+    elif same_matched_snap and expansion_applied:
+        notes.append("Matched SNAP_ID remained the same, but expanded begin/end intervals were used to improve comparison context.")
 
     confidence = _comparability_to_confidence(comparability)
+    same_snap_selected = same_matched_snap and not expansion_applied
     debug = {
         "previous_run_timestamp": _format_ts(previous_run_dt),
         "current_run_timestamp": _format_ts(current_run_dt),
@@ -349,7 +366,8 @@ def map_run_pair_to_awr_windows(
         "current_instance_rows_found": current.instance_rows_found,
         "previous_instance_count": previous.instance_count,
         "current_instance_count": current.instance_count,
-        "same_snap_selected": same_matched_snap,
+        "same_snap_selected": same_snap_selected,
+        "same_window_expansion_applied": expansion_applied,
         "begin_end_snap_pair": {
             "previous": [previous.begin_snap_id, previous.end_snap_id],
             "current": [current.begin_snap_id, current.end_snap_id],
@@ -365,15 +383,128 @@ def map_run_pair_to_awr_windows(
     )
 
 
+def _expand_same_window_pair_if_needed(
+    *,
+    previous: AwrSnapshotWindowMapping,
+    current: AwrSnapshotWindowMapping,
+    dbid: int | None,
+    previous_run_dt: datetime | None,
+    current_run_dt: datetime | None,
+) -> tuple[AwrSnapshotWindowMapping, AwrSnapshotWindowMapping, list[str], bool]:
+    if not _valid_window(previous) or not _valid_window(current):
+        return previous, current, [], False
+    same_window = (
+        previous.begin_snap_id is not None
+        and previous.end_snap_id is not None
+        and previous.begin_snap_id == current.begin_snap_id
+        and previous.end_snap_id == current.end_snap_id
+    )
+    same_matched = (
+        previous.matched_snap_id is not None
+        and current.matched_snap_id is not None
+        and previous.matched_snap_id == current.matched_snap_id
+    )
+    if not (same_window or same_matched):
+        return previous, current, [], False
+
+    if previous_run_dt is None or current_run_dt is None:
+        return previous, current, [], False
+
+    logical_snapshots = _load_logical_snapshots(
+        dbid=dbid,
+        scan_start=min(previous_run_dt, current_run_dt) - timedelta(hours=12),
+        scan_end=max(previous_run_dt, current_run_dt) + timedelta(hours=12),
+    )
+    if not logical_snapshots:
+        return previous, current, [], False
+
+    ordered = sorted(logical_snapshots, key=lambda row: int(row.get("snap_id") or 0))
+    snap_ids = [int(row.get("snap_id") or 0) for row in ordered]
+    target_snap_id = _safe_int(previous.matched_snap_id) or _safe_int(previous.end_snap_id)
+    if target_snap_id is None or target_snap_id not in snap_ids:
+        return previous, current, [], False
+
+    index = snap_ids.index(target_snap_id)
+    if len(ordered) < 2:
+        return previous, current, [], False
+
+    prev_begin_idx = max(index - 1, 0)
+    prev_end_idx = index
+    curr_begin_idx = index
+    curr_end_idx = min(index + 1, len(ordered) - 1)
+
+    if prev_begin_idx == prev_end_idx and prev_end_idx < (len(ordered) - 1):
+        prev_end_idx = prev_end_idx + 1
+    if curr_begin_idx == curr_end_idx and curr_begin_idx > 0:
+        curr_begin_idx = curr_begin_idx - 1
+
+    previous_expanded = _expanded_window_from_rows(
+        begin_row=ordered[prev_begin_idx],
+        end_row=ordered[prev_end_idx],
+        matched_row=ordered[index],
+        dbid=dbid,
+        note=(
+            "Expanded previous run to nearest earlier snapshot interval to avoid same-window comparison."
+        ),
+    )
+    current_expanded = _expanded_window_from_rows(
+        begin_row=ordered[curr_begin_idx],
+        end_row=ordered[curr_end_idx],
+        matched_row=ordered[index],
+        dbid=dbid,
+        note=(
+            "Expanded current run to nearest later snapshot interval to avoid same-window comparison."
+        ),
+    )
+    notes = [
+        "Detected same-window/same-SNAP mapping for run pair; attempted interval expansion for AWR comparability.",
+        f"Expanded run-pair windows to previous SNAP {previous_expanded.begin_snap_id}..{previous_expanded.end_snap_id} "
+        f"and current SNAP {current_expanded.begin_snap_id}..{current_expanded.end_snap_id}.",
+    ]
+    return previous_expanded, current_expanded, notes, True
+
+
+def _expanded_window_from_rows(
+    *,
+    begin_row: dict[str, Any],
+    end_row: dict[str, Any],
+    matched_row: dict[str, Any],
+    dbid: int | None,
+    note: str,
+) -> AwrSnapshotWindowMapping:
+    begin_time = _format_ts(_snapshot_begin(begin_row))
+    end_time = _format_ts(_snapshot_end(end_row))
+    matched_begin = _format_ts(_snapshot_begin(matched_row))
+    matched_end = _format_ts(_snapshot_end(matched_row))
+    instance_count = max(int(begin_row.get("instance_count") or 0), int(end_row.get("instance_count") or 0))
+    instance_rows_found = max(int(begin_row.get("instance_rows_found") or 0), int(end_row.get("instance_rows_found") or 0))
+    return AwrSnapshotWindowMapping(
+        dbid=_safe_int(dbid),
+        begin_snap_id=_safe_int(begin_row.get("snap_id")),
+        end_snap_id=_safe_int(end_row.get("snap_id")),
+        matched_snap_id=_safe_int(matched_row.get("snap_id")),
+        begin_time=begin_time,
+        end_time=end_time,
+        matched_begin_time=matched_begin,
+        matched_end_time=matched_end,
+        instance_count=instance_count,
+        instance_rows_found=instance_rows_found,
+        mapping_quality="MEDIUM",
+        notes=[note],
+    )
+
+
 def build_awr_state_diff(
     *,
     window_mapping: AwrRunPairWindowMapping,
     capabilities: AwrCapabilities | None = None,
 ) -> AwrStateDiff:
     caps = capabilities or get_awr_capabilities()
+    awr_mode = _awr_mode_for_mapping(window_mapping)
     if not caps.available:
         return AwrStateDiff(
             available=False,
+            awr_mode=awr_mode,
             capabilities=caps,
             window_mapping=window_mapping,
             snapshot_quality=AwrSnapshotQuality(
@@ -390,6 +521,7 @@ def build_awr_state_diff(
     if not _valid_window(prev) or not _valid_window(curr):
         return AwrStateDiff(
             available=False,
+            awr_mode=awr_mode,
             capabilities=caps,
             window_mapping=window_mapping,
             snapshot_quality=AwrSnapshotQuality(
@@ -505,6 +637,7 @@ def build_awr_state_diff(
 
     return AwrStateDiff(
         available=True,
+        awr_mode=awr_mode,
         capabilities=caps,
         window_mapping=window_mapping,
         load_profile=load_profile,
@@ -540,6 +673,138 @@ def get_top_sql_from_awr(limit: int = 10) -> list[dict]:
         """,
         {"lim": int(limit)},
     )
+
+
+def generate_awr_report_text(
+    *,
+    dbid: int | None,
+    begin_snap_id: int | None,
+    end_snap_id: int | None,
+    instance_number: int | None = None,
+    max_lines: int = 4000,
+) -> list[str]:
+    bid = _safe_int(begin_snap_id)
+    eid = _safe_int(end_snap_id)
+    if bid is None or eid is None or eid < bid:
+        return []
+    if dbid is None:
+        return []
+
+    inst_num = _safe_int(instance_number) or _default_awr_instance_number() or 1
+    rows = fetch_all(
+        """
+        select output
+        from table(dbms_workload_repository.awr_report_text(:dbid, :inst_num, :begin_snap_id, :end_snap_id, 0))
+        """,
+        {
+            "dbid": int(dbid),
+            "inst_num": int(inst_num),
+            "begin_snap_id": int(bid),
+            "end_snap_id": int(eid),
+        },
+    )
+    lines: list[str] = []
+    for row in rows[: max(int(max_lines), 1)]:
+        text = str((row or {}).get("output") or "").rstrip()
+        if text:
+            lines.append(text)
+    return lines
+
+
+def summarize_awr_report_text(
+    report_lines: list[str],
+    *,
+    dbid: int | None,
+    instance_number: int | None,
+    begin_snap_id: int | None,
+    end_snap_id: int | None,
+) -> AwrReportTextSummary:
+    cleaned = [str(line).rstrip() for line in report_lines if str(line or "").strip()]
+    if not cleaned:
+        return AwrReportTextSummary(
+            available=False,
+            source="DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+            dbid=dbid,
+            instance_number=instance_number,
+            begin_snap_id=begin_snap_id,
+            end_snap_id=end_snap_id,
+            notes=["AWR report text returned no lines for this snapshot interval."],
+        )
+
+    load_profile_summary = _build_awr_load_profile_summary(cleaned)
+    main_bottlenecks = _build_awr_bottleneck_summary(cleaned)
+    sql_contributors = _extract_awr_sql_contributors(cleaned, max_items=6)
+    recommended_follow_up = _derive_awr_follow_up(
+        load_profile_summary=load_profile_summary,
+        main_bottlenecks=main_bottlenecks,
+        sql_contributors=sql_contributors,
+    )
+    interpretation_summary = _build_awr_interpretation_summary(
+        load_profile_summary=load_profile_summary,
+        main_bottlenecks=main_bottlenecks,
+        sql_contributors=sql_contributors,
+    )
+
+    return AwrReportTextSummary(
+        available=True,
+        source="DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+        dbid=dbid,
+        instance_number=instance_number,
+        begin_snap_id=begin_snap_id,
+        end_snap_id=end_snap_id,
+        line_count=len(cleaned),
+        load_profile_summary=load_profile_summary,
+        main_bottlenecks=main_bottlenecks,
+        sql_contributors=sql_contributors,
+        recommended_follow_up=recommended_follow_up,
+        interpretation_summary=interpretation_summary,
+    )
+
+
+def get_awr_report_text_summary_for_window(
+    *,
+    window: AwrSnapshotWindowMapping,
+    dbid: int | None = None,
+    instance_number: int | None = None,
+) -> AwrReportTextSummary:
+    effective_dbid = _safe_int(dbid) or _safe_int(window.dbid)
+    bid = _safe_int(window.begin_snap_id)
+    eid = _safe_int(window.end_snap_id)
+    if effective_dbid is None or bid is None or eid is None or eid < bid:
+        return AwrReportTextSummary(
+            available=False,
+            source="DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+            dbid=effective_dbid,
+            instance_number=_safe_int(instance_number),
+            begin_snap_id=bid,
+            end_snap_id=eid,
+            notes=["Snapshot interval was incomplete; AWR report text summary was skipped."],
+        )
+    try:
+        effective_inst = _safe_int(instance_number) or _default_awr_instance_number() or 1
+        lines = generate_awr_report_text(
+            dbid=effective_dbid,
+            begin_snap_id=bid,
+            end_snap_id=eid,
+            instance_number=effective_inst,
+        )
+        return summarize_awr_report_text(
+            lines,
+            dbid=effective_dbid,
+            instance_number=effective_inst,
+            begin_snap_id=bid,
+            end_snap_id=eid,
+        )
+    except Exception as exc:
+        return AwrReportTextSummary(
+            available=False,
+            source="DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT",
+            dbid=effective_dbid,
+            instance_number=_safe_int(instance_number),
+            begin_snap_id=bid,
+            end_snap_id=eid,
+            notes=[f"AWR report text summary failed: {exc}"],
+        )
 
 
 def _collect_load_profile(window: AwrSnapshotWindowMapping, notes: list[str], *, label: str) -> dict[str, float | None]:
@@ -1330,6 +1595,19 @@ def _valid_window(window: AwrSnapshotWindowMapping) -> bool:
     return window.begin_snap_id is not None and window.end_snap_id is not None and window.end_snap_id >= window.begin_snap_id
 
 
+def _awr_mode_for_mapping(window_mapping: AwrRunPairWindowMapping) -> str:
+    previous = window_mapping.previous
+    current = window_mapping.current
+    if (
+        previous.begin_snap_id is not None
+        and previous.end_snap_id is not None
+        and previous.begin_snap_id == current.begin_snap_id
+        and previous.end_snap_id == current.end_snap_id
+    ):
+        return "single_window_interpretation"
+    return "comparison"
+
+
 def _pct(numerator: float | None, denominator: float | None) -> float | None:
     num = _safe_float(numerator)
     den = _safe_float(denominator)
@@ -1571,6 +1849,387 @@ def _to_mb(value: float | None) -> float | None:
     if value is None:
         return None
     return round(float(value) / 1024.0 / 1024.0, 3)
+
+
+def _default_awr_instance_number() -> int | None:
+    try:
+        row = fetch_one("select min(instance_number) as instance_number from gv$instance") or {}
+        candidate = _safe_int(row.get("instance_number"))
+        if candidate is not None:
+            return candidate
+    except Exception:
+        pass
+    try:
+        row = fetch_one("select instance_number from v$instance") or {}
+        return _safe_int(row.get("instance_number"))
+    except Exception:
+        return None
+
+
+def _build_awr_load_profile_summary(lines: list[str]) -> list[str]:
+    metric_lines: dict[str, str] = {}
+    for raw in lines:
+        lower = raw.lower()
+        for key in (
+            "db time",
+            "db cpu",
+            "redo size",
+            "parse",
+            "execute",
+            "transaction",
+            "logical read",
+            "physical read",
+        ):
+            if key in lower and key not in metric_lines and _numbers_from_awr_line(raw):
+                metric_lines[key] = raw
+
+    out: list[str] = []
+    db_time = _best_awr_number(metric_lines.get("db time"))
+    if db_time is not None:
+        out.append(f"DB Time: {_workload_label(db_time, low=60.0, high=900.0)} workload ({_format_seconds_or_minutes(db_time)} total)")
+    db_cpu = _best_awr_number(metric_lines.get("db cpu"))
+    if db_cpu is not None:
+        out.append(f"DB CPU: {_usage_label(db_cpu, low=30.0, high=600.0)} usage ({_format_seconds_or_minutes(db_cpu)} total)")
+    redo = _best_awr_number(metric_lines.get("redo size"))
+    if redo is not None:
+        out.append(f"Redo Generation: {_volume_label(redo)} ({_format_bytes(redo)})")
+    parses = _best_awr_number(metric_lines.get("parse"))
+    if parses is not None:
+        out.append(f"Parse Activity: {_activity_label(parses, low=100.0, high=5000.0)} ({_format_count(parses)} calls)")
+    executes = _best_awr_number(metric_lines.get("execute"))
+    if executes is not None:
+        out.append(f"SQL Executions: {_activity_label(executes, low=100.0, high=10000.0)} ({_format_count(executes)} executions)")
+    transactions = _best_awr_number(metric_lines.get("transaction"))
+    if transactions is not None:
+        out.append(f"Transactions: {_activity_label(transactions, low=50.0, high=5000.0)} ({_format_count(transactions)} total)")
+    logical = _best_awr_number(metric_lines.get("logical read"))
+    if logical is not None:
+        out.append(f"Logical Reads: {_activity_label(logical, low=10000.0, high=1000000.0)} ({_format_count(logical)} reads)")
+    physical = _best_awr_number(metric_lines.get("physical read"))
+    if physical is not None:
+        out.append(f"Physical Reads: {_activity_label(physical, low=1000.0, high=100000.0)} ({_format_count(physical)} reads)")
+    return _dedupe_text(out)[:8]
+
+
+def _build_awr_bottleneck_summary(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    seen_events: set[str] = set()
+    for raw in lines:
+        event = _awr_wait_event_name(raw)
+        if not event or event.lower() in seen_events:
+            continue
+        seen_events.add(event.lower())
+        wait_class = _awr_wait_class(event)
+        latency = _awr_latency_summary(raw)
+        impact = _awr_impact_label(raw, event)
+        lines_for_event = [
+            event,
+            f"  -> {wait_class}",
+        ]
+        if latency:
+            lines_for_event.append(f"  -> avg latency: {latency}")
+        lines_for_event.append(f"  -> impact: {impact}")
+        out.append("\n".join(lines_for_event))
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _extract_awr_lines(
+    lines: list[str],
+    *,
+    keywords: tuple[str, ...],
+    require_number: bool,
+    max_items: int,
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in lines:
+        lower = raw.lower()
+        if not any(keyword in lower for keyword in keywords):
+            continue
+        if require_number and not any(char.isdigit() for char in raw):
+            continue
+        cleaned = " ".join(raw.split())
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned[:160])
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _extract_awr_sql_contributors(lines: list[str], *, max_items: int) -> list[str]:
+    out: list[str] = []
+    seen_sql: set[str] = set()
+    for raw in lines:
+        sql_ids = _sql_ids_from_line(raw)
+        if not sql_ids:
+            continue
+        sql_id = sql_ids[0]
+        if sql_id in seen_sql:
+            continue
+        seen_sql.add(sql_id)
+        numbers = _numbers_from_awr_line(raw)
+        elapsed = _format_seconds_or_minutes(numbers[0]) if numbers else "-"
+        executions = _format_count(numbers[-1]) if len(numbers) >= 2 else "-"
+        classification = _sql_text_classification(raw)
+        impact = "dominant workload driver" if len(out) == 0 else "candidate workload contributor"
+        out.append(
+            "\n".join(
+                [
+                    f"SQL_ID: {sql_id}",
+                    f"  -> elapsed: {elapsed}",
+                    f"  -> executions: {executions}",
+                    "  -> module: not available in report text",
+                    f"  -> classification: {classification}",
+                    f"  -> impact: {impact}",
+                ]
+            )
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _sql_ids_from_line(text: str) -> list[str]:
+    candidate = text.lower()
+    out: list[str] = []
+    token = ""
+    for char in candidate:
+        if char.isalnum():
+            token += char
+            continue
+        if len(token) == 13 and token.isalnum():
+            out.append(token)
+        token = ""
+    if len(token) == 13 and token.isalnum():
+        out.append(token)
+    return out
+
+
+def _numbers_from_awr_line(text: Any) -> list[float]:
+    cleaned = str(text or "").replace(",", "")
+    values: list[float] = []
+    for match in re.finditer(r"(?<![A-Za-z0-9_])-?\d+(?:\.\d+)?(?![A-Za-z0-9_])", cleaned):
+        try:
+            values.append(float(match.group(0)))
+        except Exception:
+            continue
+    return values
+
+
+def _best_awr_number(text: str | None) -> float | None:
+    numbers = _numbers_from_awr_line(text)
+    if not numbers:
+        return None
+    return max(abs(number) for number in numbers)
+
+
+def _workload_label(value: float, *, low: float, high: float) -> str:
+    if value < low:
+        return "low"
+    if value >= high:
+        return "high"
+    return "moderate"
+
+
+def _usage_label(value: float, *, low: float, high: float) -> str:
+    if value < low:
+        return "minimal"
+    if value >= high:
+        return "high"
+    return "moderate"
+
+
+def _activity_label(value: float, *, low: float, high: float) -> str:
+    if value < low:
+        return "low"
+    if value >= high:
+        return "high"
+    return "moderate"
+
+
+def _volume_label(value: float) -> str:
+    if value < 1024.0 * 1024.0:
+        return "very low"
+    if value >= 1024.0 * 1024.0 * 1024.0:
+        return "high"
+    return "moderate"
+
+
+def _format_seconds_or_minutes(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if abs(value) >= 60.0:
+        return f"{value / 60.0:.2f} mins"
+    return f"{value:.2f} secs"
+
+
+def _format_count(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.0f}"
+
+
+def _format_bytes(value: float | None) -> str:
+    if value is None:
+        return "-"
+    abs_value = abs(value)
+    if abs_value >= 1024.0 * 1024.0 * 1024.0:
+        return f"{value / (1024.0 * 1024.0 * 1024.0):.2f} GB"
+    if abs_value >= 1024.0 * 1024.0:
+        return f"{value / (1024.0 * 1024.0):.2f} MB"
+    if abs_value >= 1024.0:
+        return f"{value / 1024.0:.2f} KB"
+    return f"{value:.0f} bytes"
+
+
+def _awr_wait_event_name(raw: str) -> str | None:
+    text = " ".join(str(raw or "").split())
+    lower = text.lower()
+    known_events = (
+        "db file sequential read",
+        "db file scattered read",
+        "log file sync",
+        "log file parallel write",
+        "direct path read",
+        "direct path write",
+        "enq: tx - row lock contention",
+        "enq: tm - contention",
+        "resmgr:cpu quantum",
+        "library cache lock",
+        "library cache: mutex",
+        "latch free",
+        "cpu time",
+    )
+    for event in known_events:
+        if event in lower:
+            return event
+    if lower.startswith("enq:"):
+        return text.split("  ")[0].strip() or text
+    return None
+
+
+def _awr_wait_class(event: str) -> str:
+    lower = event.lower()
+    if "db file" in lower or "direct path" in lower:
+        return "dominant User I/O wait"
+    if "log file sync" in lower:
+        return "commit latency"
+    if "log file parallel" in lower:
+        return "redo write latency"
+    if "enq:" in lower:
+        return "application/concurrency wait"
+    if "resmgr" in lower:
+        return "Resource Manager CPU scheduling wait"
+    if "library cache" in lower or "latch" in lower:
+        return "shared pool/library cache serialization"
+    if "cpu" in lower:
+        return "CPU service time"
+    return "foreground wait event"
+
+
+def _awr_latency_summary(raw: str) -> str:
+    lower = str(raw or "").lower()
+    numbers = _numbers_from_awr_line(raw)
+    if not numbers:
+        return ""
+    candidate = numbers[-1]
+    if "us" in lower or "micro" in lower:
+        return f"{candidate:.0f} us"
+    if "ms" in lower or candidate < 100.0:
+        return f"{candidate:.2f} ms"
+    return f"{candidate:.0f} us"
+
+
+def _awr_impact_label(raw: str, event: str) -> str:
+    lower = f"{raw} {event}".lower()
+    numbers = _numbers_from_awr_line(raw)
+    peak = max(numbers) if numbers else 0.0
+    if "log file sync" in lower and peak >= 3.0:
+        return "noticeable"
+    if "enq:" in lower:
+        return "contention-sensitive"
+    if peak >= 1000.0:
+        return "high"
+    if peak > 0:
+        return "moderate"
+    return "low"
+
+
+def _sql_text_classification(raw: str) -> str:
+    lower = str(raw or "").lower()
+    if "scheduler" in lower or "dbms_scheduler" in lower:
+        return "scheduler/internal SQL"
+    if "sys" in lower or "system" in lower:
+        return "oracle internal SQL"
+    return "SQL contributor from AWR text"
+
+
+def _build_awr_interpretation_summary(
+    *,
+    load_profile_summary: list[str],
+    main_bottlenecks: list[str],
+    sql_contributors: list[str],
+) -> list[str]:
+    joined_load = " ".join(load_profile_summary).lower()
+    joined_bottlenecks = " ".join(main_bottlenecks).lower()
+    out: list[str] = []
+    if "low workload" in joined_load or "minimal usage" in joined_load:
+        out.append("Workload is low overall with no clear system-level saturation in the AWR window.")
+    elif load_profile_summary:
+        out.append("Workload is measurable in the AWR window; validate whether the sampled interval matches the incident.")
+    if sql_contributors:
+        out.append("SQL contributor evidence is available; review the listed SQL_IDs before assuming host-level pressure.")
+    else:
+        out.append("SQL contributor details were not available for this snapshot window.")
+    if "user i/o" in joined_bottlenecks:
+        out.append("Dominant waits are I/O-related; impact should be judged with latency and SQL plan context.")
+    if "commit latency" in joined_bottlenecks:
+        out.append("Commit latency is visible; review log file sync and redo write behavior if application commits are frequent.")
+    if "contention" in joined_bottlenecks:
+        out.append("Contention waits appear in the AWR window; verify whether blockers were transient or still active.")
+    if not main_bottlenecks:
+        out.append("No dominant wait-event bottleneck was parsed from AWR report text.")
+    out.append("AWR findings should be correlated with health-run evidence because snapshot windows may not line up exactly with symptoms.")
+    return _dedupe_text(out)[:6]
+
+
+def _dedupe_text(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _derive_awr_follow_up(
+    *,
+    load_profile_summary: list[str],
+    main_bottlenecks: list[str],
+    sql_contributors: list[str],
+) -> list[str]:
+    lower_bottlenecks = " ".join(main_bottlenecks).lower()
+    follow_up: list[str] = []
+    if "enq: tx" in lower_bottlenecks or "concurrency" in lower_bottlenecks:
+        follow_up.append("Review historical and live blocking chains for transient row-lock contention.")
+    if "db file" in lower_bottlenecks or "direct path" in lower_bottlenecks:
+        follow_up.append("Validate storage latency and top I/O SQL plans for the AWR window.")
+    if "resmgr" in lower_bottlenecks:
+        follow_up.append("Inspect Resource Manager directives and scheduler workload concurrency.")
+    if sql_contributors:
+        follow_up.append("Drill into listed SQL contributors with SQL Monitor/ASH for execution-plan stability.")
+    if not follow_up and load_profile_summary:
+        follow_up.append("Cross-check load-profile signals against host/container utilization for the same AWR window.")
+    if not follow_up:
+        follow_up.append("Capture an explicit AWR interval around the incident and compare with ASH top waits.")
+    return follow_up[:4]
 
 
 def _probe_component(sql: str) -> bool:

@@ -74,13 +74,25 @@ APP_CSS = """
   width: 100%;
 }
 #remediation-card { border: 1px solid #d6dee8; border-radius: 20px; padding: 18px; background: linear-gradient(180deg, #f9fbfd 0%, #eef4f8 100%); }
-#app-shell button {
+.action-primary-btn button {
   background: #f6c343 !important;
   border: 1px solid #d4a52a !important;
   color: #2b2100 !important;
+  font-weight: 700 !important;
+  border-radius: 10px !important;
 }
-#app-shell button:hover {
+.action-primary-btn button:hover {
   background: #ffd157 !important;
+}
+.action-secondary-btn button {
+  background: #f3f4f6 !important;
+  border: 1px solid #d1d5db !important;
+  color: #111827 !important;
+  font-weight: 600 !important;
+  border-radius: 10px !important;
+}
+.action-secondary-btn button:hover {
+  background: #e5e7eb !important;
 }
 """
 
@@ -177,15 +189,15 @@ def build_app() -> gr.Blocks:
                 )
                 with gr.Group(elem_id="shortcut-rail-card"):
                     for label, prompt in WORKFLOW_PROMPTS:
-                        btn = gr.Button(label, variant="primary", elem_classes=["workflow-shortcut-btn"])
+                        btn = gr.Button(label, variant="primary", elem_classes=["workflow-shortcut-btn", "action-primary-btn"])
                         shortcut_clicks.append((btn, prompt))
             with gr.Column(scale=4, elem_id="center-panel"):
                 chatbot = gr.Chatbot(type="messages", label="Planner Chat", height=550)
                 message = gr.Textbox(lines=4, placeholder="Ask about Oracle health, SQL_ID, ORA errors, blocking, or trends.", label="Message")
                 with gr.Row():
-                    send_btn = gr.Button("Send", variant="primary")
-                    investigate_btn = gr.Button("Investigate with AI")
-                    clear_btn = gr.Button("Clear")
+                    send_btn = gr.Button("Send", variant="primary", elem_classes=["action-primary-btn"])
+                    investigate_btn = gr.Button("Investigate with AI", variant="primary", elem_classes=["action-primary-btn"])
+                    clear_btn = gr.Button("Clear", variant="secondary", elem_classes=["action-secondary-btn"])
                 with gr.Group(elem_id="remediation-card"):
                     remediation_md = gr.Markdown("No remediation proposed for the current analysis.")
                     confirm_checkbox = gr.Checkbox(label="I have reviewed the target session and want to allow this action.", value=False)

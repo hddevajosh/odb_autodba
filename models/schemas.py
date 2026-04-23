@@ -821,8 +821,25 @@ class AwrSnapshotQuality(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class AwrReportTextSummary(BaseModel):
+    available: bool = False
+    source: str = ""
+    dbid: int | None = None
+    instance_number: int | None = None
+    begin_snap_id: int | None = None
+    end_snap_id: int | None = None
+    line_count: int = 0
+    load_profile_summary: list[str] = Field(default_factory=list)
+    main_bottlenecks: list[str] = Field(default_factory=list)
+    sql_contributors: list[str] = Field(default_factory=list)
+    recommended_follow_up: list[str] = Field(default_factory=list)
+    interpretation_summary: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class AwrStateDiff(BaseModel):
     available: bool = False
+    awr_mode: Literal["comparison", "single_window_interpretation"] = "comparison"
     capabilities: AwrCapabilities | None = None
     window_mapping: AwrRunPairWindowMapping = Field(default_factory=AwrRunPairWindowMapping)
     load_profile: list[AwrMetricDiff] = Field(default_factory=list)
@@ -838,6 +855,7 @@ class AwrStateDiff(BaseModel):
     sql_change_summary: AwrSqlChangeSummary = Field(default_factory=AwrSqlChangeSummary)
     ash_state: AwrAshState = Field(default_factory=AwrAshState)
     snapshot_quality: AwrSnapshotQuality = Field(default_factory=AwrSnapshotQuality)
+    awr_report_text_summary: AwrReportTextSummary = Field(default_factory=AwrReportTextSummary)
     notes: list[str] = Field(default_factory=list)
 
 

@@ -484,15 +484,32 @@ def render_history_answer(answer: dict[str, Any]) -> str:
     domain = answer.get("domain")
     time_scope = answer.get("time_scope") or {}
     transition = answer.get("state_transition") or (context.state_transition if context else None)
-    awr_state_diff = answer.get("awr_state_diff") or (transition.awr_state_diff if transition else None)
+    transition_data = _history_mapping(transition)
+    transition_awr = transition_data.get("awr_state_diff")
+    if transition_awr is None and transition is not None and hasattr(transition, "awr_state_diff"):
+        transition_awr = getattr(transition, "awr_state_diff")
+    awr_state_diff = answer.get("awr_state_diff") or transition_awr
     history_source = answer.get("history_source_summary") or answer.get("history_source_note") or (
         f"History source: {answer.get('history_source_used') or (context.history_source_used if context else 'raw JSONL only')}."
     )
-    awr_source_summary = answer.get("awr_source_summary") or (transition.awr_source_summary if transition else None)
-    fallback_summary = answer.get("fallback_summary") or (transition.fallback_summary if transition else None)
-    transition_data = _history_mapping(transition)
+    awr_source_summary = answer.get("awr_source_summary") or transition_data.get("awr_source_summary")
+    fallback_summary = answer.get("fallback_summary") or transition_data.get("fallback_summary")
     awr_data = _history_mapping(awr_state_diff)
-    learning_data = _history_mapping(answer.get("learning_features") or (transition.learning_features if transition else None))
+    window_mapping = _history_mapping(awr_data.get("window_mapping"))
+    previous_window = _history_mapping(window_mapping.get("previous"))
+    current_window = _history_mapping(window_mapping.get("current"))
+    awr_report_text_summary = _history_mapping(awr_data.get("awr_report_text_summary"))
+    awr_mode = str(awr_data.get("awr_mode") or _infer_awr_mode(previous_window, current_window))
+    single_window_awr = awr_mode == "single_window_interpretation"
+    if not awr_source_summary and single_window_awr:
+        if awr_report_text_summary.get("available"):
+            awr_source_summary = "AWR source: single-window analysis with report-text enrichment (comparison not applicable)"
+        else:
+            awr_source_summary = "AWR source: single-window analysis (comparison not applicable)"
+    transition_learning = transition_data.get("learning_features")
+    if transition_learning is None and transition is not None and hasattr(transition, "learning_features"):
+        transition_learning = getattr(transition, "learning_features")
+    learning_data = _history_mapping(answer.get("learning_features") or transition_learning)
     fallback_info = _history_mapping(transition_data.get("awr_fallback_info"))
     section_naming = _history_mapping(transition_data.get("section_naming"))
     primary_driver_title = section_naming.get("primary_driver_section_title") or _primary_driver_title_for_outcome(
@@ -596,7 +613,6 @@ def render_history_answer(answer: dict[str, Any]) -> str:
     else:
         lines.append("No issue-transition rows were captured.")
 
-    lines.extend(["", _section_heading("AWR Workload Changes", informational=True), ""])
     workload_metric_rows = awr_data.get("workload_metrics") if isinstance(awr_data.get("workload_metrics"), list) else []
     if not workload_metric_rows:
         load_profile_rows = awr_data.get("load_profile") if isinstance(awr_data.get("load_profile"), list) else []
@@ -613,8 +629,13 @@ def render_history_answer(answer: dict[str, Any]) -> str:
             for row in load_profile_rows
         ]
     historical_confidence = _history_mapping(transition_data.get("historical_confidence"))
-    if workload_metric_rows:
-        awr_rows = []
+    awr_rows: list[dict[str, Any]] = []
+    if single_window_awr:
+        lines.extend(["", _section_heading("AWR Analysis Mode", informational=True), ""])
+        lines.append("AWR Analysis Mode: Single-window interpretation (historical context applied)")
+    else:
+        lines.extend(["", _section_heading("AWR Workload Changes", informational=True), ""])
+    if workload_metric_rows and not single_window_awr:
         for row in workload_metric_rows[:20]:
             awr_rows.append(
                 {
@@ -640,11 +661,11 @@ def render_history_answer(answer: dict[str, Any]) -> str:
             awr_workload_interpretation = transition_data.get("awr_workload_interpretation") or _history_mapping(awr_data.get("workload_interpretation")).get("summary")
             if awr_workload_interpretation:
                 lines.append(f"- {awr_workload_interpretation}")
-    else:
+    elif not single_window_awr:
         fallback_reason = fallback_info.get("awr_user_message") or historical_confidence.get("fallback_reason") or "AWR workload comparison unavailable; JSONL fallback used."
         lines.append(f"AWR workload comparison fallback: {fallback_reason}")
 
-    lines.extend(["", _section_heading("Wait Class Shift", informational=True), ""])
+    lines.extend(["", _section_heading("Wait Event Profile" if single_window_awr else "Wait Class Shift", informational=True), ""])
     wait_shift = _history_mapping(awr_data.get("wait_shift_summary")) or _history_mapping(awr_data.get("wait_class_shift"))
     if wait_shift:
         wait_summary_rows = [
@@ -663,13 +684,16 @@ def render_history_answer(answer: dict[str, Any]) -> str:
             wait_summary_rows,
             ["previous_dominant_wait_class", "current_dominant_wait_class", "previous_top_event", "current_top_event"],
         ):
-            lines.append("AWR wait-class shift details were unavailable for the mapped comparison window.")
+            if single_window_awr:
+                lines.append("AWR wait-event details were unavailable for the mapped snapshot window.")
+            else:
+                lines.append("AWR wait-class shift details were unavailable for the mapped comparison window.")
         else:
             lines.append(_render_table(wait_summary_rows, list(wait_summary_rows[0].keys())))
     else:
         lines.append("Wait-class shift evidence unavailable.")
 
-    lines.extend(["", _section_heading("SQL Change Summary", informational=True), ""])
+    lines.extend(["", _section_heading("SQL Activity Summary" if single_window_awr else "SQL Change Summary", informational=True), ""])
     sql_change = _history_mapping(awr_data.get("sql_change_summary")) or _history_mapping(awr_data.get("sql_change"))
     if sql_change:
         sql_summary_rows = [
@@ -701,11 +725,110 @@ def render_history_answer(answer: dict[str, Any]) -> str:
                 "dominant_sql_module_current",
             ],
         ):
-            lines.append("AWR SQL-change details were unavailable for the mapped comparison window.")
+            if single_window_awr:
+                lines.append("AWR SQL details were unavailable for the mapped snapshot window.")
+            else:
+                lines.append("AWR SQL-change details were unavailable for the mapped comparison window.")
         else:
             lines.append(_render_table(sql_summary_rows, list(sql_summary_rows[0].keys())))
     else:
-        lines.append("AWR SQL-change intelligence unavailable; SQL regression inferred from JSONL metric deltas when possible.")
+        if single_window_awr:
+            lines.append("AWR SQL activity details were unavailable for this snapshot window.")
+        else:
+            lines.append("AWR SQL-change intelligence unavailable; SQL regression inferred from JSONL metric deltas when possible.")
+
+    snapshot_mapping_summary = transition_data.get("snapshot_mapping_summary")
+    lines.extend(["", _section_heading("AWR Snapshot Window", informational=True), ""])
+    window_rows: list[dict[str, Any]] = []
+    if previous_window.get("begin_snap_id") is not None:
+        window_rows.append(
+            {
+                "window": "previous",
+                "begin_snap": previous_window.get("begin_snap_id"),
+                "end_snap": previous_window.get("end_snap_id"),
+                "quality": previous_window.get("mapping_quality") or "-",
+            }
+        )
+    if current_window.get("begin_snap_id") is not None:
+        window_rows.append(
+            {
+                "window": "current",
+                "begin_snap": current_window.get("begin_snap_id"),
+                "end_snap": current_window.get("end_snap_id"),
+                "quality": current_window.get("mapping_quality") or "-",
+            }
+        )
+    if window_rows:
+        lines.append(_render_table(window_rows, ["window", "begin_snap", "end_snap", "quality"]))
+    else:
+        lines.append("AWR snapshot window mapping was unavailable.")
+
+    lines.extend(["", _section_heading("Load Profile Summary", informational=True), ""])
+    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("load_profile_summary"), list):
+        load_items = [str(row) for row in awr_report_text_summary.get("load_profile_summary", [])[:8] if str(row).strip()]
+        lines.extend(_render_awr_bullet_lines(load_items, empty="Load-profile highlights were not available for this snapshot window."))
+    elif workload_metric_rows:
+        concise = [
+            row
+            for row in awr_rows
+            if row.get("previous") != "-" or row.get("current") != "-" or row.get("delta") != "-"
+        ][:6]
+        if concise:
+            lines.append(_render_table(concise, ["metric", "previous", "current", "delta", "%delta", "significance"]))
+        else:
+            lines.append("Load-profile metrics were sparse in this mapped interval.")
+    else:
+        lines.append("Load-profile summary unavailable.")
+
+    lines.extend(["", _section_heading("Main Bottlenecks", informational=True), ""])
+    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("main_bottlenecks"), list):
+        bottlenecks = [str(item) for item in awr_report_text_summary.get("main_bottlenecks", []) if str(item).strip()]
+        lines.extend(_render_awr_bullet_lines(bottlenecks[:5], empty="Main bottleneck details were not available for this snapshot window."))
+    else:
+        interpretation = wait_shift.get("interpretation") if isinstance(wait_shift, dict) else None
+        if interpretation:
+            lines.append(f"- {interpretation}")
+        else:
+            lines.append("- Main bottleneck evidence unavailable.")
+
+    lines.extend(["", _section_heading("SQL Contributors", informational=True), ""])
+    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("sql_contributors"), list):
+        sql_lines = [str(item) for item in awr_report_text_summary.get("sql_contributors", []) if str(item).strip()]
+        lines.extend(
+            _render_awr_bullet_lines(
+                sql_lines[:5],
+                empty="SQL contributor details were not available for this snapshot window.",
+            )
+        )
+    elif sql_change:
+        dom_prev = sql_change.get("dominant_sql_id_previous") or "-"
+        dom_curr = sql_change.get("dominant_sql_id_current") or "-"
+        if dom_prev == "-" and dom_curr == "-":
+            lines.append("- SQL contributor details were not available for this snapshot window.")
+        else:
+            lines.append(f"- Dominant SQL previous/current: {dom_prev} -> {dom_curr}")
+    else:
+        lines.append("- SQL contributor evidence unavailable.")
+
+    lines.extend(["", _section_heading("Recommended Follow-up", informational=True), ""])
+    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("recommended_follow_up"), list):
+        follow_up = [str(item) for item in awr_report_text_summary.get("recommended_follow_up", []) if str(item).strip()]
+        lines.extend(_render_awr_bullet_lines(follow_up[:6], empty="No AWR-specific follow-up suggestions were generated."))
+    else:
+        lines.append("- Capture a wider AWR interval with matching ASH window if mapped sections remain sparse.")
+
+    lines.extend(["", _section_heading("AWR Interpretation Summary", informational=True), ""])
+    interpretation_items = []
+    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("interpretation_summary"), list):
+        interpretation_items = [str(item) for item in awr_report_text_summary.get("interpretation_summary", []) if str(item).strip()]
+    if single_window_awr:
+        interpretation_items.append("AWR trend context is limited because previous and current runs mapped to the same snapshot window.")
+    lines.extend(
+        _render_awr_bullet_lines(
+            _dedupe_strings(interpretation_items)[:6],
+            empty="AWR interpretation summary was unavailable for this snapshot window.",
+        )
+    )
 
     lines.extend(["", _section_heading("Event Timeline", informational=True), ""])
     timeline_entries = transition_data.get("event_timeline_entries")
@@ -726,46 +849,30 @@ def render_history_answer(answer: dict[str, Any]) -> str:
         lines.append("Learning-feature vector unavailable.")
 
     lines.extend(["", _section_heading("Confidence + Coverage Notes", informational=True), ""])
-    coverage_notes = transition_data.get("coverage_notes") if isinstance(transition_data.get("coverage_notes"), list) else []
-    snapshot_mapping_summary = transition_data.get("snapshot_mapping_summary")
-    window_mapping = _history_mapping(awr_data.get("window_mapping"))
-    previous_window = _history_mapping(window_mapping.get("previous"))
-    current_window = _history_mapping(window_mapping.get("current"))
     if historical_confidence:
-        history_source_note = str(transition_data.get("history_source_summary") or historical_confidence.get("history_source_used") or "-")
-        awr_source_note = str(transition_data.get("awr_source_summary") or "-")
-        history_source_note = _strip_prefixed_label(history_source_note, "History source")
-        awr_source_note = _strip_prefixed_label(awr_source_note, "AWR source")
         lines.append(f"- Confidence: {historical_confidence.get('confidence_level') or 'LOW'}")
         lines.append(f"- Coverage: {historical_confidence.get('coverage_quality') or 'LOW'}")
-        lines.append(f"- History source: {history_source_note}")
-        lines.append(f"- AWR source: {awr_source_note}")
-        confidence_reason = str(historical_confidence.get("confidence_reason") or "").strip()
-        fallback_reason = str(historical_confidence.get("fallback_reason") or "").strip()
-        if confidence_reason:
-            lines.append(f"- Confidence reason: {confidence_reason}")
-        elif fallback_reason:
-            lines.append(f"- Fallback: {fallback_reason}")
     else:
         snapshot_quality = _history_mapping(awr_data.get("snapshot_quality"))
         if snapshot_quality:
-            lines.append(
-                "- "
-                + (
-                    f"AWR coverage={snapshot_quality.get('coverage_quality')}, "
-                    f"comparability={snapshot_quality.get('comparability_score')}, "
-                    f"confidence={snapshot_quality.get('confidence')}."
-                )
-            )
-    if previous_window.get("begin_snap_id") is not None:
+            lines.append(f"- Confidence: {snapshot_quality.get('confidence') or 'LOW'}")
+            lines.append(f"- Coverage: {snapshot_quality.get('coverage_quality') or 'LOW'}")
+    lines.append(
+        "- AWR mode: "
+        + (
+            "Single-window interpretation (historical context applied)"
+            if single_window_awr
+            else "Run-pair comparison"
+        )
+    )
+    if single_window_awr and previous_window.get("begin_snap_id") is not None:
+        lines.append(f"- Snapshot window: SNAP {previous_window.get('begin_snap_id')}..{previous_window.get('end_snap_id')}")
+    elif previous_window.get("begin_snap_id") is not None:
         lines.append(f"- Previous window: SNAP {previous_window.get('begin_snap_id')}..{previous_window.get('end_snap_id')}")
-    if current_window.get("begin_snap_id") is not None:
+    if not single_window_awr and current_window.get("begin_snap_id") is not None:
         lines.append(f"- Current window: SNAP {current_window.get('begin_snap_id')}..{current_window.get('end_snap_id')}")
     if snapshot_mapping_summary and previous_window.get("begin_snap_id") is None and current_window.get("begin_snap_id") is None:
         lines.append(f"- Snapshot mapping: {snapshot_mapping_summary}")
-    if coverage_notes:
-        deduped = _dedupe_strings(coverage_notes)
-        lines.extend(f"- {note}" for note in deduped[:1])
 
     lines.extend(["", _section_heading("Recurring Patterns", status="WARNING" if context and context.recurring_findings else "OK"), ""])
     ranked_recurring = transition_data.get("recurring_patterns_ranked") or (context.recurring_findings if context else [])
@@ -968,6 +1075,31 @@ def _history_mapping(payload: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _infer_awr_mode(previous_window: dict[str, Any], current_window: dict[str, Any]) -> str:
+    if (
+        previous_window.get("begin_snap_id") is not None
+        and previous_window.get("end_snap_id") is not None
+        and previous_window.get("begin_snap_id") == current_window.get("begin_snap_id")
+        and previous_window.get("end_snap_id") == current_window.get("end_snap_id")
+    ):
+        return "single_window_interpretation"
+    return "comparison"
+
+
+def _render_awr_bullet_lines(items: list[str], *, empty: str) -> list[str]:
+    if not items:
+        return [f"- {empty}"]
+    lines: list[str] = []
+    for item in items:
+        parts = [part.rstrip() for part in str(item).splitlines() if part.strip()]
+        if not parts:
+            continue
+        lines.append(f"- {parts[0].strip()}")
+        for part in parts[1:]:
+            lines.append(f"  {part.strip()}")
+    return lines or [f"- {empty}"]
 
 
 def _primary_driver_title_for_outcome(outcome: str) -> str:
