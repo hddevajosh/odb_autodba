@@ -481,4 +481,3 @@ Workspace venv:
 ```bash
 .venv/bin/python -m odb_autodba
 ```
-
