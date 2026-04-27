@@ -29,70 +29,43 @@ APP_CSS = """
   position: sticky;
   top: 16px;
   align-self: flex-start;
-  padding-right: 14px;
-  height: fit-content;
-  max-height: calc(100vh - 24px);
+  padding-right: 20px;
 }
-#shortcut-rail-card {
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  padding: 2px 0 0 0;
+#action-rail .rail-title {
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #5d6878;
+  margin-bottom: 10px;
 }
-#shortcut-rail-card > div {
-  border: 0 !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-  box-shadow: none !important;
-  padding: 0 !important;
-}
-#workflow-shortcuts-title {
-  margin-bottom: 6px;
-}
-#workflow-shortcuts-title .title-main {
-  font-size: 1.08rem;
-  font-weight: 800;
-  letter-spacing: 0.02em;
-  color: #f6c343;
-}
-#workflow-shortcuts-title .title-sub {
-  font-size: 0.95rem;
+#action-rail .workflow-button {
+  border-radius: 16px;
+  min-height: 54px;
   font-weight: 700;
-  color: #9ca3af;
+  font-size: 1rem;
 }
-.workflow-shortcut-btn button {
-  width: 100%;
-  min-height: 40px;
-  border-radius: 10px !important;
-  text-align: center;
-  justify-content: center;
-  padding: 8px 12px !important;
-  margin: 0 !important;
+#action-rail .workflow-button:hover {
+  filter: none;
 }
-.workflow-shortcut-btn {
-  width: 100%;
+#center-panel {
+  min-width: 0;
+}
+@media (min-width: 1280px) {
+  #action-rail {
+    position: fixed;
+    top: 88px;
+    width: 210px;
+  }
+  #center-panel {
+    margin-left: 252px;
+  }
 }
 #remediation-card { border: 1px solid #d6dee8; border-radius: 20px; padding: 18px; background: linear-gradient(180deg, #f9fbfd 0%, #eef4f8 100%); }
-.action-primary-btn button {
-  background: #f6c343 !important;
-  border: 1px solid #d4a52a !important;
-  color: #2b2100 !important;
-  font-weight: 700 !important;
-  border-radius: 10px !important;
-}
-.action-primary-btn button:hover {
-  background: #ffd157 !important;
-}
-.action-secondary-btn button {
-  background: #f3f4f6 !important;
-  border: 1px solid #d1d5db !important;
-  color: #111827 !important;
-  font-weight: 600 !important;
-  border-radius: 10px !important;
-}
-.action-secondary-btn button:hover {
-  background: #e5e7eb !important;
+#center-panel button[variant="stop"] {
+  margin-top: 10px;
+  min-height: 48px;
+  border-radius: 14px;
+  font-weight: 700;
 }
 """
 
@@ -182,22 +155,18 @@ def build_app() -> gr.Blocks:
         response_state = gr.State({})
         shortcut_clicks: list[tuple[gr.Button, str]] = []
         with gr.Row():
-            with gr.Column(scale=1, elem_id="action-rail"):
-                gr.Markdown(
-                    "<div class='title-main'>Oracle AutoDBA</div><div class='title-sub'>Workflow shortcuts</div>",
-                    elem_id="workflow-shortcuts-title",
-                )
-                with gr.Group(elem_id="shortcut-rail-card"):
-                    for label, prompt in WORKFLOW_PROMPTS:
-                        btn = gr.Button(label, variant="primary", elem_classes=["workflow-shortcut-btn", "action-primary-btn"])
-                        shortcut_clicks.append((btn, prompt))
-            with gr.Column(scale=4, elem_id="center-panel"):
+            with gr.Column(scale=0, min_width=190, elem_id="action-rail"):
+                gr.Markdown("Workflow Shortcuts", elem_classes=["rail-title"])
+                for label, prompt in WORKFLOW_PROMPTS:
+                    btn = gr.Button(label, size="lg", variant="primary", elem_classes=["workflow-button"])
+                    shortcut_clicks.append((btn, prompt))
+            with gr.Column(scale=1, min_width=720, elem_id="center-panel"):
                 chatbot = gr.Chatbot(type="messages", label="Planner Chat", height=550)
                 message = gr.Textbox(lines=4, placeholder="Ask about Oracle health, SQL_ID, ORA errors, blocking, or trends.", label="Message")
                 with gr.Row():
-                    send_btn = gr.Button("Send", variant="primary", elem_classes=["action-primary-btn"])
-                    investigate_btn = gr.Button("Investigate with AI", variant="primary", elem_classes=["action-primary-btn"])
-                    clear_btn = gr.Button("Clear", variant="secondary", elem_classes=["action-secondary-btn"])
+                    send_btn = gr.Button("Send", variant="primary")
+                    investigate_btn = gr.Button("Investigate with AI", variant="primary")
+                    clear_btn = gr.Button("Clear")
                 with gr.Group(elem_id="remediation-card"):
                     remediation_md = gr.Markdown("No remediation proposed for the current analysis.")
                     confirm_checkbox = gr.Checkbox(label="I have reviewed the target session and want to allow this action.", value=False)
@@ -221,7 +190,8 @@ def build_app() -> gr.Blocks:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    build_app().launch()
+    app = build_app()
+    app.launch()
 
 
 if __name__ == "__main__":
