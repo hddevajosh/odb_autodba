@@ -27,7 +27,16 @@ STATUS_ICONS = {
 SECTION_COLUMNS = {
     "Database Status": ["db_name", "open_mode", "database_role", "log_mode", "instance_name", "instance_status"],
     "Alert Log Errors": ["source", "window_hours", "filter", "rows_found", "status", "ts", "severity", "code", "message"],
-    "Tablespace Usage": ["tablespace_name", "used_pct", "used_mb", "free_mb", "total_mb"],
+    "Tablespace Usage": [
+        "tablespace_name",
+        "allocated_gb",
+        "used_gb",
+        "free_allocated_gb",
+        "allocated_used_pct",
+        "max_gb",
+        "max_used_pct",
+        "autoextensible",
+    ],
     "Temp Usage": ["sid", "serial_num", "username", "program", "module", "sql_id", "gb_used"],
     "Locks And Blocking": ["waiter_sid", "waiter_user", "waiter_sql_id", "seconds_in_wait", "blocker_sid", "blocker_user", "blocker_sql_id", "blocker_program"],
     "Objects And Validity": ["owner", "object_name", "object_type"],
@@ -97,7 +106,16 @@ SECTION_COLUMNS = {
 }
 
 SECTION_COMPACT_COLUMNS = {
-    "Tablespace Usage": ["tablespace_name", "used_pct", "used", "free", "total"],
+    "Tablespace Usage": [
+        "tablespace_name",
+        "allocated_gb",
+        "used_gb",
+        "free_allocated_gb",
+        "allocated_used_pct",
+        "max_gb",
+        "max_used_pct",
+        "autoextensible",
+    ],
     "Temp Usage": ["sid", "username", "sql_id", "segtype", "temp_used", "tablespace"],
     "Memory And Configuration": ["sid", "serial_num", "username", "sql_id", "pga_used", "pga_alloc", "temp_used", "module", "program"],
     "CPU Hotspots": ["row_type", "os_pid", "process_group", "cpu_pct", "memory_pct", "sid", "username", "sql_id", "module", "program", "source"],
@@ -333,6 +351,13 @@ def _format_pct(value: Any) -> str:
     return f"{number:.2f}%"
 
 
+def _format_gb_from_mb(value_mb: Any) -> str:
+    number = _to_float(value_mb)
+    if number is None:
+        return _format_value(value_mb)
+    return f"{number / 1024.0:.2f}"
+
+
 def render_key_value_block(rows: list[tuple[str, Any]]) -> str:
     if not rows:
         return "- None"
@@ -439,6 +464,10 @@ def render_health_snapshot_report(snapshot: HealthSnapshot) -> str:
         _section_heading("Key Health Signals", informational=True),
         "",
         _render_key_signals(snapshot),
+        "",
+        _section_heading("Host Check Scope", informational=True),
+        "",
+        _render_host_check_scope_section(snapshot),
         "",
         _section_heading("Findings Needing Attention", status=_findings_status(snapshot)),
         "",
@@ -1268,6 +1297,7 @@ def _render_executive_summary(snapshot: HealthSnapshot) -> str:
 def _render_key_signals(snapshot: HealthSnapshot) -> str:
     critical_count = sum(1 for item in snapshot.actionable_items if item.severity == "CRITICAL")
     warning_count = sum(1 for item in snapshot.actionable_items if item.severity == "WARNING")
+    host_check = _host_check_payload(snapshot)
     return "\n".join(
         _render_horizontal_kv_block(
             [
@@ -1276,11 +1306,74 @@ def _render_key_signals(snapshot: HealthSnapshot) -> str:
                 ("ORA/TNS rows", len(snapshot.raw_evidence.get("alert_log") or [])),
                 ("Highest tablespace", _highest_tablespace(snapshot)),
                 ("Actionable findings", f"{len(snapshot.actionable_items)} ({critical_count} critical, {warning_count} warning)"),
-                ("Host checks", "Included" if snapshot.host_snapshot else "Disabled"),
+                ("Host checks", _host_checks_summary_value(host_check)),
             ],
             columns=2,
         )
     )
+
+
+def _host_checks_summary_value(host_check: dict[str, Any]) -> str:
+    scope = str(host_check.get("host_check_scope") or "").strip().lower()
+    if scope == "disabled":
+        return "Disabled"
+    if scope == "local_app_host":
+        return "Local AutoDBA app host"
+    if scope == "remote_db_host_ssh":
+        return "Remote Oracle DB host via SSH"
+    if scope == "unavailable":
+        return "Unavailable"
+    return "Included"
+
+
+def _host_check_payload(snapshot: HealthSnapshot) -> dict[str, Any]:
+    raw = snapshot.raw_evidence.get("host_check") if isinstance(snapshot.raw_evidence.get("host_check"), dict) else {}
+    if raw:
+        return dict(raw)
+    host = snapshot.host_snapshot
+    if host is None:
+        return {
+            "host_check_mode": "disabled",
+            "host_check_scope": "disabled",
+            "host_check_label": "Host checks disabled",
+            "host_check_warning": "Host OS metrics disabled; database health is based on Oracle-side signals only.",
+            "host_check_target": "",
+        }
+    return {
+        "host_check_mode": host.host_check_mode,
+        "host_check_scope": host.host_check_scope,
+        "host_check_label": host.host_check_label,
+        "host_check_warning": host.host_check_warning or "",
+        "host_check_target": host.host_check_target or "",
+    }
+
+
+def _render_host_check_scope_section(snapshot: HealthSnapshot) -> str:
+    host_check = _host_check_payload(snapshot)
+    mode = str(host_check.get("host_check_mode") or "local_app_host")
+    scope = str(host_check.get("host_check_scope") or "").strip().lower()
+    label = str(host_check.get("host_check_label") or "Host metrics unavailable")
+    if mode == "ssh_remote":
+        label = "Remote Oracle DB host via SSH"
+    elif mode == "local_app_host":
+        label = "Local AutoDBA app host"
+    elif mode == "disabled":
+        label = "Host checks disabled"
+    warning = str(host_check.get("host_check_warning") or "").strip()
+    target = str(host_check.get("host_check_target") or "").strip()
+    lines = [
+        f"- Mode: {mode}",
+        f"- Scope: {label}",
+    ]
+    if mode == "ssh_remote" and scope == "unavailable":
+        lines.append("- Availability: unavailable")
+    if target:
+        lines.append(f"- Host: {target}")
+    if warning:
+        lines.append(f"- Note: {warning}")
+    elif mode == "disabled":
+        lines.append("- Note: Oracle-side health checks only.")
+    return "\n".join(lines)
 
 
 def _render_actionable_items(snapshot: HealthSnapshot) -> str:
@@ -1690,10 +1783,32 @@ def _prepare_rows_for_section(section_name: str, rows: list[dict[str, Any]]) -> 
     prepared: list[dict[str, Any]] = [dict(row) for row in rows]
     if section_name == "Tablespace Usage":
         for row in prepared:
-            row["used_pct"] = _format_pct(row.get("used_pct"))
-            row["used_mb"] = format_storage_value(row.get("used_mb"), source_unit="kb")
-            row["free_mb"] = format_storage_value(row.get("free_mb"), source_unit="kb")
-            row["total_mb"] = format_storage_value(row.get("total_mb"), source_unit="kb")
+            allocated_mb = _to_float(row.get("allocated_mb"))
+            if allocated_mb is None:
+                allocated_mb = _to_float(row.get("total_mb"))
+            used_mb = _to_float(row.get("used_mb"))
+            free_allocated_mb = _to_float(row.get("free_allocated_mb"))
+            if free_allocated_mb is None:
+                free_allocated_mb = _to_float(row.get("free_mb"))
+            allocated_pct = _to_float(row.get("allocated_used_pct"))
+            if allocated_pct is None:
+                allocated_pct = _to_float(row.get("used_pct"))
+            max_mb = _to_float(row.get("max_mb"))
+            max_pct = _to_float(row.get("max_used_pct"))
+
+            row["allocated_gb"] = _format_gb_from_mb(allocated_mb)
+            row["used_gb"] = _format_gb_from_mb(used_mb)
+            row["free_allocated_gb"] = _format_gb_from_mb(free_allocated_mb)
+            row["allocated_used_pct"] = _format_pct(allocated_pct)
+            row["max_gb"] = _format_gb_from_mb(max_mb)
+            row["max_used_pct"] = _format_pct(max_pct)
+            row["autoextensible"] = str(row.get("autoextensible") or "NO")
+
+            # Keep legacy fields for compatibility in other renderers/tests.
+            row["used_pct"] = _format_pct(allocated_pct)
+            row["used_mb"] = format_storage_value(used_mb, source_unit="mb")
+            row["free_mb"] = format_storage_value(free_allocated_mb, source_unit="mb")
+            row["total_mb"] = format_storage_value(allocated_mb, source_unit="mb")
         return prepared
     if section_name == "Temp Usage":
         for row in prepared:

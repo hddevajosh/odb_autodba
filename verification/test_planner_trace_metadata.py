@@ -18,30 +18,15 @@ from odb_autodba.rag.trace_store import (
 @contextmanager
 def _temp_runtime_dirs():
     with tempfile.TemporaryDirectory() as tmp:
-        trace_dir = os.path.join(tmp, "traces")
-        index_dir = os.path.join(tmp, "indexes")
-        index_file = os.path.join(index_dir, "history_indexing.jsonl")
-        old_trace = os.environ.get("ODB_AUTODBA_TRACE_DIR")
-        old_index = os.environ.get("ODB_AUTODBA_HISTORY_INDEX_DIR")
-        old_index_file = os.environ.get("ODB_AUTODBA_HISTORY_INDEX_FILE")
-        os.environ["ODB_AUTODBA_TRACE_DIR"] = trace_dir
-        os.environ["ODB_AUTODBA_HISTORY_INDEX_DIR"] = index_dir
-        os.environ["ODB_AUTODBA_HISTORY_INDEX_FILE"] = index_file
+        old_root = os.environ.get("ODB_AUTODBA_RUNTIME_ROOT")
+        os.environ["ODB_AUTODBA_RUNTIME_ROOT"] = tmp
         try:
             yield
         finally:
-            if old_trace is None:
-                os.environ.pop("ODB_AUTODBA_TRACE_DIR", None)
+            if old_root is None:
+                os.environ.pop("ODB_AUTODBA_RUNTIME_ROOT", None)
             else:
-                os.environ["ODB_AUTODBA_TRACE_DIR"] = old_trace
-            if old_index is None:
-                os.environ.pop("ODB_AUTODBA_HISTORY_INDEX_DIR", None)
-            else:
-                os.environ["ODB_AUTODBA_HISTORY_INDEX_DIR"] = old_index
-            if old_index_file is None:
-                os.environ.pop("ODB_AUTODBA_HISTORY_INDEX_FILE", None)
-            else:
-                os.environ["ODB_AUTODBA_HISTORY_INDEX_FILE"] = old_index_file
+                os.environ["ODB_AUTODBA_RUNTIME_ROOT"] = old_root
 
 
 class PlannerTraceMetadataTests(unittest.TestCase):

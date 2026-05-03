@@ -33,21 +33,23 @@ def retrieve_trace_evidence(
     *,
     database_name: str | None = None,
     requested_domain: str | None = None,
+    db_key: str | None = None,
 ) -> list[str]:
     chunks = retrieve_trace_chunks(
         query=query,
         limit=limit,
         database_name=database_name,
         requested_domain=requested_domain,
+        db_key=db_key,
     )
     if chunks:
         return [_format_chunk(chunk) for chunk in chunks]
 
-    history = JsonlHistoryService().load_recent_runs(limit=20, database_name=database_name)
+    history = JsonlHistoryService().load_recent_runs(limit=20, database_name=database_name, db_key=db_key)
     q = (query or "").lower()
     out: list[str] = []
     if requested_domain in {"transition", "awr", "learning"} or any(token in q for token in {"transition", "driver", "feature", "awr"}):
-        context = JsonlHistoryService().compare_recent_runs(limit=20, database_name=database_name)
+        context = JsonlHistoryService().compare_recent_runs(limit=20, database_name=database_name, db_key=db_key)
         if context.state_transition and context.state_transition.available:
             out.append(
                 "Transition summary: "
@@ -79,12 +81,14 @@ def retrieve_trace_chunks(
     database_name: str | None = None,
     requested_domain: str | None = None,
     time_scope: Any = None,
+    db_key: str | None = None,
 ) -> list[TraceEvidenceChunk]:
     chunks = read_trace_evidence_chunks(
         database_name=database_name,
         completed_after=getattr(time_scope, "completed_after", None),
         completed_before=getattr(time_scope, "completed_before", None),
         limit=None,
+        db_key=db_key,
     )
     if not chunks:
         return []
@@ -107,11 +111,13 @@ def retrieve_recurring_issue_hits(
     *,
     database_name: str | None = None,
     requested_domain: str | None = None,
+    db_key: str | None = None,
 ) -> list[str]:
     return [_format_recurring(record) for record in retrieve_recurring_issue_records(
         limit=limit,
         database_name=database_name,
         requested_domain=requested_domain,
+        db_key=db_key,
     )]
 
 
@@ -120,8 +126,9 @@ def retrieve_recurring_issue_records(
     *,
     database_name: str | None = None,
     requested_domain: str | None = None,
+    db_key: str | None = None,
 ) -> list[RecurringIssueIndexRecord]:
-    records = read_recurring_issue_index(database_name=database_name, limit=None)
+    records = read_recurring_issue_index(database_name=database_name, limit=None, db_key=db_key)
     if requested_domain:
         aliases = DOMAIN_ALIASES.get(requested_domain, {requested_domain})
         records = [
@@ -140,11 +147,13 @@ def summarize_recurring_issue_index(
     requested_domain: str | None = None,
     sampled_runs: int | None = None,
     limit: int = 8,
+    db_key: str | None = None,
 ) -> dict[str, Any]:
     records = retrieve_recurring_issue_records(
         limit=10000,
         database_name=database_name,
         requested_domain=requested_domain,
+        db_key=db_key,
     )
     lines: list[str] = []
     for record in records[:limit]:

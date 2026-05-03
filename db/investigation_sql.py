@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from time import perf_counter
 
-from odb_autodba.db.connection import db_connection
+from odb_autodba.db.connection import db_connection, db_key_context
 from odb_autodba.models.schemas import SQLExecutionResult, SQLValidationResult
 
 FORBIDDEN_KEYWORDS = (
@@ -28,27 +28,28 @@ def validate_investigation_sql(sql: str) -> SQLValidationResult:
     return SQLValidationResult(ok=True, normalized_sql=normalized)
 
 
-def execute_investigation_sql(sql: str, *, row_limit: int = 100) -> SQLExecutionResult:
+def execute_investigation_sql(sql: str, *, row_limit: int = 100, db_key: str | None = None) -> SQLExecutionResult:
     started = perf_counter()
     try:
-        with db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(sql)
-            cols = [d[0].lower() for d in (cur.description or [])]
-            fetched = cur.fetchmany(max(int(row_limit), 1) + 1)
-            truncated = len(fetched) > row_limit
-            rows = [
-                {cols[i]: _value(row[i]) for i in range(len(cols))}
-                for row in fetched[:row_limit]
-            ]
-            return SQLExecutionResult(
-                status="success",
-                elapsed_ms=int((perf_counter() - started) * 1000),
-                columns=cols,
-                rows=rows,
-                row_count=len(rows),
-                truncated=truncated,
-            )
+        with db_key_context(db_key):
+            with db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql)
+                cols = [d[0].lower() for d in (cur.description or [])]
+                fetched = cur.fetchmany(max(int(row_limit), 1) + 1)
+                truncated = len(fetched) > row_limit
+                rows = [
+                    {cols[i]: _value(row[i]) for i in range(len(cols))}
+                    for row in fetched[:row_limit]
+                ]
+                return SQLExecutionResult(
+                    status="success",
+                    elapsed_ms=int((perf_counter() - started) * 1000),
+                    columns=cols,
+                    rows=rows,
+                    row_count=len(rows),
+                    truncated=truncated,
+                )
     except Exception as exc:
         return SQLExecutionResult(status="error", elapsed_ms=int((perf_counter() - started) * 1000), error=str(exc))
 

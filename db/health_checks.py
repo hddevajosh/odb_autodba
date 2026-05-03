@@ -5,7 +5,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from odb_autodba.db.connection import fetch_all, fetch_one
+from odb_autodba.db.connection import db_key_context, fetch_all, fetch_one
 from odb_autodba.db.extended_health_checks import collect_extended_health
 from odb_autodba.db.log_checks import collect_alert_error_summary, collect_listener_error_summary
 from odb_autodba.db.module_health import summarize_modules
@@ -18,7 +18,7 @@ from odb_autodba.db.running_sessions import (
 )
 from odb_autodba.db.sql_monitor import summarize_current_sql
 from odb_autodba.db.sql_text import get_sql_text
-from odb_autodba.host.health_checks import collect_host_snapshot
+from odb_autodba.host.health_checks import collect_host_snapshot_for_mode, resolve_host_check_config
 from odb_autodba.models.schemas import (
     ActionableHealthItem,
     BlockingInterpretationNote,
@@ -39,7 +39,6 @@ from odb_autodba.models.schemas import (
     WaitClassSummary,
     WaitEventRow,
 )
-from odb_autodba.utils.oracle_env import env_flag
 
 
 INSTANCE_SQL = """
@@ -211,14 +210,43 @@ select * from (
 """
 
 TABLESPACE_SQL = """
-select tablespace_name, used_percent as used_pct,
-       tablespace_size*8 as total_mb,
-       used_space*8 as used_mb,
-       (tablespace_size-used_space)*8 as free_mb,
-       contents, bigfile
-from dba_tablespace_usage_metrics m
-join dba_tablespaces t using (tablespace_name)
-order by used_percent desc
+with file_alloc as (
+    select tablespace_name,
+           round(sum(bytes) / 1024 / 1024, 2) as allocated_mb,
+           round(sum(case when autoextensible = 'YES' and maxbytes > bytes then maxbytes else bytes end) / 1024 / 1024, 2) as max_mb,
+           sum(case when autoextensible = 'YES' then 1 else 0 end) as autoext_count
+    from dba_data_files
+    group by tablespace_name
+),
+usage_metrics as (
+    select tablespace_name,
+           round(used_percent, 2) as allocated_used_pct,
+           round(used_space * 8, 2) as used_mb
+    from dba_tablespace_usage_metrics
+)
+select t.tablespace_name,
+       nvl(u.allocated_used_pct, 0) as used_pct,
+       a.allocated_mb as allocated_mb,
+       nvl(u.used_mb, round(nvl(a.allocated_mb, 0) * (nvl(u.allocated_used_pct, 0) / 100), 2)) as used_mb,
+       round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_allocated_mb,
+       nvl(u.allocated_used_pct, 0) as allocated_used_pct,
+       a.max_mb as max_mb,
+       round(greatest(nvl(a.max_mb, nvl(a.allocated_mb, 0)) - nvl(u.used_mb, 0), 0), 2) as max_free_mb,
+       case
+           when nvl(a.max_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.max_mb) * 100, 2)
+           when nvl(a.allocated_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.allocated_mb) * 100, 2)
+           else null
+       end as max_used_pct,
+       case when nvl(a.autoext_count, 0) > 0 then 'YES' else 'NO' end as autoextensible,
+       round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_mb,
+       a.allocated_mb as total_mb,
+       t.contents,
+       t.bigfile
+from dba_tablespaces t
+left join file_alloc a on a.tablespace_name = t.tablespace_name
+left join usage_metrics u on u.tablespace_name = t.tablespace_name
+where t.contents <> 'TEMPORARY'
+order by nvl(u.allocated_used_pct, 0) desc, t.tablespace_name
 """
 
 TEMP_SQL = """
@@ -247,84 +275,89 @@ fetch first 20 rows only
 """
 
 
-def collect_health_snapshot() -> HealthSnapshot:
-    notes: list[str] = []
-    generated_at = datetime.now(UTC).isoformat()
-    window_hours = _health_window_hours()
+def collect_health_snapshot(db_key: str | None = None) -> HealthSnapshot:
+    with db_key_context(db_key):
+        notes: list[str] = []
+        generated_at = datetime.now(UTC).isoformat()
+        window_hours = _health_window_hours()
 
-    instance_row = fetch_one(INSTANCE_SQL) or {}
-    summary_row = fetch_one(SESSION_SUMMARY_SQL) or {}
-    wait_classes = [WaitClassSummary(**row) for row in fetch_all(WAIT_CLASS_SQL)]
-    top_waits = [WaitEventRow(**row) for row in fetch_all(TOP_WAITS_SQL)]
+        instance_row = fetch_one(INSTANCE_SQL) or {}
+        summary_row = fetch_one(SESSION_SUMMARY_SQL) or {}
+        wait_classes = [WaitClassSummary(**row) for row in fetch_all(WAIT_CLASS_SQL)]
+        top_waits = [WaitEventRow(**row) for row in fetch_all(TOP_WAITS_SQL)]
 
-    top_elapsed = _collect_top_sql_rows(limit=10, order="elapsed", notes=notes)
-    top_cpu = _collect_top_sql_rows(limit=10, order="cpu", notes=notes)
+        top_elapsed = _collect_top_sql_rows(limit=10, order="elapsed", notes=notes)
+        top_cpu = _collect_top_sql_rows(limit=10, order="cpu", notes=notes)
 
-    tablespaces = [TablespaceUsageRow(**row) for row in fetch_all(TABLESPACE_SQL)]
-    temp_usage = [TempUsageRow(**row) for row in fetch_all(TEMP_SQL)]
-    active_sessions = get_running_sessions_inventory()
-    blocking = get_blocking_chains()
-    ora_errors = collect_alert_error_summary()
-    listener_errors = collect_listener_error_summary()
-    host_snapshot = collect_host_snapshot() if env_flag("ENABLE_HOST_CHECKS", True) else None
-    top_session_candidates = get_top_session_resource_candidates(limit=10)
-    try:
-        current_sql_candidates = summarize_current_sql(limit=10)
-    except Exception:
-        current_sql_candidates = []
+        tablespaces = [TablespaceUsageRow(**row) for row in fetch_all(TABLESPACE_SQL)]
+        temp_usage = [TempUsageRow(**row) for row in fetch_all(TEMP_SQL)]
+        active_sessions = get_running_sessions_inventory()
+        blocking = get_blocking_chains()
+        ora_errors = collect_alert_error_summary()
+        listener_errors = collect_listener_error_summary()
+        top_session_candidates = get_top_session_resource_candidates(limit=10)
+        try:
+            current_sql_candidates = summarize_current_sql(limit=10)
+        except Exception:
+            current_sql_candidates = []
 
-    plan_evidence = collect_plan_evidence_for_top_sql([row.sql_id for row in top_elapsed[:5]])
-    extended_sections, actionable_items, raw_evidence = collect_extended_health(window_hours=window_hours)
-    raw_evidence["top_session_resource_candidates"] = top_session_candidates
-    raw_evidence["current_sql_candidates"] = current_sql_candidates
+        plan_evidence = collect_plan_evidence_for_top_sql([row.sql_id for row in top_elapsed[:5]])
+        extended_sections, actionable_items, raw_evidence = collect_extended_health(window_hours=window_hours)
+        host_cfg = resolve_host_check_config()
+        host_snapshot, host_check = collect_host_snapshot_for_mode(host_cfg)
+        raw_evidence["host_check"] = dict(host_check)
+        if host_check.get("host_check_warning"):
+            notes.append(str(host_check.get("host_check_warning")))
+        raw_evidence["top_session_resource_candidates"] = top_session_candidates
+        raw_evidence["current_sql_candidates"] = current_sql_candidates
 
-    if host_snapshot is not None:
-        host_snapshot = _correlate_host_hotspots_with_db(
-            host_snapshot,
-            notes=notes,
+        if host_snapshot is not None:
+            host_snapshot = _correlate_host_hotspots_with_db(
+                host_snapshot,
+                notes=notes,
+                top_sql_by_cpu=top_cpu,
+                top_session_candidates=top_session_candidates,
+                current_sql_candidates=current_sql_candidates,
+                top_pga_candidates=(raw_evidence.get("memory_config") or {}).get("top_pga_sessions") or [],
+            )
+            _apply_memory_compact_note(snapshot_sections=extended_sections, host_snapshot=host_snapshot, raw_evidence=raw_evidence, notes=notes)
+
+        if host_snapshot:
+            extended_sections.append(_host_health_section(host_snapshot))
+            extended_sections.extend(_build_hotspot_sections(host_snapshot))
+            actionable_items.extend(_host_actionable_items(host_snapshot))
+            raw_evidence["host"] = host_snapshot.model_dump(mode="json")
+        raw_evidence["blocking_chains"] = [chain.model_dump(mode="json") for chain in blocking]
+
+        snapshot = HealthSnapshot(
+            generated_at=generated_at,
+            instance_info=InstanceInfo(**instance_row),
+            session_summary=SessionSummary(**summary_row),
+            active_sessions=active_sessions,
+            blocking_chains=blocking,
+            top_waits=top_waits,
+            wait_classes=wait_classes,
+            top_sql_by_elapsed=top_elapsed,
             top_sql_by_cpu=top_cpu,
-            top_session_candidates=top_session_candidates,
-            current_sql_candidates=current_sql_candidates,
-            top_pga_candidates=(raw_evidence.get("memory_config") or {}).get("top_pga_sessions") or [],
+            tablespaces=tablespaces,
+            temp_usage=temp_usage,
+            ora_errors=ora_errors,
+            listener_errors=listener_errors,
+            init_parameters=fetch_all(INIT_PARAM_SQL),
+            scheduler_jobs=fetch_all(SCHEDULER_SQL),
+            host_snapshot=host_snapshot,
+            plan_evidence=plan_evidence,
+            health_sections=extended_sections,
+            actionable_items=actionable_items,
+            raw_evidence=raw_evidence,
+            notes=notes,
         )
-        _apply_memory_compact_note(snapshot_sections=extended_sections, host_snapshot=host_snapshot, raw_evidence=raw_evidence, notes=notes)
-
-    if host_snapshot:
-        extended_sections.append(_host_health_section(host_snapshot))
-        extended_sections.extend(_build_hotspot_sections(host_snapshot))
-        actionable_items.extend(_host_actionable_items(host_snapshot))
-        raw_evidence["host"] = host_snapshot.model_dump(mode="json")
-    raw_evidence["blocking_chains"] = [chain.model_dump(mode="json") for chain in blocking]
-
-    snapshot = HealthSnapshot(
-        generated_at=generated_at,
-        instance_info=InstanceInfo(**instance_row),
-        session_summary=SessionSummary(**summary_row),
-        active_sessions=active_sessions,
-        blocking_chains=blocking,
-        top_waits=top_waits,
-        wait_classes=wait_classes,
-        top_sql_by_elapsed=top_elapsed,
-        top_sql_by_cpu=top_cpu,
-        tablespaces=tablespaces,
-        temp_usage=temp_usage,
-        ora_errors=ora_errors,
-        listener_errors=listener_errors,
-        init_parameters=fetch_all(INIT_PARAM_SQL),
-        scheduler_jobs=fetch_all(SCHEDULER_SQL),
-        host_snapshot=host_snapshot,
-        plan_evidence=plan_evidence,
-        health_sections=extended_sections,
-        actionable_items=actionable_items,
-        raw_evidence=raw_evidence,
-        notes=notes,
-    )
-    _reconcile_lock_section(snapshot)
-    _apply_tablespace_allocation_anomaly(snapshot)
-    _apply_lock_wait_interpretation(snapshot)
-    snapshot.issues = _derive_issues(snapshot)
-    snapshot.module_summaries = summarize_modules(snapshot)
-    return snapshot
+        _reconcile_lock_section(snapshot)
+        _apply_tablespace_allocation_anomaly(snapshot)
+        _apply_lock_wait_interpretation(snapshot)
+        snapshot.issues = _derive_issues(snapshot)
+        snapshot.module_summaries = summarize_modules(snapshot)
+        return snapshot
 
 
 def _collect_top_sql_rows(*, limit: int, order: str, notes: list[str]) -> list[TopSqlRow]:
@@ -1030,6 +1063,8 @@ def _host_health_section(host: HostSnapshot) -> HealthCheckSection:
     rows: list[dict[str, Any]] = [
         {
             "scope": "host",
+            "host_check_scope": host.host_check_scope,
+            "host_check_label": host.host_check_label,
             "cpu_pct": host.cpu_pct,
             "memory_pct": host.memory_pct,
             "swap_pct": host.swap_pct,
@@ -1061,7 +1096,11 @@ def _host_health_section(host: HostSnapshot) -> HealthCheckSection:
     )
     rows.extend({"scope": "filesystem", **row} for row in host.filesystems[:10])
 
-    summary = f"Host CPU={_fmt_pct(host.cpu_pct)}, memory={_fmt_pct(host.memory_pct)}, swap={_fmt_pct(host.swap_pct)}."
+    summary = (
+        f"{host.host_check_label}: CPU={_fmt_pct(host.cpu_pct)}, memory={_fmt_pct(host.memory_pct)}, swap={_fmt_pct(host.swap_pct)}."
+    )
+    if host.host_check_target:
+        summary += f" Target={host.host_check_target}."
     if host.docker_container:
         summary += f" Oracle container {host.docker_container} CPU={_fmt_pct(docker_cpu)}, memory={_fmt_pct(docker_mem)}."
     else:
@@ -1082,6 +1121,9 @@ def _host_health_section(host: HostSnapshot) -> HealthCheckSection:
         )
 
     notes = list(host.notes)
+    notes.append(f"Host check mode={host.host_check_mode}, scope={host.host_check_scope}.")
+    if host.host_check_warning:
+        notes.append(host.host_check_warning)
     notes.append(host.cpu_hotspot.interpretation)
     notes.append(host.memory_hotspot.interpretation)
     notes.append(

@@ -1,52 +1,61 @@
 from __future__ import annotations
 
+from odb_autodba.db.connection import db_key_context
 from odb_autodba.db.investigation_sql import execute_investigation_sql, validate_investigation_sql
 from odb_autodba.models.schemas import InvestigationReport, InvestigationStep
-from odb_autodba.rag.investigation_trace_store import append_investigation_trace
+from odb_autodba.rag.investigation_trace_store import append_investigation_trace, investigation_trace_path
+from odb_autodba.target_registry import get_oracle_target
 from odb_autodba.utils.sql_analysis import extract_sql_id
 
 
 class InvestigationAgent:
     RESULT_ROW_PREVIEW_LIMIT = 20
 
-    def investigate(self, problem_statement: str, max_steps: int = 4) -> InvestigationReport:
+    def __init__(self, db_key: str | None = None) -> None:
+        self.db_key = db_key
+
+    def investigate(self, problem_statement: str, max_steps: int = 4, db_key: str | None = None) -> InvestigationReport:
+        resolved_target = get_oracle_target(db_key or self.db_key)
+        resolved_db_key = resolved_target.db_key
+        self.db_key = resolved_db_key
         intents = self._detect_intents(problem_statement)
         sql_steps = self._plan_steps(problem_statement, intents)[:max_steps]
         steps: list[InvestigationStep] = []
         evidence: list[str] = []
-        for idx, item in enumerate(sql_steps, start=1):
-            validation = validate_investigation_sql(item["sql"])
-            if not validation.ok:
+        with db_key_context(resolved_db_key):
+            for idx, item in enumerate(sql_steps, start=1):
+                validation = validate_investigation_sql(item["sql"])
+                if not validation.ok:
+                    steps.append(
+                        InvestigationStep(
+                            step_number=idx,
+                            goal=item["goal"],
+                            sql=item["sql"],
+                            result_preview=validation.reason,
+                            status="error",
+                        )
+                    )
+                    break
+                result = execute_investigation_sql(validation.normalized_sql or item["sql"], db_key=resolved_db_key)
+                preview = result.error if result.status == "error" else f"Returned {result.row_count} row(s). Columns: {', '.join(result.columns[:8])}"
+                if result.status == "success" and result.rows:
+                    evidence.append(f"Step {idx} {item['goal']}: first row {result.rows[0]}")
+                rows_preview = list(result.rows[: self.RESULT_ROW_PREVIEW_LIMIT]) if result.status == "success" else []
                 steps.append(
                     InvestigationStep(
                         step_number=idx,
                         goal=item["goal"],
-                        sql=item["sql"],
-                        result_preview=validation.reason,
-                        status="error",
+                        sql=validation.normalized_sql or item["sql"],
+                        result_preview=preview,
+                        row_count=result.row_count,
+                        status=result.status,
+                        result_columns=list(result.columns or []),
+                        result_rows=rows_preview,
+                        result_truncated=bool(result.truncated or (result.status == "success" and result.row_count > len(rows_preview))),
                     )
                 )
-                break
-            result = execute_investigation_sql(validation.normalized_sql or item["sql"])
-            preview = result.error if result.status == "error" else f"Returned {result.row_count} row(s). Columns: {', '.join(result.columns[:8])}"
-            if result.status == "success" and result.rows:
-                evidence.append(f"Step {idx} {item['goal']}: first row {result.rows[0]}")
-            rows_preview = list(result.rows[: self.RESULT_ROW_PREVIEW_LIMIT]) if result.status == "success" else []
-            steps.append(
-                InvestigationStep(
-                    step_number=idx,
-                    goal=item["goal"],
-                    sql=validation.normalized_sql or item["sql"],
-                    result_preview=preview,
-                    row_count=result.row_count,
-                    status=result.status,
-                    result_columns=list(result.columns or []),
-                    result_rows=rows_preview,
-                    result_truncated=bool(result.truncated or (result.status == "success" and result.row_count > len(rows_preview))),
-                )
-            )
-            if result.status == "error":
-                break
+                if result.status == "error":
+                    break
         likely_cause = self._derive_cause(problem_statement, intents, steps, evidence)
         report = InvestigationReport(
             problem_statement=problem_statement,
@@ -56,7 +65,9 @@ class InvestigationAgent:
             recommended_next_actions=self._recommended_next_actions(intents, steps),
             steps=steps,
         )
-        append_investigation_trace(problem_statement, [step.model_dump() for step in steps])
+        investigation_id = append_investigation_trace(problem_statement, [step.model_dump() for step in steps], db_key=resolved_db_key)
+        trace_path = str(investigation_trace_path(investigation_id=investigation_id, db_key=resolved_db_key))
+        report.trace_path = trace_path
         return report
 
     def _plan_steps(self, problem_statement: str, intents: set[str]) -> list[dict[str, str]]:

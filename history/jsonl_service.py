@@ -14,6 +14,7 @@ from odb_autodba.db.awr_checks import (
     get_awr_capabilities,
     map_run_pair_to_awr_windows,
 )
+from odb_autodba.config import get_default_oracle_target
 from odb_autodba.models.schemas import (
     AwrFallbackInfo,
     AwrStateDiff,
@@ -43,7 +44,7 @@ from odb_autodba.models.schemas import (
     TraceEvidenceChunk,
     TraceHealthRunRecord,
 )
-from odb_autodba.rag.indexer import rebuild_planner_memory_artifacts
+from odb_autodba.rag.indexer import get_index_status, rebuild_planner_memory_artifacts
 from odb_autodba.rag.trace_store import (
     health_run_trace_path,
     history_data_source_paths,
@@ -54,10 +55,7 @@ from odb_autodba.rag.trace_store import (
     read_health_run_traces,
     read_trace_evidence_chunks,
 )
-
-
-TRACE_DIR = health_run_trace_path().parent
-HEALTH_RUNS_FILE = health_run_trace_path()
+from odb_autodba.utils.sql_analysis import detect_history_metric_question
 
 
 DEFAULT_TREND_METRICS: tuple[tuple[str, str], ...] = (
@@ -87,6 +85,79 @@ DOMAIN_METRIC_HINTS: dict[str, tuple[str, ...]] = {
     "transition": ("blocking_count", "alert_log_count", "top_elapsed_sql_elapsed_s", "top_cpu_sql_cpu_s"),
 }
 
+HISTORY_METRIC_ROUTE_HINTS: tuple[dict[str, Any], ...] = (
+    {
+        "metric_family": "cpu",
+        "title": "CPU Consumption",
+        "keywords": ("cpu", "load", "cpu consumption", "cpu utilization"),
+        "fields": ("host_cpu_pct", "container_cpu_pct", "top_cpu_sql_cpu_s"),
+        "context": "cpu",
+    },
+    {
+        "metric_family": "memory",
+        "title": "Memory Utilization",
+        "keywords": ("memory", "ram", "pga", "sga"),
+        "fields": ("host_memory_pct", "container_memory_pct", "temp_usage_pct"),
+        "context": "memory",
+    },
+    {
+        "metric_family": "blocking",
+        "title": "Blocking Lock History",
+        "keywords": ("blocking", "lock", "locks", "blocked session", "blocking session"),
+        "fields": ("blocking_count",),
+        "context": "blocking",
+    },
+    {
+        "metric_family": "active_sessions",
+        "title": "Active Session Pressure",
+        "keywords": ("active sessions", "session count", "sessions"),
+        "fields": ("active_sessions",),
+        "context": "blocking",
+    },
+    {
+        "metric_family": "alerts",
+        "title": "Alert/Error History",
+        "keywords": ("ora", "tns", "alert", "errors"),
+        "fields": ("alert_log_count",),
+        "context": "general",
+    },
+    {
+        "metric_family": "tablespace",
+        "title": "Tablespace Usage",
+        "keywords": ("tablespace", "storage", "space", "disk"),
+        "fields": ("hottest_tablespace_pct", "fra_pct"),
+        "context": "general",
+    },
+    {
+        "metric_family": "sql_workload",
+        "title": "Top SQL CPU/Elapsed Trend",
+        "keywords": ("top sql", "sql cpu", "sql elapsed", "trend of top sql cpu"),
+        "fields": ("top_cpu_sql_cpu_s", "top_elapsed_sql_elapsed_s"),
+        "context": "sql",
+    },
+    {
+        "metric_family": "cache",
+        "title": "Cache Efficiency",
+        "keywords": ("cache", "buffer hit", "library cache"),
+        "fields": ("buffer_hit_pct", "library_hit_pct", "dictionary_hit_pct"),
+        "context": "general",
+    },
+    {
+        "metric_family": "plan_stats",
+        "title": "Plan/Stats Churn",
+        "keywords": ("plan churn", "stale stats", "plan change"),
+        "fields": ("plan_churn_count", "stale_stats_count"),
+        "context": "sql",
+    },
+    {
+        "metric_family": "redo_fra",
+        "title": "Redo/FRA",
+        "keywords": ("redo", "fra", "archive"),
+        "fields": ("redo_per_hour", "fra_pct"),
+        "context": "general",
+    },
+)
+
 SQL_REGRESSION_ABS_THRESHOLD = 120.0
 SQL_REGRESSION_RATIO_THRESHOLD = 3.0
 SQL_REGRESSION_CRITICAL_ABS_THRESHOLD = 800.0
@@ -100,6 +171,94 @@ METRIC_HIGH_THRESHOLDS: dict[str, float] = {
     "top_elapsed_sql_elapsed_s": 120.0,
     "top_cpu_sql_cpu_s": 120.0,
 }
+
+
+def route_history_metric_question(
+    user_query: str,
+    requested_domain: str | None = None,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    normalized = " ".join((user_query or "").strip().lower().split())
+    if not normalized:
+        return None
+    detected = detect_history_metric_question(user_query) or {}
+    family = str(detected.get("metric_family") or "").strip().lower()
+    if requested_domain and not family:
+        family = str(requested_domain or "").strip().lower()
+    if not family:
+        for hint in HISTORY_METRIC_ROUTE_HINTS:
+            if any(token in normalized for token in hint["keywords"]):
+                family = str(hint["metric_family"])
+                break
+    if not family:
+        return None
+
+    hint = _history_metric_hint(family)
+    requested_fields = list(detected.get("requested_fields") or (hint.get("fields") if hint else []))
+    if not requested_fields and hint:
+        requested_fields = list(hint.get("fields") or [])
+    aggregation = str(detected.get("aggregation") or _route_aggregation(normalized) or "latest")
+    raw_window = detected.get("time_window") if isinstance(detected.get("time_window"), dict) else {}
+    window_label = str(raw_window.get("label") or "all").strip().lower()
+    resolved_now = (now_utc or datetime.now(UTC)).astimezone(UTC)
+    if window_label in {"today", "yesterday"}:
+        time_window = resolve_time_window(window_label, resolved_now)
+    elif window_label == "last_n_hours":
+        hours = max(int(raw_window.get("hours") or 1), 1)
+        time_window = {
+            "label": f"last {hours} hours",
+            "completed_after": resolved_now - timedelta(hours=hours),
+            "completed_before": resolved_now,
+            "history_only": True,
+        }
+    elif window_label == "last_n_days":
+        days = max(int(raw_window.get("days") or 1), 1)
+        time_window = resolve_time_window(f"last {days} days", resolved_now)
+    elif any(token in normalized for token in ("from beginning", "all history", "ever", "overall", "all days")):
+        time_window = resolve_time_window("from beginning", resolved_now)
+    else:
+        time_window = None
+
+    route_kind = "issue_window" if family == "blocking" and aggregation in {"any", "count"} else "metric_history"
+    return {
+        "kind": route_kind,
+        "metric_family": family,
+        "requested_fields": requested_fields,
+        "aggregation": aggregation,
+        "time_window": time_window,
+        "requested_domain": requested_domain or family,
+        "title": str(hint.get("title") or family.replace("_", " ").title()) if hint else family.replace("_", " ").title(),
+        "context": str(hint.get("context") or "general") if hint else "general",
+        "source_preference": "index_first",
+        "allow_jsonl_fallback": True,
+    }
+
+
+def _history_metric_hint(metric_family: str) -> dict[str, Any] | None:
+    key = str(metric_family or "").strip().lower()
+    for hint in HISTORY_METRIC_ROUTE_HINTS:
+        if str(hint.get("metric_family") or "").strip().lower() == key:
+            return hint
+    return None
+
+
+def _route_aggregation(normalized: str) -> str | None:
+    if any(token in normalized for token in ("average", "avg", "mean")):
+        return "avg"
+    if any(token in normalized for token in ("maximum", "max", "highest", "peak")):
+        return "max"
+    if any(token in normalized for token in ("minimum", "min", "lowest")):
+        return "min"
+    if any(token in normalized for token in ("trend", "over time", "changed")):
+        return "trend"
+    if any(token in normalized for token in ("how many", "count", "number of times")):
+        return "count"
+    if any(token in normalized for token in ("were there any", "did it happen", "any blocking")):
+        return "any"
+    if any(token in normalized for token in ("latest", "last run", "current from last saved")):
+        return "latest"
+    return None
 
 
 def resolve_time_window(label: str | None, now_utc: datetime | None = None) -> dict[str, Any] | None:
@@ -157,17 +316,21 @@ class JsonlHistoryService:
     def resolve_time_scope(self, user_query: str | None) -> dict[str, Any] | None:
         return resolve_time_window(user_query)
 
-    def append_run_summary(self, summary: dict[str, Any]) -> None:
-        HEALTH_RUNS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with HEALTH_RUNS_FILE.open("a", encoding="utf-8") as handle:
+    def append_run_summary(self, summary: dict[str, Any], *, db_key: str | None = None) -> None:
+        resolved_db_key = (db_key or "").strip() or get_default_oracle_target().db_key
+        health_runs_file = health_run_trace_path(db_key=resolved_db_key)
+        health_runs_file.parent.mkdir(parents=True, exist_ok=True)
+        with health_runs_file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(summary, ensure_ascii=True, default=str) + "\n")
 
-    def load_recent_runs(self, limit: int = 10, database_name: str | None = None) -> list[HistoricalRun]:
-        traces = read_health_run_traces(database_name=database_name, limit=limit)
+    def load_recent_runs(self, limit: int = 10, database_name: str | None = None, db_key: str | None = None) -> list[HistoricalRun]:
+        fetch_limit = max(int(limit) * 5, int(limit), 10)
+        traces = _dedupe_trace_records(read_health_run_traces(database_name=database_name, limit=fetch_limit, db_key=db_key))
+        traces = traces[: max(int(limit), 0)]
         if traces:
             return [self._historical_run(trace) for trace in traces]
 
-        rows = read_health_run_summaries(database_name=database_name, limit=limit)
+        rows = read_health_run_summaries(database_name=database_name, limit=limit, db_key=db_key)
         return [self._historical_run_from_summary(row) for row in rows]
 
     def compare_recent_runs(
@@ -175,11 +338,12 @@ class JsonlHistoryService:
         limit: int = 10,
         database_name: str | None = None,
         time_scope: dict[str, Any] | None = None,
+        db_key: str | None = None,
     ) -> HistoryContext:
-        traces = self._load_traces(limit=limit, database_name=database_name, time_scope=time_scope)
+        traces = self._load_traces(limit=limit, database_name=database_name, time_scope=time_scope, db_key=db_key)
         runs = [self._historical_run(trace) for trace in traces]
         recurring = self._recurring_findings(traces)
-        trends = self.get_metric_trends_from_jsonl(database_name=database_name, traces=traces)
+        trends = self.get_metric_trends_from_jsonl(database_name=database_name, traces=traces, db_key=db_key)
         trace_paths = [trace.trace_path for trace in traces if trace.trace_path]
         latest_trace = traces[0] if traces else None
         previous_trace = traces[1] if len(traces) > 1 else None
@@ -214,16 +378,17 @@ class JsonlHistoryService:
         user_query: str | None = None,
         database_name: str | None = None,
         limit: int = 10,
+        db_key: str | None = None,
     ) -> HistoryContext:
         time_scope = resolve_time_window(user_query)
-        return self.compare_recent_runs(limit=limit, database_name=database_name, time_scope=time_scope)
+        return self.compare_recent_runs(limit=limit, database_name=database_name, time_scope=time_scope, db_key=db_key)
 
-    def get_latest_jsonl_run(self, database_name: str | None = None) -> TraceHealthRunRecord | None:
-        traces = read_health_run_traces(database_name=database_name, limit=1)
+    def get_latest_jsonl_run(self, database_name: str | None = None, db_key: str | None = None) -> TraceHealthRunRecord | None:
+        traces = read_health_run_traces(database_name=database_name, limit=1, db_key=db_key)
         return traces[0] if traces else None
 
-    def get_previous_jsonl_runs(self, database_name: str | None = None, limit: int = 5) -> list[TraceHealthRunRecord]:
-        return read_health_run_traces(database_name=database_name, limit=limit)
+    def get_previous_jsonl_runs(self, database_name: str | None = None, limit: int = 5, db_key: str | None = None) -> list[TraceHealthRunRecord]:
+        return read_health_run_traces(database_name=database_name, limit=limit, db_key=db_key)
 
     def get_jsonl_runs_in_time_window(
         self,
@@ -232,12 +397,14 @@ class JsonlHistoryService:
         end: datetime | None,
         database_name: str | None = None,
         limit: int = 50,
+        db_key: str | None = None,
     ) -> list[TraceHealthRunRecord]:
         return read_health_run_traces(
             database_name=database_name,
             completed_after=start,
             completed_before=end,
             limit=limit,
+            db_key=db_key,
         )
 
     def get_metric_trends_from_jsonl(
@@ -246,8 +413,9 @@ class JsonlHistoryService:
         database_name: str | None = None,
         traces: list[TraceHealthRunRecord] | None = None,
         limit: int = 20,
+        db_key: str | None = None,
     ) -> list[MetricTrendSummary]:
-        source = traces if traces is not None else read_health_run_traces(database_name=database_name, limit=limit)
+        source = traces if traces is not None else read_health_run_traces(database_name=database_name, limit=limit, db_key=db_key)
         chronological = list(reversed(source))
         trends: list[MetricTrendSummary] = []
         for label, key in DEFAULT_TREND_METRICS:
@@ -278,15 +446,17 @@ class JsonlHistoryService:
         user_query: str,
         database_name: str | None = None,
         requested_domain: str | None = None,
+        db_key: str | None = None,
     ) -> dict[str, Any]:
         time_scope = resolve_time_window(user_query)
-        traces = self._load_traces(limit=100, database_name=database_name, time_scope=time_scope)
-        context = self.compare_recent_runs(limit=100, database_name=database_name, time_scope=time_scope)
+        traces = self._load_traces(limit=100, database_name=database_name, time_scope=time_scope, db_key=db_key)
+        context = self.compare_recent_runs(limit=100, database_name=database_name, time_scope=time_scope, db_key=db_key)
         audit = self.audit_history_pipeline(
             database_name=database_name,
             time_scope=time_scope,
             traces=traces,
             auto_rebuild=True,
+            db_key=db_key,
         )
         indexed_recurring = audit.get("indexed_recurring_findings") or []
         if audit.get("recurrence_computation_mode") == "indexed" and indexed_recurring:
@@ -345,19 +515,209 @@ class JsonlHistoryService:
             "fallback_summary": (transition.fallback_summary if transition else "Fallback mode unavailable."),
         }
 
+    def route_history_metric_question(
+        self,
+        user_query: str,
+        requested_domain: str | None = None,
+    ) -> dict[str, Any] | None:
+        return route_history_metric_question(user_query=user_query, requested_domain=requested_domain)
+
+    def get_metric_history_from_index(
+        self,
+        *,
+        route: dict[str, Any],
+        database_name: str | None = None,
+        db_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        fields = [str(field) for field in (route.get("requested_fields") or []) if str(field).strip()]
+        if not fields:
+            return None
+
+        window = route.get("time_window") if isinstance(route.get("time_window"), dict) else None
+        window_start = _to_datetime(window.get("completed_after")) if window else None
+        window_end = _to_datetime(window.get("completed_before")) if window else None
+        index_rows = read_history_index_entries(
+            database_name=database_name,
+            limit=None,
+            entry_type="run_history",
+            db_key=db_key,
+        )
+        ordered_rows = list(reversed(index_rows))
+        planner_records = read_database_planner_memory(database_name=database_name, limit=1, db_key=db_key)
+        baseline_by_metric: dict[str, dict[str, Any]] = {}
+        if planner_records:
+            baseline_by_metric = dict((planner_records[0].database_behavior_profile.metric_baselines or {}))
+
+        points_by_field: dict[str, list[dict[str, Any]]] = {field: [] for field in fields}
+        matched_runs = 0
+        host_scope = ""
+        host_label = ""
+        for entry in ordered_rows:
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
+            completed_at = _to_datetime(payload.get("completed_at") or payload.get("recorded_at"))
+            if window_start and completed_at and completed_at < window_start:
+                continue
+            if window_end and completed_at and completed_at >= window_end:
+                continue
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            if not metrics:
+                continue
+            has_match = False
+            if not host_scope:
+                host_scope = str(metrics.get("host_check_scope") or "")
+                host_label = str(metrics.get("host_check_label") or "")
+            for field in fields:
+                value = None
+                for candidate in _candidate_metric_keys(field):
+                    value = _to_float(metrics.get(candidate))
+                    if value is not None:
+                        break
+                if value is None:
+                    continue
+                has_match = True
+                points_by_field[field].append(
+                    {
+                        "completed_at": completed_at.isoformat() if completed_at else "",
+                        "value": value,
+                        "overall_status": str(payload.get("overall_status") or "INFO"),
+                    }
+                )
+            if has_match:
+                matched_runs += 1
+
+        field_summaries: list[dict[str, Any]] = []
+        for field, points in points_by_field.items():
+            values = [float(item["value"]) for item in points if item.get("value") is not None]
+            if not values:
+                continue
+            baseline = baseline_by_metric.get(field) if isinstance(baseline_by_metric.get(field), dict) else {}
+            average_normal = _to_float((baseline or {}).get("average_normal"))
+            recent_average = _to_float((baseline or {}).get("recent_average"))
+            pressure_runs = int((baseline or {}).get("pressure_run_count") or 0)
+            stable_runs = int((baseline or {}).get("stable_run_count") or 0)
+            if average_normal is None:
+                average_normal = sum(values) / len(values)
+            if recent_average is None:
+                recent_window = values[-3:] if len(values) >= 3 else values
+                recent_average = sum(recent_window) / len(recent_window)
+            if pressure_runs == 0 and stable_runs == 0:
+                threshold = METRIC_HIGH_THRESHOLDS.get(field, 85.0 if field.endswith("_pct") else 1.0)
+                pressure_runs = sum(1 for value in values if value >= threshold)
+                stable_runs = max(len(values) - pressure_runs, 0)
+            latest_value = values[-1]
+            state = str((baseline or {}).get("state") or _index_metric_state(field=field, latest=latest_value, average_normal=average_normal))
+            field_summaries.append(
+                {
+                    "field": field,
+                    "sample_count": len(values),
+                    "latest": round(latest_value, 3),
+                    "average_normal": round(float(average_normal), 3),
+                    "recent_average": round(float(recent_average), 3),
+                    "min": round(min(values), 3),
+                    "max": round(max(values), 3),
+                    "state": state,
+                    "pressure_run_count": pressure_runs,
+                    "stable_run_count": stable_runs,
+                }
+            )
+
+        if not field_summaries:
+            return None
+
+        blocking_summary = None
+        if str(route.get("metric_family") or "") == "blocking":
+            blocking_values = [row["value"] for row in points_by_field.get("blocking_count", []) if row.get("value") is not None]
+            if blocking_values:
+                occurrences = sum(1 for value in blocking_values if float(value) > 0.0)
+                max_blocking = int(max(blocking_values))
+                last_occurrence = ""
+                for row in reversed(points_by_field.get("blocking_count", [])):
+                    if float(row.get("value") or 0) > 0:
+                        stamp = _to_datetime(row.get("completed_at"))
+                        if stamp:
+                            last_occurrence = stamp.strftime("%Y-%m-%d %H:%M UTC")
+                        break
+                affected_pct = (occurrences / max(matched_runs, 1)) * 100.0
+                blocking_summary = {
+                    "occurrences": occurrences,
+                    "matched_runs": matched_runs,
+                    "affected_pct": round(affected_pct, 1),
+                    "max_blocking_sessions": max_blocking,
+                    "last_occurrence": last_occurrence,
+                }
+
+        return {
+            "metric_family": str(route.get("metric_family") or ""),
+            "title": str(route.get("title") or "Historical Metric"),
+            "aggregation": str(route.get("aggregation") or "latest"),
+            "time_window_label": str((window or {}).get("label") or "all"),
+            "matched_runs": matched_runs,
+            "sample_count": sum(int(item.get("sample_count") or 0) for item in field_summaries),
+            "field_summaries": field_summaries,
+            "blocking_summary": blocking_summary,
+            "host_check_scope": host_scope,
+            "host_check_label": host_label,
+            "source": "index",
+            "planner_memory_used": bool(planner_records),
+            "history_index_used": bool(index_rows),
+        }
+
+    def answer_history_question_from_index(
+        self,
+        *,
+        user_query: str,
+        database_name: str | None = None,
+        requested_domain: str | None = None,
+        db_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        route = self.route_history_metric_question(user_query=user_query, requested_domain=requested_domain)
+        if route is None:
+            return None
+        history = self.get_metric_history_from_index(route=route, database_name=database_name, db_key=db_key)
+        if history is None:
+            return None
+        rendered, summary = _render_index_history_metric_report(question=user_query, route=route, history=history)
+        supporting = {
+            "question_type": "history_metric",
+            "metric_family": route.get("metric_family"),
+            "aggregation": route.get("aggregation"),
+            "time_window": route.get("time_window") or {"label": "all"},
+            "matched_runs": history.get("matched_runs"),
+            "sample_count": history.get("sample_count"),
+            "field_summaries": history.get("field_summaries"),
+            "source": "index",
+            "planner_memory_used": history.get("planner_memory_used"),
+            "history_index_used": history.get("history_index_used"),
+        }
+        return {
+            "ok": True,
+            "route": route,
+            "history": history,
+            "rendered_report": rendered,
+            "summary": summary,
+            "supporting_data": supporting,
+            "source": "index",
+            "confident": bool(history.get("field_summaries")),
+        }
+
     def _load_traces(
         self,
         *,
         limit: int,
         database_name: str | None,
         time_scope: dict[str, Any] | None,
+        db_key: str | None = None,
     ) -> list[TraceHealthRunRecord]:
-        return read_health_run_traces(
+        fetch_limit = max(int(limit) * 5, int(limit), 10)
+        traces = read_health_run_traces(
             database_name=database_name,
             completed_after=(time_scope or {}).get("completed_after"),
             completed_before=(time_scope or {}).get("completed_before"),
-            limit=limit,
+            limit=fetch_limit,
+            db_key=db_key,
         )
+        deduped = _dedupe_trace_records(traces)
+        return deduped[: max(int(limit), 0)]
 
     def audit_history_pipeline(
         self,
@@ -366,55 +726,64 @@ class JsonlHistoryService:
         time_scope: dict[str, Any] | None = None,
         traces: list[TraceHealthRunRecord] | None = None,
         auto_rebuild: bool = True,
+        db_key: str | None = None,
     ) -> dict[str, Any]:
-        source_traces = traces if traces is not None else self._load_traces(limit=100, database_name=database_name, time_scope=time_scope)
+        resolved_db_key = (db_key or "").strip() or get_default_oracle_target().db_key
+        source_traces = traces if traces is not None else self._load_traces(limit=100, database_name=database_name, time_scope=time_scope, db_key=resolved_db_key)
         runs_scanned = len(source_traces)
         latest_health_run_at = _to_datetime(source_traces[0].completed_at) if source_traces else None
-        snapshot = self._index_snapshot(database_name=database_name, time_scope=time_scope)
-        latest_indexed_at = _to_datetime(snapshot.get("latest_indexed_at"))
+        snapshot = self._index_snapshot(database_name=database_name, time_scope=time_scope, db_key=resolved_db_key)
+        index_status = get_index_status(resolved_db_key)
+        latest_indexed_at = _to_datetime(index_status.get("last_updated"))
         if latest_health_run_at and latest_indexed_at and latest_indexed_at < latest_health_run_at:
-            snapshot["history_index_status"] = "stale"
-            snapshot["history_index_freshness"] = "stale"
+            index_status["fresh"] = False
             snapshot.setdefault("notes", []).append("History indexes are older than the latest health run.")
-        elif latest_health_run_at and latest_indexed_at is None:
-            snapshot["history_index_freshness"] = "missing"
         notes = list(snapshot.get("notes") or [])
         rebuilt = False
-        if auto_rebuild and runs_scanned and self._should_rebuild_indexes(snapshot):
+        should_rebuild = runs_scanned > 0 and (not index_status.get("available") or not index_status.get("fresh"))
+        if auto_rebuild and should_rebuild:
             try:
-                rebuild_planner_memory_artifacts(database_name=database_name)
+                rebuild_planner_memory_artifacts(database_name=database_name, db_key=resolved_db_key)
                 rebuilt = True
                 notes.append("History indexes were rebuilt during this request.")
-                snapshot = self._index_snapshot(database_name=database_name, time_scope=time_scope)
+                snapshot = self._index_snapshot(database_name=database_name, time_scope=time_scope, db_key=resolved_db_key)
+                index_status = get_index_status(resolved_db_key)
                 notes.extend(snapshot.get("notes") or [])
             except Exception as exc:
                 notes.append(f"History index rebuild failed; continued with fallback: {exc}")
 
-        recurrence_mode = "indexed" if self._can_use_indexed_recurrence(snapshot, latest_health_run_at=latest_health_run_at) else "raw_scan"
+        use_index = bool(index_status.get("available")) and bool(index_status.get("fresh"))
+        recurrence_mode = "indexed" if use_index else "raw_scan"
         indexed_recurring = self._recurring_findings_from_index_records(
             snapshot.get("recurring_records") or [],
             sampled_runs=runs_scanned,
         )
-        if recurrence_mode != "indexed":
+        if not use_index:
             notes.append(self._raw_fallback_reason(snapshot))
 
-        history_source_used = "indexed recurrence + raw run metrics" if recurrence_mode == "indexed" else "raw JSONL only"
-        index_usage_summary = self._index_usage_summary(snapshot, recurrence_mode=recurrence_mode)
+        history_source_used = "indexed recurrence + metrics" if use_index else "raw JSONL fallback"
+        index_usage_summary = "recurring + chunks" if use_index else "none"
         index_records_scanned = int(snapshot.get("index_records_scanned") or 0)
         files_read = list(snapshot.get("files_read") or [])
+        if use_index:
+            history_index_status = "active"
+            history_index_freshness = "fresh"
+        else:
+            history_index_status = "missing_or_stale"
+            history_index_freshness = "stale" if bool(index_status.get("available")) else "missing"
         return {
             "history_source_used": history_source_used,
             "recurrence_computation_mode": recurrence_mode,
             "index_usage_summary": index_usage_summary,
             "runs_scanned": runs_scanned,
             "index_records_scanned": index_records_scanned,
-            "history_index_status": snapshot.get("history_index_status") or "unknown",
-            "history_index_freshness": snapshot.get("history_index_freshness") or "unknown",
+            "history_index_status": history_index_status,
+            "history_index_freshness": history_index_freshness,
             "history_index_rebuilt": rebuilt,
             "history_index_notes": _dedupe_preserve_order(notes),
             "history_source_files_read": files_read,
             "latest_health_run_at": source_traces[0].completed_at if source_traces else None,
-            "latest_indexed_at": snapshot.get("latest_indexed_at"),
+            "latest_indexed_at": index_status.get("last_updated") or snapshot.get("latest_indexed_at"),
             "indexed_recurring_findings": indexed_recurring,
         }
 
@@ -423,8 +792,9 @@ class JsonlHistoryService:
         *,
         database_name: str | None,
         time_scope: dict[str, Any] | None,
+        db_key: str | None = None,
     ) -> dict[str, Any]:
-        paths = history_data_source_paths()
+        paths = history_data_source_paths(db_key=db_key)
         files_present = {name: path.exists() for name, path in paths.items() if name != "health_runs"}
         files_read: list[str] = []
         notes: list[str] = []
@@ -434,7 +804,7 @@ class JsonlHistoryService:
         history_entries: list[dict[str, Any]] = []
 
         if files_present.get("recurring_issues"):
-            recurring_records = read_recurring_issue_index(database_name=database_name, limit=None)
+            recurring_records = read_recurring_issue_index(database_name=database_name, limit=None, db_key=db_key)
             files_read.append(str(paths["recurring_issues"]))
         if files_present.get("trace_chunks"):
             chunk_records = read_trace_evidence_chunks(
@@ -442,13 +812,14 @@ class JsonlHistoryService:
                 completed_after=(time_scope or {}).get("completed_after"),
                 completed_before=(time_scope or {}).get("completed_before"),
                 limit=None,
+                db_key=db_key,
             )
             files_read.append(str(paths["trace_chunks"]))
         if files_present.get("database_behavior_profiles"):
-            behavior_profiles = read_database_planner_memory(database_name=database_name, limit=None)
+            behavior_profiles = read_database_planner_memory(database_name=database_name, limit=None, db_key=db_key)
             files_read.append(str(paths["database_behavior_profiles"]))
         if files_present.get("history_indexing"):
-            history_entries = read_history_index_entries(database_name=database_name, limit=None)
+            history_entries = read_history_index_entries(database_name=database_name, limit=None, db_key=db_key)
             files_read.append(str(paths["history_indexing"]))
 
         latest_values = [
@@ -2215,6 +2586,245 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
         seen.add(text)
         out.append(text)
     return out
+
+
+def _index_metric_state(*, field: str, latest: float, average_normal: float | None) -> str:
+    if average_normal is None:
+        return "unknown"
+    threshold = METRIC_HIGH_THRESHOLDS.get(field, 85.0 if field.endswith("_pct") else 1.0)
+    if latest >= threshold:
+        return "pressured"
+    if average_normal == 0:
+        return "elevated" if latest > 0 else "normal"
+    if latest >= average_normal * 1.2:
+        return "elevated"
+    return "normal"
+
+
+def _field_label(field: str) -> str:
+    labels = {
+        "host_cpu_pct": "Host CPU",
+        "container_cpu_pct": "Oracle CPU",
+        "top_cpu_sql_cpu_s": "Top SQL CPU",
+        "top_elapsed_sql_elapsed_s": "Top SQL Elapsed",
+        "host_memory_pct": "Host Memory",
+        "container_memory_pct": "Oracle Memory",
+        "blocking_count": "Blocking Sessions",
+        "active_sessions": "Active Sessions",
+        "hottest_tablespace_pct": "Highest Tablespace Usage",
+        "temp_usage_pct": "TEMP Usage",
+        "alert_log_count": "Alert ORA/TNS Count",
+    }
+    key = str(field or "").strip().lower()
+    return labels.get(key, key.replace("_", " ").title())
+
+
+def _candidate_metric_keys(field: str) -> tuple[str, ...]:
+    aliases: dict[str, tuple[str, ...]] = {
+        "highest_tablespace_pct": ("highest_tablespace_pct", "hottest_tablespace_pct"),
+        "highest_tablespace_name": ("highest_tablespace_name", "hottest_tablespace"),
+        "alert_ora_tns_count": ("alert_ora_tns_count", "alert_log_count"),
+        "top_sql_cpu_seconds": ("top_sql_cpu_seconds", "top_cpu_sql_cpu_s"),
+        "top_sql_elapsed_seconds": ("top_sql_elapsed_seconds", "top_elapsed_sql_elapsed_s"),
+        "redo_switches": ("redo_switches", "redo_switch_count"),
+        "fra_used_pct": ("fra_used_pct", "fra_pct"),
+        "incident_driver_sql": ("incident_driver_sql", "top_cpu_sql_id", "top_elapsed_sql_id"),
+        "blocking_sessions": ("blocking_sessions", "blocking_count"),
+    }
+    return aliases.get(field, (field,))
+
+
+def _render_index_history_metric_report(
+    *,
+    question: str,
+    route: dict[str, Any],
+    history: dict[str, Any],
+) -> tuple[str, str]:
+    title = f"# Historical {history.get('title') or 'Metric Analysis'}"
+    metric_family = str(route.get("metric_family") or "")
+    fields = history.get("field_summaries") if isinstance(history.get("field_summaries"), list) else []
+    lines: list[str] = []
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        label = _field_label(str(item.get("field") or "metric"))
+        field = str(item.get("field") or "")
+        if field.endswith("_pct") or field.endswith("_ratio"):
+            unit = "%"
+        elif field.endswith("_cpu_s") or field.endswith("_elapsed_s"):
+            unit = " sec"
+        else:
+            unit = ""
+        lines.append(f"{label}:")
+        lines.append(f"sample_count={int(item.get('sample_count') or 0)}")
+        lines.append(f"latest={float(item.get('latest') or 0):.2f}{unit}")
+        lines.append(f"average_normal={float(item.get('average_normal') or 0):.2f}{unit}")
+        lines.append(f"recent_average={float(item.get('recent_average') or 0):.2f}{unit}")
+        lines.append(f"range={float(item.get('min') or 0):.2f}{unit} to {float(item.get('max') or 0):.2f}{unit}")
+        lines.append(f"state={item.get('state')}")
+        lines.append(
+            f"pressure_runs={int(item.get('pressure_run_count') or 0)}; stable_runs={int(item.get('stable_run_count') or 0)}"
+        )
+
+    answer_lines = []
+    if str(route.get("aggregation") or "") == "avg":
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            label = _field_label(str(item.get("field") or "metric"))
+            field = str(item.get("field") or "")
+            if field.endswith("_pct") or field.endswith("_ratio"):
+                unit = "%"
+            elif field.endswith("_cpu_s") or field.endswith("_elapsed_s"):
+                unit = " sec"
+            else:
+                unit = ""
+            answer_lines.append(f"Average {label}: {float(item.get('recent_average') or 0):.2f}{unit}")
+    elif str(route.get("aggregation") or "") == "max":
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            label = _field_label(str(item.get("field") or "metric"))
+            field = str(item.get("field") or "")
+            if field.endswith("_pct") or field.endswith("_ratio"):
+                unit = "%"
+            elif field.endswith("_cpu_s") or field.endswith("_elapsed_s"):
+                unit = " sec"
+            else:
+                unit = ""
+            answer_lines.append(f"Maximum {label}: {float(item.get('max') or 0):.2f}{unit}")
+    elif str(route.get("aggregation") or "") == "min":
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            label = _field_label(str(item.get("field") or "metric"))
+            field = str(item.get("field") or "")
+            if field.endswith("_pct") or field.endswith("_ratio"):
+                unit = "%"
+            elif field.endswith("_cpu_s") or field.endswith("_elapsed_s"):
+                unit = " sec"
+            else:
+                unit = ""
+            answer_lines.append(f"Minimum {label}: {float(item.get('min') or 0):.2f}{unit}")
+    else:
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            label = _field_label(str(item.get("field") or "metric"))
+            field = str(item.get("field") or "")
+            if field.endswith("_pct") or field.endswith("_ratio"):
+                unit = "%"
+            elif field.endswith("_cpu_s") or field.endswith("_elapsed_s"):
+                unit = " sec"
+            else:
+                unit = ""
+            answer_lines.append(f"Latest {label}: {float(item.get('latest') or 0):.2f}{unit}")
+
+    blocking = history.get("blocking_summary") if isinstance(history.get("blocking_summary"), dict) else None
+    if metric_family == "blocking" and blocking:
+        answer_lines.append(
+            f"Blocking detected in {int(blocking.get('occurrences') or 0)}/{int(blocking.get('matched_runs') or 0)} runs "
+            f"({float(blocking.get('affected_pct') or 0):.1f}%)"
+        )
+        answer_lines.append(f"Max blocking sessions: {int(blocking.get('max_blocking_sessions') or 0)}")
+        if str(blocking.get("last_occurrence") or "").strip():
+            answer_lines.append(f"Last occurrence: {blocking.get('last_occurrence')}")
+
+    notes = []
+    scope = str(history.get("host_check_scope") or "").strip()
+    if scope == "local_app_host":
+        notes.append("Host scope: Local AutoDBA app host.")
+        notes.append("This host telemetry may not be per-database CPU attribution.")
+    elif scope:
+        label = str(history.get("host_check_label") or scope)
+        notes.append(f"Host scope: {label}.")
+
+    rendered = "\n".join(
+        [
+            title,
+            "",
+            f"Question: {question}",
+            f"Time window: {history.get('time_window_label') or 'all'}",
+            "",
+            "Summary:",
+            *answer_lines,
+            "",
+            "Metric details:",
+            *lines,
+            "",
+            "Notes:",
+            *(notes or ["Indexed planner-memory/history evidence was used."]),
+        ]
+    )
+    summary = (
+        f"Historical {str(history.get('title') or '').lower()} resolved from index with "
+        f"{int(history.get('sample_count') or 0)} sample(s) across {int(history.get('matched_runs') or 0)} run(s)."
+    )
+    return rendered, summary
+
+
+def _dedupe_trace_records(records: list[TraceHealthRunRecord]) -> list[TraceHealthRunRecord]:
+    if not records:
+        return []
+
+    by_run_id: dict[str, list[TraceHealthRunRecord]] = {}
+    no_run_id: list[TraceHealthRunRecord] = []
+    for record in records:
+        run_id = str(record.run_id or "").strip()
+        if run_id:
+            by_run_id.setdefault(run_id, []).append(record)
+        else:
+            no_run_id.append(record)
+    stage_one = [_pick_richest_trace(group) for group in by_run_id.values()] + no_run_id
+
+    by_trace_path: dict[str, list[TraceHealthRunRecord]] = {}
+    no_trace_path: list[TraceHealthRunRecord] = []
+    for record in stage_one:
+        trace_path = str(record.trace_path or "").strip()
+        if trace_path:
+            by_trace_path.setdefault(trace_path, []).append(record)
+        else:
+            no_trace_path.append(record)
+    stage_two = [_pick_richest_trace(group) for group in by_trace_path.values()] + no_trace_path
+
+    by_fallback: dict[tuple[str, str, str], list[TraceHealthRunRecord]] = {}
+    for record in stage_two:
+        fallback_key = (
+            str(record.completed_at or "").strip(),
+            str(record.database_name or "").strip(),
+            str(record.summary or "").strip(),
+        )
+        by_fallback.setdefault(fallback_key, []).append(record)
+    deduped = [_pick_richest_trace(group) for group in by_fallback.values()]
+    deduped.sort(key=_trace_sort_key, reverse=True)
+    return deduped
+
+
+def _pick_richest_trace(records: list[TraceHealthRunRecord]) -> TraceHealthRunRecord:
+    return max(records, key=lambda item: (_trace_richness_score(item), _trace_sort_key(item)))
+
+
+def _trace_richness_score(record: TraceHealthRunRecord) -> int:
+    score = 0
+    score += len(record.metrics or {})
+    score += len(record.issues or []) * 4
+    score += len(record.actionable_items or []) * 2
+    score += len(record.health_sections or []) * 2
+    score += len(record.history_context_summary or {})
+    if record.snapshot is not None:
+        score += 8
+    if str(record.report_markdown or "").strip():
+        score += 4
+    return score
+
+
+def _trace_sort_key(record: TraceHealthRunRecord) -> float:
+    dt = _to_datetime(record.completed_at) or _to_datetime(record.recorded_at)
+    if dt is None:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
 
 
 def _delta(previous: Any, current: Any) -> float:

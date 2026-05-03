@@ -267,12 +267,41 @@ def _alert_actions(rows: list[dict[str, Any]], hours: int) -> list[ActionableHea
 def _tablespace_rows() -> list[dict[str, Any]]:
     rows, _ = _fetch_all(
         """
-        select tablespace_name, round(used_percent, 2) as used_pct,
-               tablespace_size*8 as total_mb,
-               used_space*8 as used_mb,
-               (tablespace_size-used_space)*8 as free_mb
-        from dba_tablespace_usage_metrics
-        order by used_percent desc
+        with file_alloc as (
+            select tablespace_name,
+                   round(sum(bytes) / 1024 / 1024, 2) as allocated_mb,
+                   round(sum(case when autoextensible = 'YES' and maxbytes > bytes then maxbytes else bytes end) / 1024 / 1024, 2) as max_mb,
+                   sum(case when autoextensible = 'YES' then 1 else 0 end) as autoext_count
+            from dba_data_files
+            group by tablespace_name
+        ),
+        usage_metrics as (
+            select tablespace_name,
+                   round(used_percent, 2) as allocated_used_pct,
+                   round(used_space * 8, 2) as used_mb
+            from dba_tablespace_usage_metrics
+        )
+        select t.tablespace_name,
+               nvl(u.allocated_used_pct, 0) as used_pct,
+               a.allocated_mb as allocated_mb,
+               nvl(u.used_mb, round(nvl(a.allocated_mb, 0) * (nvl(u.allocated_used_pct, 0) / 100), 2)) as used_mb,
+               round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_allocated_mb,
+               nvl(u.allocated_used_pct, 0) as allocated_used_pct,
+               a.max_mb as max_mb,
+               round(greatest(nvl(a.max_mb, nvl(a.allocated_mb, 0)) - nvl(u.used_mb, 0), 0), 2) as max_free_mb,
+               case
+                   when nvl(a.max_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.max_mb) * 100, 2)
+                   when nvl(a.allocated_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.allocated_mb) * 100, 2)
+                   else null
+               end as max_used_pct,
+               case when nvl(a.autoext_count, 0) > 0 then 'YES' else 'NO' end as autoextensible,
+               round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_mb,
+               a.allocated_mb as total_mb
+        from dba_tablespaces t
+        left join file_alloc a on a.tablespace_name = t.tablespace_name
+        left join usage_metrics u on u.tablespace_name = t.tablespace_name
+        where t.contents <> 'TEMPORARY'
+        order by nvl(u.allocated_used_pct, 0) desc, t.tablespace_name
         """
     )
     return rows

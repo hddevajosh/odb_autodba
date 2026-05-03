@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import os
+from contextvars import ContextVar
 from contextlib import contextmanager
 from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict
 
+from odb_autodba.target_registry import get_oracle_target, get_target_password
 from odb_autodba.utils.env_loader import load_project_dotenv
+
+_ACTIVE_DB_KEY: ContextVar[str | None] = ContextVar("odb_autodba_active_db_key", default=None)
 
 
 class ConnectionSettings(BaseModel):
@@ -21,41 +24,35 @@ class ConnectionSettings(BaseModel):
     sysdba: bool = False
 
 
-def load_connection_settings() -> ConnectionSettings:
+def load_connection_settings(db_key: str | None = None) -> ConnectionSettings:
     load_project_dotenv()
-    dsn = _env_first("ORACLE_DSN", "DB_DSN")
-    missing = [
-        canonical
-        for canonical, aliases in {
-            "host": ("ORACLE_HOST", "DB_HOST"),
-            "service_name": ("ORACLE_SERVICE_NAME", "ORACLE_SERVICE", "DB_SERVICE"),
-            "user": ("ORACLE_USER", "DB_USER"),
-            "password": ("ORACLE_PASSWORD", "ORACLE_PASS", "DB_PASSWORD"),
-        }.items()
-        if not _env_first(*aliases)
-    ]
-    if missing and not dsn:
+    active_db_key = db_key if (db_key or "").strip() else _ACTIVE_DB_KEY.get()
+    target = get_oracle_target(active_db_key)
+    dsn = target.connect_descriptor
+    service_name = target.service_name or target.sid
+
+    if not service_name and not dsn:
         raise RuntimeError(
-            "Missing Oracle connection settings: "
-            + ", ".join(missing)
-            + ". Set ORACLE_HOST/ORACLE_SERVICE_NAME/ORACLE_USER/ORACLE_PASSWORD "
-            + "or DB_HOST/DB_SERVICE/DB_USER/DB_PASSWORD."
+            "Missing Oracle connection settings: service_name. "
+            "Set ORACLE_SERVICE_NAME/ORACLE_SERVICE or DB_SERVICE, "
+            "or provide ORACLE_DSN/DB_DSN."
         )
+
     return ConnectionSettings(
-        host=_env_first("ORACLE_HOST", "DB_HOST") or "localhost",
-        port=int(_env_first("ORACLE_PORT", "DB_PORT") or "1521"),
-        service_name=_env_first("ORACLE_SERVICE_NAME", "ORACLE_SERVICE", "DB_SERVICE") or "FREEPDB1",
-        user=_env_first("ORACLE_USER", "DB_USER") or "system",
-        password=_env_first("ORACLE_PASSWORD", "ORACLE_PASS", "DB_PASSWORD") or "oracle",
+        host=target.host,
+        port=int(target.port),
+        service_name=service_name or "FREEPDB1",
+        user=target.username,
+        password=get_target_password(target),
         dsn=dsn,
-        sysdba=os.getenv("ORACLE_SYSDBA", "false").lower() in {"1", "true", "yes", "on"},
+        sysdba=target.sysdba,
     )
 
 
-def create_connection(settings: ConnectionSettings | None = None):
+def create_connection(settings: ConnectionSettings | None = None, *, db_key: str | None = None):
     import oracledb  # type: ignore
 
-    active = settings or load_connection_settings()
+    active = settings or load_connection_settings(db_key=db_key)
     dsn = active.dsn or oracledb.makedsn(active.host, active.port, service_name=active.service_name)
     kwargs: dict[str, Any] = {
         "user": active.user,
@@ -69,8 +66,8 @@ def create_connection(settings: ConnectionSettings | None = None):
 
 
 @contextmanager
-def db_connection(settings: ConnectionSettings | None = None) -> Iterator[Any]:
-    conn = create_connection(settings)
+def db_connection(settings: ConnectionSettings | None = None, *, db_key: str | None = None) -> Iterator[Any]:
+    conn = create_connection(settings, db_key=db_key)
     try:
         yield conn
     finally:
@@ -80,8 +77,15 @@ def db_connection(settings: ConnectionSettings | None = None) -> Iterator[Any]:
             pass
 
 
-def fetch_all(sql: str, binds: dict[str, Any] | None = None, *, settings: ConnectionSettings | None = None, max_rows: int | None = None) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+def fetch_all(
+    sql: str,
+    binds: dict[str, Any] | None = None,
+    *,
+    settings: ConnectionSettings | None = None,
+    max_rows: int | None = None,
+    db_key: str | None = None,
+) -> list[dict[str, Any]]:
+    with db_connection(settings, db_key=db_key) as conn:
         cur = conn.cursor()
         cur.execute(sql, binds or {})
         cols = [d[0].lower() for d in (cur.description or [])]
@@ -93,8 +97,14 @@ def fetch_all(sql: str, binds: dict[str, Any] | None = None, *, settings: Connec
         return rows
 
 
-def fetch_one(sql: str, binds: dict[str, Any] | None = None, *, settings: ConnectionSettings | None = None) -> dict[str, Any] | None:
-    rows = fetch_all(sql, binds, settings=settings, max_rows=1)
+def fetch_one(
+    sql: str,
+    binds: dict[str, Any] | None = None,
+    *,
+    settings: ConnectionSettings | None = None,
+    db_key: str | None = None,
+) -> dict[str, Any] | None:
+    rows = fetch_all(sql, binds, settings=settings, max_rows=1, db_key=db_key)
     return rows[0] if rows else None
 
 
@@ -107,9 +117,16 @@ def _normalize_value(value: Any) -> Any:
     return value
 
 
-def _env_first(*names: str) -> str | None:
-    for name in names:
-        value = os.getenv(name)
-        if value:
-            return value
-    return None
+@contextmanager
+def db_key_context(db_key: str | None) -> Iterator[None]:
+    cleaned = (db_key or "").strip() or None
+    token = _ACTIVE_DB_KEY.set(cleaned)
+    try:
+        yield
+    finally:
+        _ACTIVE_DB_KEY.reset(token)
+
+
+def active_db_key() -> str | None:
+    value = _ACTIVE_DB_KEY.get()
+    return value if (value or "").strip() else None

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from odb_autodba.config import get_default_oracle_target
 from odb_autodba.models.schemas import (
     HealthIssue,
     HealthSnapshot,
@@ -15,79 +16,61 @@ from odb_autodba.models.schemas import (
     TraceEvidenceChunk,
     TraceHealthRunRecord,
 )
+from odb_autodba.runtime_paths import get_indexes_dir, get_traces_dir
 from odb_autodba.utils.env_loader import load_project_dotenv
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RUNS_ROOT = PACKAGE_ROOT / "runs"
-DEFAULT_TRACES_ROOT = DEFAULT_RUNS_ROOT / "traces"
-DEFAULT_INDEXES_ROOT = DEFAULT_RUNS_ROOT / "indexes"
+REPO_ROOT = PACKAGE_ROOT.parent
 
 
-def traces_root() -> Path:
-    load_project_dotenv()
-    configured = os.getenv("ODB_AUTODBA_TRACE_DIR") or os.getenv("TRACE_DIR")
-    root = Path(configured) if configured else DEFAULT_TRACES_ROOT
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root
+def traces_root(db_key: str | None = None) -> Path:
+    return get_traces_dir(db_key=db_key)
 
 
-def indexes_root() -> Path:
-    load_project_dotenv()
-    configured = os.getenv("ODB_AUTODBA_HISTORY_INDEX_DIR") or os.getenv("PLANNER_HISTORY_INDEX_DIR")
-    root = Path(configured) if configured else DEFAULT_INDEXES_ROOT
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root
+def indexes_root(db_key: str | None = None) -> Path:
+    return get_indexes_dir(db_key=db_key)
 
 
-def ensure_runtime_dirs() -> None:
-    traces_root().mkdir(parents=True, exist_ok=True)
-    indexes_root().mkdir(parents=True, exist_ok=True)
+def ensure_runtime_dirs(db_key: str | None = None) -> None:
+    traces_root(db_key=db_key).mkdir(parents=True, exist_ok=True)
+    indexes_root(db_key=db_key).mkdir(parents=True, exist_ok=True)
 
 
-def health_run_trace_path() -> Path:
-    return traces_root() / "health_runs.jsonl"
+def health_run_trace_path(db_key: str | None = None) -> Path:
+    return traces_root(db_key=db_key) / "health_runs.jsonl"
 
 
-def recurring_issue_index_path() -> Path:
-    return indexes_root() / "recurring_issues.jsonl"
+def recurring_issue_index_path(db_key: str | None = None) -> Path:
+    return indexes_root(db_key=db_key) / "recurring_issues.jsonl"
 
 
-def trace_chunk_index_path() -> Path:
-    return indexes_root() / "trace_chunks.jsonl"
+def trace_chunk_index_path(db_key: str | None = None) -> Path:
+    return indexes_root(db_key=db_key) / "trace_chunks.jsonl"
 
 
-def database_behavior_profile_path() -> Path:
-    return indexes_root() / "database_behavior_profiles.jsonl"
+def database_behavior_profile_path(db_key: str | None = None) -> Path:
+    return indexes_root(db_key=db_key) / "database_behavior_profiles.jsonl"
 
 
-def history_indexing_path() -> Path:
-    load_project_dotenv()
-    configured = os.getenv("ODB_AUTODBA_HISTORY_INDEX_FILE") or os.getenv("PLANNER_HISTORY_INDEX_FILE")
-    if configured:
-        path = Path(configured)
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return path
-    return indexes_root() / "history_indexing.jsonl"
+def history_indexing_path(db_key: str | None = None) -> Path:
+    return indexes_root(db_key=db_key) / "history_indexing.jsonl"
 
 
-def history_data_source_paths() -> dict[str, Path]:
+def history_data_source_paths(db_key: str | None = None) -> dict[str, Path]:
     return {
-        "health_runs": health_run_trace_path(),
-        "trace_chunks": trace_chunk_index_path(),
-        "recurring_issues": recurring_issue_index_path(),
-        "database_behavior_profiles": database_behavior_profile_path(),
-        "history_indexing": history_indexing_path(),
+        "health_runs": health_run_trace_path(db_key=db_key),
+        "trace_chunks": trace_chunk_index_path(db_key=db_key),
+        "recurring_issues": recurring_issue_index_path(db_key=db_key),
+        "database_behavior_profiles": database_behavior_profile_path(db_key=db_key),
+        "history_indexing": history_indexing_path(db_key=db_key),
     }
 
 
-def health_run_trace_file_path(*, recorded_at: datetime, database_name: str) -> Path:
+def health_run_trace_file_path(*, recorded_at: datetime, database_name: str, db_key: str | None = None) -> Path:
     stamp = recorded_at.strftime("%Y%m%dT%H%M%S%fZ")
     safe_db = _safe_slug(database_name or "database")
-    return traces_root() / f"health_run_{stamp}_{safe_db}.json"
+    return traces_root(db_key=db_key) / f"health_run_{stamp}_{safe_db}.json"
 
 
 def append_health_run_trace(
@@ -97,6 +80,7 @@ def append_health_run_trace(
     report_markdown: str | None = None,
     history_context: HistoryContext | None = None,
     rebuild_artifacts: bool = True,
+    db_key: str | None = None,
 ) -> TraceHealthRunRecord:
     """Persist a full Oracle health trace and append a compact JSONL summary.
 
@@ -105,7 +89,9 @@ def append_health_run_trace(
     ``report_markdown`` so each health run has a full JSON trace.
     """
 
-    ensure_runtime_dirs()
+    resolved_db_key = _resolve_db_key(db_key)
+    assert resolved_db_key
+    ensure_runtime_dirs(db_key=resolved_db_key)
     now = datetime.now(UTC)
     summary = dict(snapshot_summary or {})
     if snapshot is not None:
@@ -115,7 +101,11 @@ def append_health_run_trace(
     run_id = str(summary.get("run_id") or f"odb_autodba_{now.strftime('%Y%m%d_%H%M%S')}")
     completed_at = str(summary.get("completed_at") or (snapshot.generated_at if snapshot else now.isoformat()))
     overall_status = _overall_status(summary, snapshot)
-    trace_file = health_run_trace_file_path(recorded_at=now, database_name=database_name)
+    trace_file = health_run_trace_file_path(recorded_at=now, database_name=database_name, db_key=resolved_db_key)
+    expected_trace_root = traces_root(db_key=resolved_db_key)
+    assert trace_file is not None
+    assert str(trace_file).startswith(str(expected_trace_root))
+    print(f"[TRACE WRITE] Writing trace to {trace_file}")
 
     record = TraceHealthRunRecord(
         run_id=run_id,
@@ -140,13 +130,15 @@ def append_health_run_trace(
     )
 
     _write_json(trace_file, record.model_dump(mode="json"))
-    _append_jsonl(health_run_trace_path(), _compact_record(record))
+    compact_path = health_run_trace_path(db_key=resolved_db_key)
+    assert str(compact_path).startswith(str(expected_trace_root))
+    _append_jsonl(compact_path, _compact_record(record))
 
     if rebuild_artifacts:
         try:
             from odb_autodba.rag.indexer import rebuild_planner_memory_artifacts
 
-            rebuild_planner_memory_artifacts(database_name=database_name)
+            rebuild_planner_memory_artifacts(database_name=database_name, db_key=resolved_db_key)
         except Exception:
             pass
     return record
@@ -158,11 +150,12 @@ def read_health_run_traces(
     limit: int | None = None,
     completed_after: datetime | None = None,
     completed_before: datetime | None = None,
+    db_key: str | None = None,
 ) -> list[TraceHealthRunRecord]:
-    ensure_runtime_dirs()
+    ensure_runtime_dirs(db_key=db_key)
     records: list[TraceHealthRunRecord] = []
     seen: set[str] = set()
-    full_files = sorted(traces_root().glob("health_run_*.json"), key=lambda item: item.name, reverse=True)
+    full_files = sorted(_trace_data_files(db_key=db_key), key=lambda item: item.name, reverse=True)
     for path in full_files:
         payload = _read_json(path)
         if not isinstance(payload, dict):
@@ -177,8 +170,8 @@ def read_health_run_traces(
         seen.add(record.run_id or record.trace_path or str(path))
         records.append(record)
 
-    if health_run_trace_path().exists():
-        for payload in _read_jsonl(health_run_trace_path()):
+    for compact_path in _health_runs_summary_paths(db_key=db_key):
+        for payload in _read_jsonl(compact_path):
             try:
                 record = TraceHealthRunRecord.model_validate(_expand_compact_record(payload))
             except Exception:
@@ -199,19 +192,29 @@ def read_health_run_summaries(
     *,
     database_name: str | None = None,
     limit: int | None = None,
+    db_key: str | None = None,
 ) -> list[dict[str, Any]]:
-    ensure_runtime_dirs()
-    rows = _read_jsonl(health_run_trace_path()) if health_run_trace_path().exists() else []
+    ensure_runtime_dirs(db_key=db_key)
+    rows: list[dict[str, Any]] = []
+    for path in _health_runs_summary_paths(db_key=db_key):
+        rows.extend(_read_jsonl(path))
     if not rows:
-        rows = [_compact_record(record) for record in read_health_run_traces(database_name=database_name, limit=limit)]
+        rows = [
+            _compact_record(record)
+            for record in read_health_run_traces(database_name=database_name, limit=limit, db_key=db_key)
+        ]
     if database_name:
         rows = [row for row in rows if row.get("database_name") == database_name]
     rows.sort(key=lambda item: str(item.get("completed_at") or item.get("recorded_at") or ""), reverse=True)
     return rows[:limit] if limit is not None else rows
 
 
-def write_trace_evidence_chunks(records: list[TraceEvidenceChunk]) -> None:
-    _write_jsonl_file(trace_chunk_index_path(), [record.model_dump(mode="json") for record in records])
+def write_trace_evidence_chunks(records: list[TraceEvidenceChunk], *, db_key: str | None = None) -> None:
+    resolved_db_key = _resolve_db_key(db_key)
+    path = trace_chunk_index_path(db_key=resolved_db_key)
+    expected_index_root = indexes_root(db_key=resolved_db_key)
+    assert str(path).startswith(str(expected_index_root))
+    _write_jsonl_file(path, [record.model_dump(mode="json") for record in records])
 
 
 def read_trace_evidence_chunks(
@@ -220,71 +223,89 @@ def read_trace_evidence_chunks(
     completed_after: datetime | None = None,
     completed_before: datetime | None = None,
     limit: int | None = None,
+    db_key: str | None = None,
 ) -> list[TraceEvidenceChunk]:
     rows = []
-    for payload in _read_jsonl(trace_chunk_index_path()):
-        try:
-            record = TraceEvidenceChunk.model_validate(payload)
-        except Exception:
-            continue
-        if database_name and record.database_name != database_name:
-            continue
-        recorded_at = _parse_dt(record.recorded_at)
-        if completed_after and recorded_at and recorded_at < completed_after:
-            continue
-        if completed_before and recorded_at and recorded_at >= completed_before:
-            continue
-        rows.append(record)
+    for path in _index_file_paths("trace_chunks.jsonl", db_key=db_key):
+        for payload in _read_jsonl(path):
+            try:
+                record = TraceEvidenceChunk.model_validate(payload)
+            except Exception:
+                continue
+            if database_name and record.database_name != database_name:
+                continue
+            recorded_at = _parse_dt(record.recorded_at)
+            if completed_after and recorded_at and recorded_at < completed_after:
+                continue
+            if completed_before and recorded_at and recorded_at >= completed_before:
+                continue
+            rows.append(record)
     rows.sort(key=lambda item: (item.recorded_at, item.chunk_id), reverse=True)
     return rows[:limit] if limit is not None else rows
 
 
-def write_recurring_issue_index(records: list[RecurringIssueIndexRecord]) -> None:
-    _write_jsonl_file(recurring_issue_index_path(), [record.model_dump(mode="json") for record in records])
+def write_recurring_issue_index(records: list[RecurringIssueIndexRecord], *, db_key: str | None = None) -> None:
+    resolved_db_key = _resolve_db_key(db_key)
+    path = recurring_issue_index_path(db_key=resolved_db_key)
+    expected_index_root = indexes_root(db_key=resolved_db_key)
+    assert str(path).startswith(str(expected_index_root))
+    _write_jsonl_file(path, [record.model_dump(mode="json") for record in records])
 
 
 def read_recurring_issue_index(
     *,
     database_name: str | None = None,
     limit: int | None = None,
+    db_key: str | None = None,
 ) -> list[RecurringIssueIndexRecord]:
     rows = []
-    for payload in _read_jsonl(recurring_issue_index_path()):
-        try:
-            record = RecurringIssueIndexRecord.model_validate(payload)
-        except Exception:
-            continue
-        if database_name and record.database_name != database_name:
-            continue
-        rows.append(record)
+    for path in _index_file_paths("recurring_issues.jsonl", db_key=db_key):
+        for payload in _read_jsonl(path):
+            try:
+                record = RecurringIssueIndexRecord.model_validate(payload)
+            except Exception:
+                continue
+            if database_name and record.database_name != database_name:
+                continue
+            rows.append(record)
     rows.sort(key=lambda item: (item.run_count, item.unhealthy_run_count, item.last_seen), reverse=True)
     return rows[:limit] if limit is not None else rows
 
 
-def write_database_planner_memory(records: list[OraclePlannerMemoryRecord]) -> None:
-    _write_jsonl_file(database_behavior_profile_path(), [record.model_dump(mode="json") for record in records])
+def write_database_planner_memory(records: list[OraclePlannerMemoryRecord], *, db_key: str | None = None) -> None:
+    resolved_db_key = _resolve_db_key(db_key)
+    path = database_behavior_profile_path(db_key=resolved_db_key)
+    expected_index_root = indexes_root(db_key=resolved_db_key)
+    assert str(path).startswith(str(expected_index_root))
+    _write_jsonl_file(path, [record.model_dump(mode="json") for record in records])
 
 
 def read_database_planner_memory(
     *,
     database_name: str | None = None,
     limit: int | None = None,
+    db_key: str | None = None,
 ) -> list[OraclePlannerMemoryRecord]:
     rows = []
-    for payload in _read_jsonl(database_behavior_profile_path()):
-        try:
-            record = OraclePlannerMemoryRecord.model_validate(payload)
-        except Exception:
-            continue
-        if database_name and record.database_name != database_name:
-            continue
-        rows.append(record)
+    for path in _index_file_paths("database_behavior_profiles.jsonl", db_key=db_key):
+        for payload in _read_jsonl(path):
+            try:
+                record = OraclePlannerMemoryRecord.model_validate(payload)
+            except Exception:
+                continue
+            if database_name and record.database_name != database_name:
+                continue
+            rows.append(record)
     rows.sort(key=lambda item: item.latest_trace_recorded_at or item.generated_at, reverse=True)
     return rows[:limit] if limit is not None else rows
 
 
-def write_history_index_entries(entries: list[dict[str, Any]]) -> None:
-    _write_jsonl_file(history_indexing_path(), entries)
+def write_history_index_entries(entries: list[dict[str, Any]], *, db_key: str | None = None) -> None:
+    resolved_db_key = _resolve_db_key(db_key)
+    path = history_indexing_path(db_key=resolved_db_key)
+    expected_index_root = indexes_root(db_key=resolved_db_key)
+    assert str(path).startswith(str(expected_index_root))
+    _write_jsonl_file(path, entries)
 
 
 def read_history_index_entries(
@@ -292,15 +313,17 @@ def read_history_index_entries(
     database_name: str | None = None,
     limit: int | None = None,
     entry_type: str | None = None,
+    db_key: str | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
-    for payload in _read_jsonl(history_indexing_path()):
-        if entry_type and payload.get("entry_type") != entry_type:
-            continue
-        candidate = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
-        if database_name and candidate.get("database_name") != database_name:
-            continue
-        rows.append(payload)
+    for path in _index_file_paths("history_indexing.jsonl", db_key=db_key):
+        for payload in _read_jsonl(path):
+            if entry_type and payload.get("entry_type") != entry_type:
+                continue
+            candidate = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+            if database_name and candidate.get("database_name") != database_name:
+                continue
+            rows.append(payload)
     rows.sort(key=lambda item: str((item.get("payload") or item).get("completed_at") or ""), reverse=True)
     return rows[:limit] if limit is not None else rows
 
@@ -329,6 +352,7 @@ def _snapshot_metrics(snapshot: HealthSnapshot) -> dict[str, Any]:
     host = snapshot.host_snapshot
     docker_stats = host.docker_stats if host else {}
     raw = snapshot.raw_evidence or {}
+    host_check = raw.get("host_check") if isinstance(raw.get("host_check"), dict) else {}
     return {
         "active_sessions": snapshot.session_summary.active_sessions,
         "total_sessions": snapshot.session_summary.total_sessions,
@@ -355,6 +379,10 @@ def _snapshot_metrics(snapshot: HealthSnapshot) -> dict[str, Any]:
         "host_swap_pct": host.swap_pct if host else None,
         "container_cpu_pct": docker_stats.get("cpu_pct") if docker_stats else None,
         "container_memory_pct": docker_stats.get("memory_pct") if docker_stats else None,
+        "host_check_mode": host_check.get("host_check_mode") or (host.host_check_mode if host else None),
+        "host_check_scope": host_check.get("host_check_scope") or (host.host_check_scope if host else None),
+        "host_check_label": host_check.get("host_check_label") or (host.host_check_label if host else None),
+        "host_check_warning": host_check.get("host_check_warning") or (host.host_check_warning if host else None),
     }
 
 
@@ -462,9 +490,120 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
 
 
+def _trace_data_files(*, db_key: str | None) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    directories = [traces_root(db_key=db_key)]
+    if _allow_legacy_read_fallback(db_key=db_key):
+        directories.extend(_legacy_trace_dirs())
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("health_run_*.json"), key=lambda item: item.name, reverse=True):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(path)
+    return paths
+
+
+def _health_runs_summary_paths(*, db_key: str | None) -> list[Path]:
+    primary = health_run_trace_path(db_key=db_key)
+    paths = [primary]
+    seen = {primary.resolve()}
+    if not _allow_legacy_read_fallback(db_key=db_key):
+        return paths
+    for directory in _legacy_trace_dirs():
+        candidate = directory / "health_runs.jsonl"
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        paths.append(candidate)
+    return paths
+
+
+def _index_file_paths(filename: str, *, db_key: str | None) -> list[Path]:
+    primary = indexes_root(db_key=db_key) / filename
+    paths = [primary]
+    seen = {primary.resolve()}
+    if not _allow_legacy_read_fallback(db_key=db_key):
+        return paths
+    for directory in _legacy_index_dirs():
+        candidate = directory / filename
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        paths.append(candidate)
+    return paths
+
+
+def _legacy_trace_dirs() -> list[Path]:
+    load_project_dotenv()
+    roots = [
+        PACKAGE_ROOT / "runs" / "traces",
+        REPO_ROOT / "runs" / "traces",
+        REPO_ROOT / "runtime" / "traces",
+    ]
+    configured = (os.getenv("ODB_AUTODBA_TRACE_DIR") or os.getenv("TRACE_DIR") or "").strip()
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        roots.append(path)
+    return _unique_paths(roots)
+
+
+def _legacy_index_dirs() -> list[Path]:
+    load_project_dotenv()
+    roots = [
+        PACKAGE_ROOT / "runs" / "indexes",
+        REPO_ROOT / "runs" / "indexes",
+        REPO_ROOT / "runtime" / "indexes",
+    ]
+    configured_dir = (os.getenv("ODB_AUTODBA_HISTORY_INDEX_DIR") or os.getenv("PLANNER_HISTORY_INDEX_DIR") or "").strip()
+    if configured_dir:
+        path = Path(configured_dir)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        roots.append(path)
+    configured_file = (os.getenv("ODB_AUTODBA_HISTORY_INDEX_FILE") or os.getenv("PLANNER_HISTORY_INDEX_FILE") or "").strip()
+    if configured_file:
+        file_path = Path(configured_file)
+        if not file_path.is_absolute():
+            file_path = Path.cwd() / file_path
+        roots.append(file_path.parent)
+    return _unique_paths(roots)
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def _resolve_db_key(db_key: str | None) -> str:
+    return (db_key or "").strip() or get_default_oracle_target().db_key
+
+
+def _allow_legacy_read_fallback(*, db_key: str | None) -> bool:
+    resolved = _resolve_db_key(db_key)
+    default_key = get_default_oracle_target().db_key
+    return resolved == default_key
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, default=str), encoding="utf-8")
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2, default=str)
 
 
 def _read_json(path: Path) -> Any:

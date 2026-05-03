@@ -223,7 +223,14 @@ class TopSqlRow(BaseModel):
 class TablespaceUsageRow(BaseModel):
     tablespace_name: str
     used_pct: float
+    allocated_mb: float | None = None
     used_mb: float | None = None
+    free_allocated_mb: float | None = None
+    allocated_used_pct: float | None = None
+    max_mb: float | None = None
+    max_free_mb: float | None = None
+    max_used_pct: float | None = None
+    autoextensible: str | None = None
     free_mb: float | None = None
     total_mb: float | None = None
     contents: str | None = None
@@ -431,6 +438,11 @@ class MemoryHotspotSection(BaseModel):
 
 
 class HostSnapshot(BaseModel):
+    host_check_mode: str = "local_app_host"
+    host_check_scope: str = "local_app_host"
+    host_check_label: str = "Local AutoDBA app host"
+    host_check_warning: str | None = None
+    host_check_target: str | None = None
     cpu_pct: float | None = None
     memory_pct: float | None = None
     swap_pct: float | None = None
@@ -1253,7 +1265,7 @@ class OracleDatabaseBehaviorProfile(BaseModel):
     warning_run_count: int = 0
     critical_run_count: int = 0
     latest_recorded_at: str | None = None
-    metric_baselines: dict[str, dict[str, float | int | None]] = Field(default_factory=dict)
+    metric_baselines: dict[str, dict[str, Any]] = Field(default_factory=dict)
     recurring_issue_summary: list[str] = Field(default_factory=list)
     sql_behavior_summary: list[str] = Field(default_factory=list)
     host_behavior_summary: list[str] = Field(default_factory=list)
@@ -1297,6 +1309,7 @@ class InvestigationReport(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     recommended_next_actions: list[str] = Field(default_factory=list)
     steps: list[InvestigationStep] = Field(default_factory=list)
+    trace_path: str | None = None
 
 
 class PostActionValidationPlan(BaseModel):

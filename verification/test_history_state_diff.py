@@ -854,13 +854,17 @@ class HistorySourceTransparencyTests(unittest.TestCase):
             with (
                 patch("odb_autodba.history.jsonl_service.read_health_run_traces", return_value=traces),
                 patch("odb_autodba.history.jsonl_service.history_data_source_paths", return_value=paths),
+                patch(
+                    "odb_autodba.history.jsonl_service.get_index_status",
+                    return_value={"available": False, "fresh": False, "last_updated": None},
+                ),
                 patch.object(JsonlHistoryService, "_build_optional_awr_diff", return_value=(None, ["AWR disabled"], "awr_disabled")),
             ):
                 answer = JsonlHistoryService().answer_history_question_from_jsonl(user_query="show trends", database_name="FREE")
 
-        self.assertEqual(answer["history_source_used"], "raw JSONL only")
+        self.assertEqual(answer["history_source_used"], "raw JSONL fallback")
         self.assertEqual(answer["recurrence_computation_mode"], "raw_scan")
-        self.assertEqual(answer["history_index_status"], "missing")
+        self.assertEqual(answer["history_index_status"], "missing_or_stale")
         self.assertIn("raw health_runs.jsonl", " ".join(answer["history_index_notes"]))
 
     def test_history_answer_uses_indexed_recurrence_when_available_and_fresh(self) -> None:
@@ -888,13 +892,19 @@ class HistorySourceTransparencyTests(unittest.TestCase):
                 patch("odb_autodba.history.jsonl_service.read_health_run_traces", return_value=traces),
                 patch("odb_autodba.history.jsonl_service.history_data_source_paths", return_value=paths),
                 patch("odb_autodba.history.jsonl_service.read_recurring_issue_index", return_value=recurring),
+                patch(
+                    "odb_autodba.history.jsonl_service.get_index_status",
+                    return_value={"available": True, "fresh": True, "last_updated": "2026-04-22T02:30:00+00:00"},
+                ),
                 patch.object(JsonlHistoryService, "_build_optional_awr_diff", return_value=(None, ["AWR disabled"], "awr_disabled")),
             ):
                 answer = JsonlHistoryService().answer_history_question_from_jsonl(user_query="show trends", database_name="FREE")
 
         self.assertEqual(answer["recurrence_computation_mode"], "indexed")
-        self.assertEqual(answer["history_source_used"], "indexed recurrence + raw run metrics")
-        self.assertIn("recurring_issues", answer["index_usage_summary"])
+        self.assertEqual(answer["history_source_used"], "indexed recurrence + metrics")
+        self.assertEqual(answer["index_usage_summary"], "recurring + chunks")
+        self.assertEqual(answer["history_index_status"], "active")
+        self.assertEqual(answer["history_index_freshness"], "fresh")
         self.assertTrue(any("Blocking locks detected recurred in 2/2" in line for line in answer["context"].recurring_findings))
 
     def test_stale_index_detection_and_rebuild_flag(self) -> None:
@@ -923,12 +933,19 @@ class HistorySourceTransparencyTests(unittest.TestCase):
                 patch("odb_autodba.history.jsonl_service.history_data_source_paths", return_value=paths),
                 patch("odb_autodba.history.jsonl_service.read_recurring_issue_index", return_value=recurring),
                 patch("odb_autodba.history.jsonl_service.rebuild_planner_memory_artifacts", return_value={}),
+                patch(
+                    "odb_autodba.history.jsonl_service.get_index_status",
+                    side_effect=[
+                        {"available": True, "fresh": False, "last_updated": "2026-04-21T03:00:00+00:00"},
+                        {"available": True, "fresh": False, "last_updated": "2026-04-21T03:00:00+00:00"},
+                    ],
+                ),
                 patch.object(JsonlHistoryService, "_build_optional_awr_diff", return_value=(None, ["AWR disabled"], "awr_disabled")),
             ):
                 answer = JsonlHistoryService().answer_history_question_from_jsonl(user_query="show trends", database_name="FREE")
 
         self.assertEqual(answer["history_index_freshness"], "stale")
-        self.assertEqual(answer["history_index_status"], "stale")
+        self.assertEqual(answer["history_index_status"], "missing_or_stale")
         self.assertTrue(answer["history_index_rebuilt"])
         self.assertEqual(answer["recurrence_computation_mode"], "raw_scan")
 
