@@ -5,7 +5,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from odb_autodba.models.schemas import InvestigationReport, InvestigationSQLAttemptRecord, InvestigationStep
 from odb_autodba.rag.trace_store import traces_root
+from odb_autodba.utils.formatter import render_investigation_final_report
 
 
 def new_investigation_id(recorded_at: datetime | None = None) -> str:
@@ -79,85 +81,101 @@ def hydrate_investigation_report_from_trace(trace_path: str) -> str:
     events = _load_trace_events(trace_path)
     if not events:
         return "# AI Investigation Result\n\nNo investigation trace events were available for hydration."
+    report = _build_report_from_trace(events)
+    return render_investigation_final_report(report).strip() + "\n"
 
+
+def _build_report_from_trace(events: list[dict[str, Any]]) -> InvestigationReport:
     question = _extract_question(events)
-    steps = _extract_steps(events)
     done_payload = _extract_done_payload(events)
+    step_payloads = _extract_steps(events)
+    attempts_by_step = _extract_step_attempts(events)
+    steps: list[InvestigationStep] = []
+    sql_execution_count = int(done_payload.get("sql_execution_count") or 0)
+    for index, payload in enumerate(step_payloads, start=1):
+        step_number = int(payload.get("step_number") or payload.get("step_no") or index)
+        goal = str(payload.get("goal") or "").strip() or f"Investigation step {step_number}"
+        status = str(payload.get("status") or "").strip() or "unknown"
+        sql = str(payload.get("final_sql") or payload.get("sql") or "").strip()
+        row_values = payload.get("result_rows")
+        if not isinstance(row_values, list):
+            row_values = payload.get("rows")
+        result_rows = [dict(item) for item in row_values if isinstance(item, dict)] if isinstance(row_values, list) else []
+        col_values = payload.get("result_columns")
+        if not isinstance(col_values, list):
+            col_values = payload.get("columns")
+        result_columns = [str(item) for item in col_values if str(item).strip()] if isinstance(col_values, list) else []
+        correction_source = payload.get("correction_attempts")
+        if isinstance(correction_source, list) and correction_source:
+            correction_attempts = correction_source
+        else:
+            correction_attempts = attempts_by_step.get(step_number, [])
+        attempt_models: list[InvestigationSQLAttemptRecord] = []
+        for item in correction_attempts:
+            if isinstance(item, dict):
+                try:
+                    attempt_models.append(InvestigationSQLAttemptRecord.model_validate(item))
+                except Exception:
+                    continue
+        if sql_execution_count <= 0:
+            sql_execution_count += sum(
+                1
+                for entry in attempt_models
+                if str(entry.execution_status or entry.status or "").strip().lower() in {"success", "error"}
+            )
+        row_count = int(payload.get("row_count") or len(result_rows))
+        result_truncated = bool(payload.get("result_truncated") or (row_count > len(result_rows)))
+        steps.append(
+            InvestigationStep(
+                step_number=step_number,
+                goal=goal,
+                sql=sql,
+                result_preview=str(payload.get("result_preview") or "").strip() or ("Returned 0 row(s)." if row_count == 0 else ""),
+                row_count=row_count,
+                status=status,
+                result_columns=result_columns,
+                result_rows=result_rows,
+                result_truncated=result_truncated,
+                correction_attempts=attempt_models,
+                final_attempt_count=int(payload.get("final_attempt_count") or len(attempt_models) or 1),
+                finding=str(payload.get("finding") or "").strip(),
+                evidence_source=str(payload.get("evidence_source") or done_payload.get("evidence_source") or "SQL"),
+                historical_context_used=bool(payload.get("historical_context_used") or done_payload.get("historical_context_used")),
+                investigation_mode=str(payload.get("investigation_mode") or done_payload.get("investigation_mode") or "read_only_lookup"),
+                confidence=str(payload.get("confidence") or done_payload.get("confidence") or "MEDIUM"),
+                inference_confidence=str(payload.get("inference_confidence") or done_payload.get("inference_confidence") or done_payload.get("confidence") or "MEDIUM"),
+                termination_reason=str(payload.get("termination_reason") or done_payload.get("termination_reason") or ""),
+            )
+        )
 
-    sql_sections: list[str] = []
-    result_sections: list[str] = []
-    observations: list[str] = []
-    for step in steps:
-        step_number = step.get("step_number")
-        goal = str(step.get("goal") or "").strip()
-        label = f"Step {step_number}" if step_number is not None else "Step"
-        if goal:
-            label = f"{label} - {goal}"
-        sql_text = str(step.get("sql") or "").strip()
-        if sql_text:
-            sql_sections.extend([f"### {label}", "```sql", sql_text, "```", ""])
+    if sql_execution_count <= 0:
+        sql_execution_count = sum(1 for step in steps if str(step.status or "").lower() in {"success", "error"})
+    summary = str(done_payload.get("summary") or "").strip()
+    if not summary:
+        summary = (
+            f"Ran {len(steps)} logical investigation step(s) with {sql_execution_count} SQL execution(s)."
+            if steps
+            else "No SQL steps were executed."
+        )
 
-        rows = step.get("result_rows")
-        row_count = int(step.get("row_count") or 0)
-        preview = str(step.get("result_preview") or "").strip()
-        status = str(step.get("status") or "").strip() or "unknown"
-        result_sections.append(f"### {label}")
-        result_sections.append(f"Status: `{status}`")
-        if preview:
-            result_sections.append(preview)
-        if isinstance(rows, list) and rows:
-            rendered_rows = _render_result_rows(rows)
-            if rendered_rows:
-                result_sections.extend(["```json", rendered_rows, "```"])
-        elif row_count == 0:
-            result_sections.append("No rows returned.")
-        result_sections.append("")
-
-        if preview:
-            observations.append(f"{label}: {preview}")
-        if isinstance(rows, list) and rows:
-            observations.append(f"{label}: captured {len(rows)} preview row(s).")
-
-    likely_cause = _extract_likely_cause(events, done_payload)
-    actions = _extract_actions(events, done_payload)
-    confidence_line = _extract_confidence(done_payload, steps)
-    conclusion_heading = _investigation_heading_for_question(question)
-
-    lines: list[str] = ["# AI Investigation Result", "", "## Question", question or "Not provided.", ""]
-    lines.append("## SQL Executed")
-    if sql_sections:
-        lines.extend(sql_sections)
-    else:
-        lines.append("No SQL statements were captured in the trace.")
-    lines.append("")
-
-    lines.append("## Result")
-    if result_sections:
-        lines.extend(result_sections)
-    else:
-        lines.append("No step results were captured in the trace.")
-    lines.append("")
-
-    lines.append("## Observation")
-    if observations:
-        lines.extend([f"- {item}" for item in _dedupe_lines(observations)])
-    else:
-        lines.append("- No observations captured.")
-    lines.append("")
-
-    lines.append(conclusion_heading)
-    lines.append(likely_cause or "No likely cause/conclusion was captured.")
-    lines.append("")
-
-    if actions:
-        lines.append("## Actions")
-        lines.extend([f"- {item}" for item in actions])
-        lines.append("")
-
-    lines.append("## Confidence / Termination")
-    lines.append(confidence_line)
-    lines.append("")
-    return "\n".join(lines).strip() + "\n"
+    return InvestigationReport(
+        problem_statement=question or "Not provided.",
+        summary=summary,
+        likely_cause=_extract_likely_cause(events, done_payload),
+        recommended_next_actions=_extract_actions(events, done_payload),
+        steps=steps,
+        evidence=[],
+        evidence_source=str(done_payload.get("evidence_source") or "SQL"),
+        historical_context_used=bool(done_payload.get("historical_context_used") or False),
+        investigation_mode=str(done_payload.get("investigation_mode") or "read_only_lookup"),
+        confidence=str(done_payload.get("confidence") or "MEDIUM"),
+        inference_confidence=str(done_payload.get("inference_confidence") or done_payload.get("confidence") or "MEDIUM"),
+        termination_reason=str(done_payload.get("termination_reason") or ("completed" if steps else "no_events")),
+        clarification_question=str(done_payload.get("clarification_question") or "").strip(),
+        required_evidence_status=done_payload.get("required_evidence_status") if isinstance(done_payload.get("required_evidence_status"), dict) else {},
+        sql_execution_count=sql_execution_count,
+        sql_execution_cap=int(done_payload.get("sql_execution_cap") or 0),
+    )
 
 
 def _load_trace_events(trace_path: str) -> list[dict[str, Any]]:
@@ -234,7 +252,7 @@ def _coerce_json_payload(payload: Any) -> list[dict[str, Any]]:
 def _extract_question(events: list[dict[str, Any]]) -> str:
     for event in events:
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        for key in ("question", "problem_statement"):
+        for key in ("problem_statement", "question", "prompt", "user_question"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -253,11 +271,27 @@ def _extract_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return steps
 
 
+def _extract_step_attempts(events: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    attempts_by_step: dict[int, list[dict[str, Any]]] = {}
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        if event_type != "investigation.sql_attempt":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        step_no = int(payload.get("step_number") or payload.get("step_no") or 0)
+        if step_no <= 0:
+            continue
+        attempts_by_step.setdefault(step_no, []).append(dict(payload))
+    for step_no in attempts_by_step:
+        attempts_by_step[step_no].sort(key=lambda item: int(item.get("attempt_no") or item.get("attempt") or 0))
+    return attempts_by_step
+
+
 def _extract_done_payload(events: list[dict[str, Any]]) -> dict[str, Any]:
     for event in reversed(events):
         event_type = str(event.get("event_type") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        if event_type == "investigation.done":
+        if event_type in {"investigation.done", "investigation.conclusion"}:
             return dict(payload)
     return {}
 
@@ -290,30 +324,6 @@ def _extract_actions(events: list[dict[str, Any]], done_payload: dict[str, Any])
     return _dedupe_lines(actions)
 
 
-def _extract_confidence(done_payload: dict[str, Any], steps: list[dict[str, Any]]) -> str:
-    confidence = str(done_payload.get("confidence") or "").strip()
-    termination = str(done_payload.get("termination_reason") or "").strip()
-    if confidence and termination:
-        return f"Confidence: {confidence}. Termination: {termination}."
-    if confidence:
-        return f"Confidence: {confidence}."
-    if termination:
-        return f"Termination: {termination}."
-    step_count = len(steps)
-    return f"Completed with {step_count} investigative step(s)."
-
-
-def _render_result_rows(rows: list[Any]) -> str:
-    preview = rows[:10]
-    normalized: list[Any] = []
-    for row in preview:
-        if isinstance(row, dict):
-            normalized.append(row)
-        else:
-            normalized.append({"value": str(row)})
-    return json.dumps(normalized, ensure_ascii=True, indent=2, default=str)
-
-
 def _dedupe_lines(lines: list[str]) -> list[str]:
     seen: set[str] = set()
     output: list[str] = []
@@ -324,24 +334,3 @@ def _dedupe_lines(lines: list[str]) -> list[str]:
         seen.add(normalized)
         output.append(str(line).strip())
     return output
-
-
-def _investigation_heading_for_question(question: str) -> str:
-    text = (question or "").strip().lower()
-    diagnostic_tokens = (
-        "why",
-        "caused",
-        "cause",
-        "slow",
-        "blocking",
-        "lock contention",
-        "cpu high",
-        "memory high",
-        "ora-",
-        "error",
-        "failed",
-        "failure",
-    )
-    if any(token in text for token in diagnostic_tokens):
-        return "## 🔴 Root Cause Analysis"
-    return "## 🔵 Investigation Conclusion"

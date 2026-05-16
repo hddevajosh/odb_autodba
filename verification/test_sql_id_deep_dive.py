@@ -6,6 +6,7 @@ from unittest.mock import patch
 from odb_autodba.db.plan_checks import collect_formatted_execution_plan
 from odb_autodba.db.query_deep_dive import (
     _dba_recommendation,
+    _recommended_plan_decision,
     classify_sql,
     collect_sql_wait_profile,
 )
@@ -114,7 +115,7 @@ class SqlIdDeepDiveTests(unittest.TestCase):
                     }
                 ],
             )
-        self.assertEqual(section.source_used, "v$sql_plan (fallback)")
+        self.assertEqual(section.source_used, "gv$sql_plan (fallback)")
         self.assertTrue(any("BIG_TABLE" in line for line in section.lines))
         self.assertIn("Full scans", section.interpretation)
 
@@ -181,6 +182,7 @@ class SqlIdDeepDiveTests(unittest.TestCase):
             "## Execution Plan",
             "## Plan Interpretation",
             "## Plan Stability Analysis",
+            "## Recommended Plan Decision",
             "## Historical Recurrence",
             "## Risk Verdict",
             "## DBA Recommendation",
@@ -189,6 +191,120 @@ class SqlIdDeepDiveTests(unittest.TestCase):
         positions = [rendered.find(section) for section in expected_order]
         self.assertTrue(all(index >= 0 for index in positions))
         self.assertEqual(positions, sorted(positions))
+
+    def test_recommended_plan_decision_no_awr_rows(self) -> None:
+        decision = _recommended_plan_decision(
+            sql_id="abc123xyz9",
+            current_plan_hash=123,
+            dominant_plan_hash=123,
+            plan_advisor={"final_recommendation": [], "plan_comparison": [], "rac_instance_summary": []},
+        )
+        self.assertIn("No plan recommendation possible", decision.get("decision") or "")
+
+    def test_recommended_plan_decision_single_plan(self) -> None:
+        decision = _recommended_plan_decision(
+            sql_id="abc123xyz9",
+            current_plan_hash=123,
+            dominant_plan_hash=123,
+            plan_advisor={
+                "final_recommendation": [{"recommended_plan": 123, "baseline_plan": 123, "confidence_level": "HIGH_CONFIDENCE"}],
+                "plan_comparison": [{"plan_hash_value": 123, "avg_elapsed_s": 1.0, "avg_cpu_s": 0.5, "avg_lio": 10, "avg_pio": 2, "execs": 50, "snap_count": 10}],
+                "rac_instance_summary": [],
+            },
+        )
+        self.assertIn("Only one plan observed", decision.get("decision") or "")
+
+    def test_recommended_plan_decision_negative_elapsed_penalty_uses_faster_wording(self) -> None:
+        decision = _recommended_plan_decision(
+            sql_id="abc123xyz9",
+            current_plan_hash=200,
+            dominant_plan_hash=200,
+            plan_advisor={
+                "final_recommendation": [
+                    {
+                        "recommended_plan": 100,
+                        "baseline_plan": 200,
+                        "confidence_level": "HIGH_CONFIDENCE",
+                        "elapsed_penalty_pct": -12.5,
+                        "execs": 40,
+                        "snap_count": 8,
+                    }
+                ],
+                "plan_comparison": [
+                    {"plan_hash_value": 100, "avg_elapsed_s": 1.0, "avg_cpu_s": 0.4, "avg_lio": 100.0, "avg_pio": 10.0, "execs": 40, "snap_count": 8, "elapsed_penalty_pct": -12.5},
+                    {"plan_hash_value": 200, "avg_elapsed_s": 1.2, "avg_cpu_s": 0.6, "avg_lio": 120.0, "avg_pio": 12.0, "execs": 60, "snap_count": 10},
+                ],
+                "rac_instance_summary": [],
+            },
+        )
+        why_text = " ".join(str(x) for x in (decision.get("why") or []))
+        self.assertIn("faster", why_text.lower())
+        self.assertNotIn("12.50% slower", why_text)
+
+    def test_recommended_plan_decision_low_confidence_validate_before_forcing(self) -> None:
+        decision = _recommended_plan_decision(
+            sql_id="abc123xyz9",
+            current_plan_hash=200,
+            dominant_plan_hash=200,
+            plan_advisor={
+                "final_recommendation": [
+                    {
+                        "recommended_plan": 100,
+                        "baseline_plan": 200,
+                        "confidence_level": "LOW_CONFIDENCE",
+                        "execs": 3,
+                        "snap_count": 1,
+                    }
+                ],
+                "plan_comparison": [
+                    {"plan_hash_value": 100, "avg_elapsed_s": 1.0, "avg_cpu_s": 0.4, "avg_lio": 100.0, "avg_pio": 10.0, "execs": 3, "snap_count": 1, "elapsed_penalty_pct": -5.0},
+                    {"plan_hash_value": 200, "avg_elapsed_s": 1.1, "avg_cpu_s": 0.5, "avg_lio": 110.0, "avg_pio": 11.0, "execs": 55, "snap_count": 10},
+                ],
+                "rac_instance_summary": [],
+            },
+        )
+        self.assertEqual(decision.get("confidence"), "LOW_CONFIDENCE")
+        self.assertIn("validate", str(decision.get("dba_recommendation") or "").lower())
+        self.assertIn("before forcing", str(decision.get("dba_recommendation") or "").lower())
+
+    def test_formatter_does_not_dump_detailed_plan_advisor_rows(self) -> None:
+        deep_dive = SqlIdDeepDive(
+            sql_id="abc123xyz9",
+            sql_text="select * from dual",
+            current_stats={"executions": 10, "elapsed_s": 1.2},
+            active_queries=[],
+            wait_profile=SqlWaitProfile(available=False, source_used=None, interpretation="No wait evidence."),
+            classification=SqlClassification(classification="application_sql", confidence="HIGH", explanation="app sql"),
+            impact_summary=SqlImpactSummary(executions=10, impact_summary="Visible SQL with currently low-to-moderate impact."),
+            child_cursors=[],
+            execution_plan={"available": False, "lines": [], "interpretation": "No plan evidence."},
+            plan_analysis={
+                "stability": "stable",
+                "summary": "1 plan",
+                "recommended_plan_decision": {
+                    "sql_id": "abc123xyz9",
+                    "recommended_plan": 100,
+                    "current_live_plan": 200,
+                    "dominant_historical_plan": 200,
+                    "baseline_fastest_eligible_plan": 200,
+                    "decision": "Candidate better plan is 100, but confidence is LOW.",
+                    "confidence": "LOW_CONFIDENCE",
+                    "why": ["Sample count is limited."],
+                    "dba_recommendation": "Validate before forcing.",
+                },
+            },
+            plan_advisor={
+                "final_recommendation": [{"recommended_plan": 100}],
+                "plan_comparison": [{"plan_hash_value": 100, "plan_shape": "SENTINEL_PLAN_SHAPE_LONG"}],
+                "rac_instance_summary": [],
+            },
+            history_analysis={"runs_scanned": 0, "matched_runs": []},
+            risk_summary={"status": "OK", "reason_lines": ["No strong risk signal."]},
+            dba_recommendation={"severity": "INFO", "recommendation": "No tuning required", "rationale": ["Low impact."]},
+            notes=["collector note"],
+        )
+        rendered = render_sql_id_deep_dive_report(deep_dive)
+        self.assertNotIn("SENTINEL_PLAN_SHAPE_LONG", rendered)
 
 
 if __name__ == "__main__":

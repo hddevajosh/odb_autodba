@@ -1,0 +1,859 @@
+{
+  "repository_name": "odb_autodba",
+  "timestamp": "2026-05-06T01:51:32.679380+00:00",
+  "overall_score": 0.9728260869565217,
+  "check_summaries": [
+    {
+      "check_name": "function_size",
+      "description": "Checks that functions/methods do not exceed line count thresholds",
+      "check_type": "standard",
+      "total_entities_checked": 1005,
+      "findings_count": 11,
+      "warning_count": 11,
+      "score": 0.9890547263681592,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 150,
+          "description": "Functions exceeding 150.0 lines",
+          "entities": [
+            {
+              "entity_name": "utils.formatter.render_history_answer",
+              "file_path": "utils/formatter.py",
+              "line_start": 509,
+              "line_end": 931,
+              "metric_value": 422
+            },
+            {
+              "entity_name": "history.jsonl_service.JsonlHistoryService._build_state_transition",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 1041,
+              "line_end": 1248,
+              "metric_value": 207
+            },
+            {
+              "entity_name": "guardrails.policy_engine._validate_action_specific",
+              "file_path": "guardrails/policy_engine.py",
+              "line_start": 128,
+              "line_end": 306,
+              "metric_value": 178
+            },
+            {
+              "entity_name": "agents.planner_agent.PlannerAgent.handle_message",
+              "file_path": "agents/planner_agent.py",
+              "line_start": 33,
+              "line_end": 207,
+              "metric_value": 174
+            },
+            {
+              "entity_name": "agents.correlation_engine.correlate_root_cause_from_traces",
+              "file_path": "agents/correlation_engine.py",
+              "line_start": 104,
+              "line_end": 277,
+              "metric_value": 173
+            },
+            {
+              "entity_name": "db.awr_checks.map_run_to_snapshot_window",
+              "file_path": "db/awr_checks.py",
+              "line_start": 112,
+              "line_end": 283,
+              "metric_value": 171
+            },
+            {
+              "entity_name": "tools.action_proposals._blocking_lock_proposal",
+              "file_path": "tools/action_proposals.py",
+              "line_start": 41,
+              "line_end": 212,
+              "metric_value": 171
+            },
+            {
+              "entity_name": "agents.correlation_engine._score_candidates",
+              "file_path": "agents/correlation_engine.py",
+              "line_start": 634,
+              "line_end": 802,
+              "metric_value": 168
+            },
+            {
+              "entity_name": "history.jsonl_service.JsonlHistoryService._rank_transition_drivers",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 1454,
+              "line_end": 1618,
+              "metric_value": 164
+            },
+            {
+              "entity_name": "db.awr_checks.build_awr_state_diff",
+              "file_path": "db/awr_checks.py",
+              "line_start": 497,
+              "line_end": 657,
+              "metric_value": 160
+            },
+            {
+              "entity_name": "history.jsonl_service.JsonlHistoryService._build_residual_warning_drivers",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 1754,
+              "line_end": 1906,
+              "metric_value": 152
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "check_name": "fan_out",
+      "description": "Checks efferent coupling: how many other functions each function calls",
+      "check_type": "standard",
+      "total_entities_checked": 1005,
+      "findings_count": 16,
+      "warning_count": 16,
+      "score": 0.9840796019900497,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 10,
+          "description": "Functions calling more than 10.0 other functions",
+          "entities": [
+            {
+              "entity_name": "db.extended_health_checks.collect_extended_health",
+              "file_path": "db/extended_health_checks.py",
+              "line_start": 33,
+              "line_end": 144,
+              "metric_value": 35
+            },
+            {
+              "entity_name": "history.jsonl_service.JsonlHistoryService._build_state_transition",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 1041,
+              "line_end": 1248,
+              "metric_value": 23
+            },
+            {
+              "entity_name": "agents.root_cause_engine.infer_root_cause",
+              "file_path": "agents/root_cause_engine.py",
+              "line_start": 143,
+              "line_end": 245,
+              "metric_value": 19
+            },
+            {
+              "entity_name": "utils.formatter.render_history_answer",
+              "file_path": "utils/formatter.py",
+              "line_start": 509,
+              "line_end": 931,
+              "metric_value": 19
+            },
+            {
+              "entity_name": "agents.correlation_engine.correlate_root_cause_from_traces",
+              "file_path": "agents/correlation_engine.py",
+              "line_start": 104,
+              "line_end": 277,
+              "metric_value": 18
+            },
+            {
+              "entity_name": "db.awr_checks.build_awr_state_diff",
+              "file_path": "db/awr_checks.py",
+              "line_start": 497,
+              "line_end": 657,
+              "metric_value": 17
+            },
+            {
+              "entity_name": "utils.formatter.render_health_snapshot_report",
+              "file_path": "utils/formatter.py",
+              "line_start": 449,
+              "line_end": 506,
+              "metric_value": 15
+            },
+            {
+              "entity_name": "db.query_deep_dive.build_sql_id_deep_dive_report",
+              "file_path": "db/query_deep_dive.py",
+              "line_start": 67,
+              "line_end": 150,
+              "metric_value": 14
+            },
+            {
+              "entity_name": "host.health_checks.collect_host_snapshot",
+              "file_path": "host/health_checks.py",
+              "line_start": 114,
+              "line_end": 182,
+              "metric_value": 14
+            },
+            {
+              "entity_name": "rag.trace_store.append_health_run_trace",
+              "file_path": "rag/trace_store.py",
+              "line_start": 87,
+              "line_end": 161,
+              "metric_value": 14
+            },
+            {
+              "entity_name": "db.health_checks.collect_health_snapshot",
+              "file_path": "db/health_checks.py",
+              "line_start": 278,
+              "line_end": 360,
+              "metric_value": 11
+            },
+            {
+              "entity_name": "frontend.gradio_app.build_app",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 995,
+              "line_end": 1121,
+              "metric_value": 11
+            },
+            {
+              "entity_name": "db.awr_checks._build_sql_change_intel",
+              "file_path": "db/awr_checks.py",
+              "line_start": 1033,
+              "line_end": 1092,
+              "metric_value": 10
+            },
+            {
+              "entity_name": "db.awr_checks._build_awr_load_profile_summary",
+              "file_path": "db/awr_checks.py",
+              "line_start": 1869,
+              "line_end": 1911,
+              "metric_value": 10
+            },
+            {
+              "entity_name": "mcp.jobs.create_job",
+              "file_path": "mcp/jobs.py",
+              "line_start": 54,
+              "line_end": 98,
+              "metric_value": 10
+            },
+            {
+              "entity_name": "rag.investigation_trace_store.hydrate_investigation_report_from_trace",
+              "file_path": "rag/investigation_trace_store.py",
+              "line_start": 78,
+              "line_end": 160,
+              "metric_value": 10
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "check_name": "fan_in",
+      "description": "Checks afferent coupling: how many other functions call each function",
+      "check_type": "standard",
+      "total_entities_checked": 1005,
+      "findings_count": 8,
+      "warning_count": 8,
+      "score": 0.9920398009950249,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 10,
+          "description": "Functions called by more than 10.0 other functions",
+          "entities": [
+            {
+              "entity_name": "mcp.server._error_payload",
+              "file_path": "mcp/server.py",
+              "line_start": 664,
+              "line_end": 670,
+              "metric_value": 21
+            },
+            {
+              "entity_name": "mcp.server._log_request",
+              "file_path": "mcp/server.py",
+              "line_start": 689,
+              "line_end": 697,
+              "metric_value": 21
+            },
+            {
+              "entity_name": "db.extended_health_checks._float",
+              "file_path": "db/extended_health_checks.py",
+              "line_start": 929,
+              "line_end": 935,
+              "metric_value": 18
+            },
+            {
+              "entity_name": "db.awr_checks._safe_float",
+              "file_path": "db/awr_checks.py",
+              "line_start": 1830,
+              "line_end": 1836,
+              "metric_value": 16
+            },
+            {
+              "entity_name": "utils.formatter._format_value",
+              "file_path": "utils/formatter.py",
+              "line_start": 1997,
+              "line_end": 2013,
+              "metric_value": 14
+            },
+            {
+              "entity_name": "history.jsonl_service._to_float",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 2556,
+              "line_end": 2562,
+              "metric_value": 12
+            },
+            {
+              "entity_name": "db.extended_health_checks._fetch_all",
+              "file_path": "db/extended_health_checks.py",
+              "line_start": 147,
+              "line_end": 151,
+              "metric_value": 11
+            },
+            {
+              "entity_name": "rag.trace_store.indexes_root",
+              "file_path": "rag/trace_store.py",
+              "line_start": 42,
+              "line_end": 43,
+              "metric_value": 10
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "check_name": "god_class",
+      "description": "Detects classes with too many methods, too much code, or too many outgoing dependencies",
+      "check_type": "standard",
+      "total_entities_checked": 7,
+      "findings_count": 2,
+      "warning_count": 2,
+      "score": 0.7142857142857143,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 25,
+          "description": "Classes exceeding god class criteria (methods, LOC, or fan-out)",
+          "entities": [
+            {
+              "entity_name": "history.jsonl_service.JsonlHistoryService",
+              "file_path": "history/jsonl_service.py",
+              "metric_value": 2211.0
+            },
+            {
+              "entity_name": "agents.planner_agent.PlannerAgent",
+              "file_path": "agents/planner_agent.py",
+              "metric_value": 437.0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "check_name": "circular_dependencies",
+      "description": "Detects circular dependencies between packages",
+      "check_type": "circular_dependencies",
+      "cycles": [],
+      "packages_checked": 20,
+      "packages_in_cycles": 0
+    },
+    {
+      "check_name": "package_instability",
+      "description": "Computes Martin's instability metric (I = Ce / (Ca + Ce)) per package",
+      "check_type": "standard",
+      "total_entities_checked": 0,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "component_cohesion",
+      "description": "Measures internal vs external edge ratio per component/cluster",
+      "check_type": "standard",
+      "total_entities_checked": 58,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "unused_code_diagnostics",
+      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
+      "check_type": "standard",
+      "total_entities_checked": 48,
+      "findings_count": 48,
+      "warning_count": 20,
+      "score": 0.0,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 0,
+          "description": "Unused import statements that should be removed",
+          "entities": [
+            {
+              "entity_name": "[unused_import] Import \"re\" is not accessed",
+              "file_path": "agents/correlation_engine.py",
+              "line_start": 5,
+              "line_end": 5,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"Any\" is not accessed",
+              "file_path": "agents/openai_assistant.py",
+              "line_start": 4,
+              "line_end": 4,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"RemediationExecution\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 15,
+              "line_end": 15,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"Path\" is not accessed",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 8,
+              "line_end": 8,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"json\" is not accessed",
+              "file_path": "mcp/server.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"datetime\" is not accessed",
+              "file_path": "models/schemas.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_import] Import \"json\" is not accessed",
+              "file_path": "tools/action_history.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            }
+          ]
+        },
+        {
+          "severity": "info",
+          "threshold": 0,
+          "description": "Variables declared but never used",
+          "entities": [
+            {
+              "entity_name": "[unused_variable] \"re\" is not accessed",
+              "file_path": "agents/correlation_engine.py",
+              "line_start": 5,
+              "line_end": 5,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"Any\" is not accessed",
+              "file_path": "agents/openai_assistant.py",
+              "line_start": 4,
+              "line_end": 4,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"summary\" is not accessed",
+              "file_path": "agents/root_cause_engine.py",
+              "line_start": 146,
+              "line_end": 146,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"report_text\" is not accessed",
+              "file_path": "agents/root_cause_engine.py",
+              "line_start": 409,
+              "line_end": 409,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_extract_awr_lines\" is not accessed",
+              "file_path": "db/awr_checks.py",
+              "line_start": 1938,
+              "line_end": 1938,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_snake_label\" is not accessed",
+              "file_path": "db/query_deep_dive.py",
+              "line_start": 1245,
+              "line_end": 1245,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"RemediationExecution\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 15,
+              "line_end": 15,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_submit_message\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 379,
+              "line_end": 379,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_latest_report_message\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 703,
+              "line_end": 703,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"target_label\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 491,
+              "line_end": 491,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"mode_info\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 1025,
+              "line_end": 1025,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"Path\" is not accessed",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 8,
+              "line_end": 8,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"recurring\" is not accessed",
+              "file_path": "history/jsonl_service.py",
+              "line_start": 1046,
+              "line_end": 1046,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_split_ssh_sections\" is not accessed",
+              "file_path": "host/health_checks.py",
+              "line_start": 793,
+              "line_end": 793,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"json\" is not accessed",
+              "file_path": "mcp/server.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_startup_cleanup_jobs\" is not accessed",
+              "file_path": "mcp/server.py",
+              "line_start": 81,
+              "line_end": 81,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"datetime\" is not accessed",
+              "file_path": "models/schemas.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"metric_name\" is not accessed",
+              "file_path": "rag/indexer.py",
+              "line_start": 402,
+              "line_end": 402,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"json\" is not accessed",
+              "file_path": "tools/action_history.py",
+              "line_start": 3,
+              "line_end": 3,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_render_markdown_kv_table\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 262,
+              "line_end": 262,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_format_bool\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1215,
+              "line_end": 1215,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_render_likely_causes\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1395,
+              "line_end": 1395,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_render_section_bullets\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1843,
+              "line_end": 1843,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_table_cell\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1993,
+              "line_end": 1993,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_header\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 2020,
+              "line_end": 2020,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"_render_remediation_evidence_lines\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 2207,
+              "line_end": 2207,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] \"section_name\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1448,
+              "line_end": 1448,
+              "metric_value": 0.0
+            }
+          ]
+        },
+        {
+          "severity": "warning",
+          "threshold": 0,
+          "description": "Functions/methods defined but never called",
+          "entities": [
+            {
+              "entity_name": "[unused_function] Function \"_extract_awr_lines\" is not accessed",
+              "file_path": "db/awr_checks.py",
+              "line_start": 1938,
+              "line_end": 1938,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_snake_label\" is not accessed",
+              "file_path": "db/query_deep_dive.py",
+              "line_start": 1245,
+              "line_end": 1245,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_submit_message\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 379,
+              "line_end": 379,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_latest_report_message\" is not accessed",
+              "file_path": "frontend/gradio_app.py",
+              "line_start": 703,
+              "line_end": 703,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_split_ssh_sections\" is not accessed",
+              "file_path": "host/health_checks.py",
+              "line_start": 793,
+              "line_end": 793,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_startup_cleanup_jobs\" is not accessed",
+              "file_path": "mcp/server.py",
+              "line_start": 81,
+              "line_end": 81,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_render_markdown_kv_table\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 262,
+              "line_end": 262,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_format_bool\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1215,
+              "line_end": 1215,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_render_likely_causes\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1395,
+              "line_end": 1395,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_render_section_bullets\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1843,
+              "line_end": 1843,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_table_cell\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 1993,
+              "line_end": 1993,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_header\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 2020,
+              "line_end": 2020,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_function] Function \"_render_remediation_evidence_lines\" is not accessed",
+              "file_path": "utils/formatter.py",
+              "line_start": 2207,
+              "line_end": 2207,
+              "metric_value": 0.0
+            }
+          ]
+        },
+        {
+          "severity": "info",
+          "threshold": 0,
+          "description": "Code that cannot be reached during execution",
+          "entities": [
+            {
+              "entity_name": "[unreachable_code] Type analysis indicates code is unreachable",
+              "file_path": "rag/indexer.py",
+              "line_start": 408,
+              "line_end": 408,
+              "metric_value": 0.0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "file_summaries": [
+    {
+      "file_path": "utils/formatter.py",
+      "total_findings": 19,
+      "warning_findings": 11,
+      "composite_risk_score": 100.0
+    },
+    {
+      "file_path": "history/jsonl_service.py",
+      "total_findings": 9,
+      "warning_findings": 7,
+      "composite_risk_score": 85.0
+    },
+    {
+      "file_path": "db/awr_checks.py",
+      "total_findings": 8,
+      "warning_findings": 7,
+      "composite_risk_score": 85.0
+    },
+    {
+      "file_path": "agents/correlation_engine.py",
+      "total_findings": 5,
+      "warning_findings": 4,
+      "composite_risk_score": 70.0
+    },
+    {
+      "file_path": "frontend/gradio_app.py",
+      "total_findings": 9,
+      "warning_findings": 4,
+      "composite_risk_score": 70.0
+    },
+    {
+      "file_path": "mcp/server.py",
+      "total_findings": 6,
+      "warning_findings": 4,
+      "composite_risk_score": 70.0
+    },
+    {
+      "file_path": "db/extended_health_checks.py",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "db/query_deep_dive.py",
+      "total_findings": 3,
+      "warning_findings": 2,
+      "composite_risk_score": 40.0
+    },
+    {
+      "file_path": "host/health_checks.py",
+      "total_findings": 3,
+      "warning_findings": 2,
+      "composite_risk_score": 40.0
+    },
+    {
+      "file_path": "agents/root_cause_engine.py",
+      "total_findings": 3,
+      "warning_findings": 1,
+      "composite_risk_score": 35.0
+    },
+    {
+      "file_path": "agents/planner_agent.py",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "rag/trace_store.py",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "agents/openai_assistant.py",
+      "total_findings": 2,
+      "warning_findings": 1,
+      "composite_risk_score": 25.0
+    },
+    {
+      "file_path": "models/schemas.py",
+      "total_findings": 2,
+      "warning_findings": 1,
+      "composite_risk_score": 25.0
+    },
+    {
+      "file_path": "tools/action_history.py",
+      "total_findings": 2,
+      "warning_findings": 1,
+      "composite_risk_score": 25.0
+    },
+    {
+      "file_path": "rag/indexer.py",
+      "total_findings": 2,
+      "warning_findings": 0,
+      "composite_risk_score": 20.0
+    },
+    {
+      "file_path": "guardrails/policy_engine.py",
+      "total_findings": 1,
+      "warning_findings": 1,
+      "composite_risk_score": 15.0
+    },
+    {
+      "file_path": "tools/action_proposals.py",
+      "total_findings": 1,
+      "warning_findings": 1,
+      "composite_risk_score": 15.0
+    },
+    {
+      "file_path": "db/health_checks.py",
+      "total_findings": 1,
+      "warning_findings": 1,
+      "composite_risk_score": 15.0
+    },
+    {
+      "file_path": "mcp/jobs.py",
+      "total_findings": 1,
+      "warning_findings": 1,
+      "composite_risk_score": 15.0
+    }
+  ]
+}

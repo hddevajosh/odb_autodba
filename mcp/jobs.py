@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import uuid
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -49,6 +50,10 @@ ALLOWED_JOB_TYPES = {
     "awr_analysis",
 }
 FINAL_JOB_STATUSES = {"completed", "failed"}
+
+
+class ReportExportError(RuntimeError):
+    pass
 
 
 def create_job(job_type: str, db_key: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -119,7 +124,13 @@ def cleanup_old_jobs(*, retention_hours: float | None = None) -> int:
             try:
                 path.unlink(missing_ok=True)
                 removed += 1
-            except Exception:
+            except Exception as exc:
+                LOGGER.warning(
+                    "job_cleanup_unlink_failed path=%s error_type=%s error=%s",
+                    path,
+                    type(exc).__name__,
+                    _sanitize_error_message(str(exc)),
+                )
                 continue
     if removed:
         LOGGER.info("job_cleanup removed=%s retention_hours=%s", removed, retention_hours or _job_retention_hours())
@@ -235,10 +246,26 @@ def _dispatch_job(job: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("question is required for history_metric_question job")
         return answer_history_metric_question(question, db_key=db_key)
     if job_type == "investigation":
-        question = str(payload.get("question") or "").strip()
-        if not question:
-            raise ValueError("question is required for investigation job")
-        return run_ai_investigation(question, db_key=db_key)
+        problem_statement = _coerce_problem_statement_from_payload(payload)
+        if not problem_statement:
+            raise ValueError("problem_statement is required for investigation job")
+        if str(payload.get("thread_id") or "").strip() or ("continue_context" in payload):
+            LOGGER.info(
+                "mcp_investigation_thread_context_ignored=true db_key=%s thread_id=%s continue_context=%s thread_memory_enabled=false",
+                str(db_key or "").strip(),
+                str(payload.get("thread_id") or "").strip(),
+                str(bool(payload.get("continue_context"))) if "continue_context" in payload else "",
+            )
+        LOGGER.info("mcp_investigation_uses_agent=true db_key=%s", str(db_key or "").strip())
+        return run_ai_investigation(
+            problem_statement,
+            db_key=db_key,
+            thread_id=str(payload.get("thread_id") or "").strip() or None,
+            continue_context=bool(payload.get("continue_context")) if "continue_context" in payload else None,
+            user_id=str(payload.get("user_id") or "").strip() or None,
+            session_id=str(payload.get("session_id") or "").strip() or None,
+            job_id=str(job.get("job_id") or "").strip() or None,
+        )
     if job_type == "active_sessions":
         return get_active_sessions(db_key=db_key)
     if job_type == "blocking_analysis":
@@ -259,26 +286,77 @@ def _finalize_job_result(result: dict[str, Any], *, job: dict[str, Any]) -> dict
     if job_type != "investigation":
         return _ensure_result_report_export(result, job=job)
 
+    _inject_investigation_result_metadata(result, job=job)
+    report_text = str(result.get("report_text") or "").strip()
     rendered_report = str(result.get("rendered_report") or "").strip()
     trace_path = str(result.get("trace_path") or "").strip()
     db_key = str(result.get("db_key") or job.get("db_key") or "").strip() or None
-    job_id = str(job.get("job_id") or "").strip()
+    job_id = str(job.get("job_id") or "").strip() or str(result.get("job_id") or "").strip() or "unknown"
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    problem_statement = str(result.get("problem_statement") or "").strip() or _coerce_problem_statement_from_payload(payload)
 
-    if trace_path and _needs_investigation_hydration(rendered_report):
-        hydrated = hydrate_investigation_report_from_trace(trace_path).strip()
-        if hydrated and "No investigation trace events were available for hydration." not in hydrated:
-            result["rendered_report"] = hydrated
-            rendered_report = hydrated
-
-    if rendered_report:
+    resolved_report = report_text or rendered_report
+    if not resolved_report:
         report_path = str(result.get("report_path") or "").strip()
-        if not report_path:
-            result["report_path"] = _write_investigation_export(
-                rendered_report=rendered_report,
-                db_key=db_key,
-                job_id=job_id,
+        if report_path and Path(report_path).exists():
+            resolved_report = Path(report_path).read_text(encoding="utf-8").strip()
+    if not resolved_report and trace_path:
+        try:
+            hydrated = str(hydrate_investigation_report_from_trace(trace_path)).strip()
+        except Exception as exc:
+            _append_result_warning(
+                result,
+                f"investigation_trace_hydration_failed: {type(exc).__name__}: {_sanitize_error_message(str(exc))}",
             )
-    return _ensure_result_report_export(result, job=job)
+            hydrated = ""
+        if hydrated and "No investigation trace events were available for hydration." not in hydrated:
+            resolved_report = hydrated
+    if not resolved_report:
+        details = [
+            "Investigation completed but report_text was missing.",
+            f"job_id={job_id}",
+        ]
+        if trace_path:
+            details.append(f"trace_path={trace_path}")
+        raise ReportExportError(" ".join(details))
+
+    result["problem_statement"] = problem_statement
+    result["question"] = problem_statement
+    result["report_text"] = resolved_report
+    result["rendered_report"] = resolved_report
+    result["thread_memory_enabled"] = False
+
+    export_path = ""
+    try:
+        export_path = _write_investigation_export(
+            rendered_report=resolved_report,
+            db_key=db_key,
+            job_id=job_id,
+        )
+        result["report_path"] = export_path
+    except Exception as exc:
+        _append_result_warning(
+            result,
+            f"investigation_report_export_write_failed: {type(exc).__name__}: {_sanitize_error_message(str(exc))}",
+        )
+        LOGGER.warning(
+            "investigation_report_export_write_failed job_id=%s db_key=%s error_type=%s error=%s",
+            job_id,
+            str(db_key or ""),
+            type(exc).__name__,
+            _sanitize_error_message(str(exc)),
+            exc_info=True,
+        )
+
+    LOGGER.info(
+        "investigation_result_ready job_id=%s db_key=%s report_text_len=%s report_path=%s trace_path=%s thread_memory_enabled=false",
+        job_id,
+        str(db_key or ""),
+        len(resolved_report),
+        export_path,
+        trace_path,
+    )
+    return result
 
 
 def _write_investigation_export(*, rendered_report: str, db_key: str | None, job_id: str) -> str:
@@ -289,30 +367,28 @@ def _write_investigation_export(*, rendered_report: str, db_key: str | None, job
     return str(path)
 
 
-def _needs_investigation_hydration(rendered_report: str) -> bool:
-    text = str(rendered_report or "").strip()
-    if not text:
-        return True
+def _extract_investigation_id(*, trace_path: str, job_id: str) -> str:
+    trace = str(trace_path or "").strip()
+    if trace:
+        stem = Path(trace).stem
+        if stem:
+            return stem
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_-]+", "", str(job_id or ""))
+    return f"investigation_{safe_job_id or 'unknown'}"
 
-    lowered = text.lower()
-    placeholder_markers = (
-        "no rendered report/summary was provided",
-        "compact job payload",
-        "investigation failed.",
-    )
-    if any(marker in lowered for marker in placeholder_markers):
-        return True
 
-    has_sql_section = "## sql steps run" in lowered or "## sql executed" in lowered
-    has_conclusion_section = any(
-        marker in lowered
-        for marker in (
-            "## likely cause",
-            "## 🔵 investigation conclusion",
-            "## 🔴 root cause analysis",
-        )
+def _inject_investigation_result_metadata(result: dict[str, Any], *, job: dict[str, Any]) -> None:
+    job_id = str(job.get("job_id") or "").strip()
+    trace_path = str(result.get("trace_path") or "").strip()
+    status = str(result.get("status") or "").strip() or "completed"
+    result["status"] = status
+    result["job_id"] = job_id
+    result["investigation_id"] = str(result.get("investigation_id") or "").strip() or _extract_investigation_id(
+        trace_path=trace_path,
+        job_id=job_id,
     )
-    return not (has_sql_section and has_conclusion_section)
+    if "error_type" not in result or str(result.get("error_type") or "").strip():
+        result["error_type"] = ""
 
 
 def _ensure_result_report_export(result: dict[str, Any], *, job: dict[str, Any]) -> dict[str, Any]:
@@ -385,11 +461,43 @@ def _reserve_next_pending_job() -> dict[str, Any] | None:
 def _execute_reserved_job(job: dict[str, Any]) -> None:
     job_id = str(job.get("job_id") or "")
     started = datetime.now(UTC)
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    problem_statement = _coerce_problem_statement_from_payload(payload) if str(job.get("job_type") or "") == "investigation" else ""
+    question_hash = hashlib.sha256(problem_statement.encode("utf-8")).hexdigest()[:16] if problem_statement else ""
+    LOGGER.info(
+        "job_start job_id=%s job_type=%s db_key=%s problem_statement_len=%s problem_statement_hash=%s",
+        job_id,
+        str(job.get("job_type") or ""),
+        str(job.get("db_key") or ""),
+        len(problem_statement),
+        question_hash,
+    )
     try:
         timeout_seconds = _job_timeout_seconds(str(job.get("job_type") or ""))
         result = _dispatch_with_timeout(job, timeout_seconds=timeout_seconds)
+        if str(job.get("job_type") or "") == "investigation" and isinstance(result, dict) and not bool(result.get("ok", True)):
+            error_type = str(result.get("error_type") or "").strip() or "investigation_error"
+            error_message = _sanitize_error_message(
+                str(result.get("error") or result.get("summary") or "Investigation failed.")
+            )
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=_utc_now_iso(),
+                result=_sanitize_value(result),
+                error=error_message,
+                error_type=error_type,
+                queue_reason=None,
+            )
+            elapsed_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
+            _log_job_event(job, status="failed", elapsed_ms=elapsed_ms, error_type=error_type)
+            return
         if isinstance(result, dict):
             result = _finalize_job_result(result, job=job)
+            if str(job.get("job_type") or "") == "investigation":
+                result["status"] = str(result.get("status") or "completed")
+                if "error_type" not in result or str(result.get("error_type") or "").strip():
+                    result["error_type"] = ""
         update_job(
             job_id,
             status="completed",
@@ -401,6 +509,36 @@ def _execute_reserved_job(job: dict[str, Any]) -> None:
         )
         elapsed_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
         _log_job_event(job, status="completed", elapsed_ms=elapsed_ms)
+        if isinstance(result, dict):
+            report_path = str(result.get("report_path") or "").strip()
+            trace_path = str(result.get("trace_path") or "").strip()
+            report_text = str(result.get("report_text") or "").strip()
+            LOGGER.info(
+                "job_completion job_id=%s status=completed error_type=%s report_text_present=%s report_path_exists=%s trace_path_exists=%s",
+                job_id,
+                str(result.get("error_type") or ""),
+                str(bool(report_text)).lower(),
+                str(bool(report_path and Path(report_path).exists())).lower(),
+                str(bool(trace_path and Path(trace_path).exists())).lower(),
+            )
+    except ReportExportError as exc:
+        message = _sanitize_error_message(str(exc))
+        update_job(
+            job_id,
+            status="failed",
+            completed_at=_utc_now_iso(),
+            result={
+                "summary": "Investigation completed but report_text was missing.",
+                "error_type": "investigation_result_error",
+                "error": message,
+            },
+            error=message,
+            error_type="investigation_result_error",
+            queue_reason=None,
+        )
+        elapsed_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
+        _log_job_event(job, status="failed", elapsed_ms=elapsed_ms, error_type="investigation_result_error")
+        LOGGER.exception("investigation_result_finalize_failed job_id=%s db_key=%s", job_id, str(job.get("db_key") or ""))
     except TimeoutError as exc:
         message = _sanitize_error_message(str(exc) or "job exceeded timeout")
         update_job(
@@ -535,7 +673,13 @@ def _load_all_job_rows_unlocked() -> list[tuple[Path, dict[str, Any]]]:
 def _load_job_file_unlocked(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "job_file_load_failed path=%s error_type=%s error=%s",
+            path,
+            type(exc).__name__,
+            _sanitize_error_message(str(exc)),
+        )
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -543,7 +687,16 @@ def _load_job_file_unlocked(path: Path) -> dict[str, Any] | None:
 def _write_job_unlocked(job: dict[str, Any]) -> None:
     path = _job_path(str(job.get("job_id") or ""))
     payload = _sanitize_value(job)
-    data = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+    try:
+        data = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+    except TypeError as exc:
+        LOGGER.exception(
+            "job_json_serialize_failed job_id=%s job_type=%s error=%s",
+            str(job.get("job_id") or ""),
+            str(job.get("job_type") or ""),
+            _sanitize_error_message(str(exc)),
+        )
+        raise
     tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         handle.write(data)
@@ -686,8 +839,12 @@ def _sanitize_error_message(message: str) -> str:
     key_value_patterns = [
         r"(?i)(password\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(pass\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(passphrase\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(token\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(secret\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(credential\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(api[_-]?key\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(private[_-]?key\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(wallet[_\s-]*password\s*[:=]\s*)([^,\s;]+)",
     ]
     for pattern in key_value_patterns:
@@ -698,21 +855,46 @@ def _sanitize_error_message(message: str) -> str:
 
 
 def _sanitize_value(value: Any) -> Any:
-    secret_keys = {"password", "pass", "token", "secret", "wallet_password"}
+    secret_tokens = ("password", "passphrase", "token", "secret", "credential", "api_key", "private_key", "wallet_password")
+    allowed_secretish_keys = {"password_env", "password_env_present", "credential_env_present"}
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
         for key, item in value.items():
-            lowered = str(key).strip().lower()
-            if lowered in secret_keys:
-                clean[key] = "***REDACTED***"
+            key_text = str(key)
+            lowered = key_text.strip().lower()
+            if lowered not in allowed_secretish_keys and any(token in lowered for token in secret_tokens):
+                clean[key_text] = "***REDACTED***"
             else:
-                clean[key] = _sanitize_value(item)
+                clean[key_text] = _sanitize_value(item)
         return clean
     if isinstance(value, list):
         return [_sanitize_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_value(item) for item in value]
+    if isinstance(value, set):
+        return [_sanitize_value(item) for item in sorted([str(v) for v in value])]
     if isinstance(value, str):
         return _sanitize_error_message(value)
     return value
+
+
+def _append_result_warning(result: dict[str, Any], message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    warnings = result.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        result["warnings"] = warnings
+    warnings.append(text)
+
+
+def _coerce_problem_statement_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("problem_statement", "question", "prompt", "user_question"):
+        text = str(payload.get(key) or "").strip()
+        if text:
+            return text
+    return ""
 
 
 @contextmanager

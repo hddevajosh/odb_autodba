@@ -8,7 +8,7 @@ from odb_autodba.db.connection import fetch_all
 
 def is_ash_available() -> bool:
     try:
-        fetch_all("select 1 as x from v$active_session_history where rownum = 1")
+        fetch_all("select 1 as x from gv$active_session_history where rownum = 1")
         return True
     except Exception:
         return False
@@ -19,7 +19,7 @@ def get_recent_ash_hotspots(hours: int = 4) -> list[dict]:
         """
         select * from (
             select nvl(event, 'ON CPU') as event, sql_id, count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time > sysdate - (:hours/24)
             group by nvl(event, 'ON CPU'), sql_id
             order by samples desc
@@ -153,7 +153,7 @@ def _ash_state_from_v_ash(*, begin_dt: datetime, end_dt: datetime, window_second
     sample_count_row = fetch_all(
         """
         select count(*) as sample_count
-        from v$active_session_history
+        from gv$active_session_history
         where sample_time >= :begin_time
           and sample_time < :end_time
         """,
@@ -165,7 +165,7 @@ def _ash_state_from_v_ash(*, begin_dt: datetime, end_dt: datetime, window_second
         """
         select * from (
             select nvl(sql_id, '(none)') as sql_id, count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time >= :begin_time
               and sample_time < :end_time
             group by nvl(sql_id, '(none)')
@@ -181,7 +181,7 @@ def _ash_state_from_v_ash(*, begin_dt: datetime, end_dt: datetime, window_second
             select nvl(event, 'ON CPU') as event,
                    nvl(wait_class, 'CPU') as wait_class,
                    count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time >= :begin_time
               and sample_time < :end_time
             group by nvl(event, 'ON CPU'), nvl(wait_class, 'CPU')
@@ -197,7 +197,7 @@ def _ash_state_from_v_ash(*, begin_dt: datetime, end_dt: datetime, window_second
             select blocking_inst_id,
                    blocking_session,
                    count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time >= :begin_time
               and sample_time < :end_time
               and blocking_session is not null
@@ -209,7 +209,7 @@ def _ash_state_from_v_ash(*, begin_dt: datetime, end_dt: datetime, window_second
     )
 
     return {
-        "source": "v$active_session_history",
+        "source": "gv$active_session_history",
         "available": True,
         "notes": [],
         "aas_proxy": _aas_proxy(sample_count, window_seconds),

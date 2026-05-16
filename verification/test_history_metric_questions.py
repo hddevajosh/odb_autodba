@@ -152,6 +152,13 @@ class HistoryMetricQuestionsTests(unittest.TestCase):
         self.assertIn("Average Top SQL CPU", report)
         self.assertNotIn("Average Host Memory", report)
         self.assertNotIn("Average value across requested metric fields", report)
+        supporting = payload.get("supporting_data") or {}
+        self.assertEqual(supporting.get("source"), "jsonl_fallback")
+        fields = supporting.get("field_summaries") or []
+        self.assertTrue(fields)
+        first = fields[0]
+        for key in ("sample_count", "latest", "current", "average_normal", "recent_average", "min", "max", "range", "state"):
+            self.assertIn(key, first)
 
     def test_blocking_question_returns_blocking_summary(self) -> None:
         traces = [

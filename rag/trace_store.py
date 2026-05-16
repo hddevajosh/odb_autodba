@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import threading
+import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from odb_autodba.config import get_default_oracle_target
 from odb_autodba.models.schemas import (
@@ -19,9 +24,15 @@ from odb_autodba.models.schemas import (
 from odb_autodba.runtime_paths import get_indexes_dir, get_traces_dir
 from odb_autodba.utils.env_loader import load_project_dotenv
 
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-posix fallback
+    fcntl = None
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
+LOGGER = logging.getLogger(__name__)
+TRACE_WRITE_LOCK = threading.Lock()
 
 
 def traces_root(db_key: str | None = None) -> Path:
@@ -105,7 +116,7 @@ def append_health_run_trace(
     expected_trace_root = traces_root(db_key=resolved_db_key)
     assert trace_file is not None
     assert str(trace_file).startswith(str(expected_trace_root))
-    print(f"[TRACE WRITE] Writing trace to {trace_file}")
+    LOGGER.info("trace_write db_key=%s trace_path=%s", resolved_db_key, trace_file)
 
     record = TraceHealthRunRecord(
         run_id=run_id,
@@ -139,8 +150,14 @@ def append_health_run_trace(
             from odb_autodba.rag.indexer import rebuild_planner_memory_artifacts
 
             rebuild_planner_memory_artifacts(database_name=database_name, db_key=resolved_db_key)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning(
+                "history_index_rebuild_failed db_key=%s database_name=%s error_type=%s error=%s",
+                resolved_db_key,
+                database_name,
+                type(exc).__name__,
+                _sanitize_log_message(str(exc)),
+            )
     return record
 
 
@@ -353,12 +370,36 @@ def _snapshot_metrics(snapshot: HealthSnapshot) -> dict[str, Any]:
     docker_stats = host.docker_stats if host else {}
     raw = snapshot.raw_evidence or {}
     host_check = raw.get("host_check") if isinstance(raw.get("host_check"), dict) else {}
+    hottest_pct = None
+    if hottest is not None:
+        if hottest.pct_used is not None:
+            hottest_pct = hottest.pct_used
+        else:
+            hottest_pct = hottest.used_pct
     return {
-        "active_sessions": snapshot.session_summary.active_sessions,
+        "database_role": snapshot.instance_info.database_role,
+        "open_mode": snapshot.instance_info.open_mode,
+        "standby_mode_detected": bool(str(snapshot.instance_info.database_role or "").upper().endswith("STANDBY")),
+        "mounted_physical_standby": bool(
+            str(snapshot.instance_info.database_role or "").upper() == "PHYSICAL STANDBY"
+            and str(snapshot.instance_info.open_mode or "").upper() == "MOUNTED"
+        ),
+        "active_sessions": snapshot.session_summary.active_total or snapshot.session_summary.active_sessions,
+        "true_active_non_idle": snapshot.session_summary.true_active_non_idle,
+        "active_idle_waiting": snapshot.session_summary.active_idle_waiting,
+        "on_cpu_sessions": snapshot.session_summary.on_cpu_sessions,
         "total_sessions": snapshot.session_summary.total_sessions,
         "blocking_count": len(snapshot.blocking_chains),
+        "blocking_critical_count": sum(
+            1 for chain in (snapshot.blocking_chains or []) if str(chain.blocking_severity or "").upper() == "CRITICAL"
+        ),
+        "blocking_warning_count": sum(
+            1 for chain in (snapshot.blocking_chains or []) if str(chain.blocking_severity or "").upper() == "WARNING"
+        ),
         "hottest_tablespace": hottest.tablespace_name if hottest else None,
-        "hottest_tablespace_pct": hottest.used_pct if hottest else None,
+        "hottest_tablespace_pct": hottest_pct,
+        "highest_tablespace_name": hottest.tablespace_name if hottest else None,
+        "highest_tablespace_pct": hottest_pct,
         "temp_usage_pct": raw.get("temp_pct"),
         "alert_log_count": len(raw.get("alert_log") or []),
         "listener_error_count": len((raw.get("listener_errors") or {}).get("errors") or []),
@@ -383,6 +424,10 @@ def _snapshot_metrics(snapshot: HealthSnapshot) -> dict[str, Any]:
         "host_check_scope": host_check.get("host_check_scope") or (host.host_check_scope if host else None),
         "host_check_label": host_check.get("host_check_label") or (host.host_check_label if host else None),
         "host_check_warning": host_check.get("host_check_warning") or (host.host_check_warning if host else None),
+        "primary_style_checks_skipped_for_mounted_standby": bool(raw.get("primary_style_checks_skipped_for_mounted_standby")),
+        "standby_apply_checked": (raw.get("dba_trust_checks") or {}).get("standby_apply_checked"),
+        "standby_lag_checked": (raw.get("dba_trust_checks") or {}).get("standby_lag_checked"),
+        "archive_gap_checked": (raw.get("dba_trust_checks") or {}).get("archive_gap_checked"),
     }
 
 
@@ -595,6 +640,10 @@ def _resolve_db_key(db_key: str | None) -> str:
 
 
 def _allow_legacy_read_fallback(*, db_key: str | None) -> bool:
+    load_project_dotenv()
+    enabled = str(os.getenv("ODB_AUTODBA_ALLOW_LEGACY_READ_FALLBACK") or "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
     resolved = _resolve_db_key(db_key)
     default_key = get_default_oracle_target().db_key
     return resolved == default_key
@@ -602,8 +651,14 @@ def _allow_legacy_read_fallback(*, db_key: str | None) -> bool:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2, default=str)
+    data = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+    with _path_lock(path, exclusive=True):
+        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
 
 
 def _read_json(path: Path) -> Any:
@@ -615,15 +670,23 @@ def _read_json(path: Path) -> Any:
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+    with _path_lock(path, exclusive=True):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def _write_jsonl_file(path: Path, payloads: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for payload in payloads:
-            handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+    with _path_lock(path, exclusive=True):
+        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            for payload in payloads:
+                handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -642,3 +705,39 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 rows.append(payload)
     return rows
+
+
+@contextmanager
+def _path_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    with TRACE_WRITE_LOCK:
+        lock_file = path.parent / f".{path.name}.lock"
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_file.open("a+", encoding="utf-8")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _sanitize_log_message(message: str) -> str:
+    text = str(message or "")
+    patterns = [
+        r"(?i)(password\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(pass\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(passphrase\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(token\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(secret\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(credential\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(api[_-]?key\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(private[_-]?key\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(wallet[_\s-]*password\s*[:=]\s*)([^,\s;]+)",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, r"\1***REDACTED***", text)
+    return text.replace("\n", " ")[:400]

@@ -58,7 +58,11 @@ def rank_root_causes(snapshot: HealthSnapshot) -> list[str]:
                 )
 
     if snapshot.blocking_chains:
-        causes.append("Blocking sessions are the strongest current cause candidate.")
+        critical_blocking = any(str(chain.blocking_severity or "").upper() == "CRITICAL" for chain in snapshot.blocking_chains)
+        if critical_blocking:
+            causes.append("Blocking sessions are the strongest current cause candidate.")
+        else:
+            causes.append("Blocking was observed but current evidence indicates mostly transient/non-critical blocking.")
     else:
         blocking_note = snapshot.raw_evidence.get("blocking_interpretation") or {}
         if isinstance(blocking_note, dict) and blocking_note.get("lock_wait_observed") and not blocking_note.get("active_blocker_present"):
@@ -76,8 +80,11 @@ def rank_root_causes(snapshot: HealthSnapshot) -> list[str]:
             f"ORA-01653 allocation failures were seen on {ts_name} despite low overall tablespace usage, "
             "suggesting file autoextend/maxsize or extent/quota constraints."
         )
-    elif snapshot.tablespaces and snapshot.tablespaces[0].used_pct >= 90:
-        causes.append(f"Tablespace pressure on {snapshot.tablespaces[0].tablespace_name} could worsen performance or failures.")
+    elif snapshot.tablespaces:
+        top = snapshot.tablespaces[0]
+        top_pct = _tablespace_pct(top)
+        if top_pct >= 85:
+            causes.append(f"Tablespace pressure on {top.tablespace_name} could worsen performance or failures.")
 
     if snapshot.raw_evidence.get("alert_log"):
         causes.append("Recent ORA/TNS errors indicate instability or workload-related failures.")
@@ -115,6 +122,15 @@ def _resolve_tablespace_name(snapshot: HealthSnapshot, anomaly: dict[str, object
     return "the affected tablespace"
 
 
+def _tablespace_pct(row: Any) -> float:
+    try:
+        if getattr(row, "pct_used", None) is not None:
+            return float(getattr(row, "pct_used"))
+        return float(getattr(row, "used_pct", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def rank_transition_causes(transition: HistoricalStateTransition | None) -> list[str]:
     if transition is None or not transition.available:
         return ["State transition evidence is unavailable."]
@@ -150,6 +166,12 @@ def infer_root_cause(
     supporting = supporting_data or {}
     report_text = (rendered_report or "").lower()
     latest_metrics = _extract_latest_metrics(supporting)
+    database_role = str(latest_metrics.get("database_role") or "").strip().upper()
+    open_mode = str(latest_metrics.get("open_mode") or "").strip().upper()
+    mounted_physical_standby = bool(
+        _to_bool(latest_metrics.get("mounted_physical_standby"))
+        or (database_role == "PHYSICAL STANDBY" and open_mode == "MOUNTED")
+    )
     host_check = _extract_host_check_context(supporting=supporting, latest_metrics=latest_metrics)
     state_transition = supporting.get("state_transition") if isinstance(supporting.get("state_transition"), dict) else {}
     learning = _extract_learning_features(supporting, state_transition)
@@ -162,8 +184,14 @@ def infer_root_cause(
     sql_signal = _detect_sql_regression_signal(learning, awr, latest_metrics)
     sql_pattern_signal = _detect_sql_performance_pattern_signal(report_text, learning, awr, latest_metrics)
     cpu_signal = _detect_cpu_signal(report_text, learning, awr, latest_metrics, host_check)
-    memory_signal = _detect_memory_signal(report_text, learning, awr, latest_metrics, host_check)
+    memory_signal = _detect_memory_signal(report_text, learning, awr, latest_metrics, host_check, supporting)
     storage_signal = _detect_storage_or_alert_signal(report_text, latest_metrics)
+    if mounted_physical_standby:
+        blocking_signal = {"present": False}
+        sql_signal = {"present": False}
+        sql_pattern_signal = {"present": False}
+        cpu_signal = {"present": False}
+        memory_signal = {"present": False}
 
     # Priority order: blocking_lock > sql_regression > sql_performance_pattern > cpu_pressure > memory_pressure > storage_or_alert_error > historical_recurrence > inconclusive
     if blocking_signal["present"]:
@@ -185,17 +213,13 @@ def infer_root_cause(
         category = "storage_or_alert_error"
         signal = storage_signal
     elif recurrence_support:
-        category = "historical_recurrence"
-        signal = {
-            "present": True,
-            "strength": min(55.0 + len(recurring_patterns) * 5.0, 78.0),
-            "primary_evidence": recurrence_support[:3],
-            "supporting_evidence": recurrence_support[3:],
-            "reasoning": "No stronger current incident signal was detected; recurrence is the strongest available pattern.",
-            "impacted_components": ["historical workload stability", "recurrent incident pattern"],
-            "next_validation_step": "Run a fresh health check and compare dominant SQL/wait/locking metrics against recurring fingerprints.",
-            "current_evidence_count": 0,
-        }
+        category = "inconclusive"
+        signal = _build_inconclusive_signal(latest_metrics, learning, recurring_patterns)
+        historical_note = (
+            "Recurring historical patterns were observed, but no matching current evidence was found "
+            "(historical_not_current)."
+        )
+        signal["supporting_evidence"] = _dedupe_cap_lines((signal.get("supporting_evidence") or []) + [historical_note], cap=5)
     elif mode == "investigation":
         likely_signal = _detect_investigation_likely_cause_signal(supporting)
         if likely_signal["present"]:
@@ -207,6 +231,17 @@ def infer_root_cause(
     else:
         category = "inconclusive"
         signal = _build_inconclusive_signal(latest_metrics, learning, recurring_patterns)
+    if mounted_physical_standby and category == "inconclusive":
+        signal = {
+            "present": True,
+            "strength": 34.0,
+            "primary_evidence": ["Primary-style RCA skipped in mounted standby mode."],
+            "supporting_evidence": ["Standby health should be driven by Data Guard apply/transport/gap evidence."],
+            "reasoning": "Mounted physical standby mode suppresses primary workload RCA categories by design.",
+            "impacted_components": ["standby apply/transport pipeline"],
+            "next_validation_step": "Review managed recovery, apply/transport lag, archive gaps, and Data Guard status messages.",
+            "current_evidence_count": 1,
+        }
 
     primary_evidence = _dedupe_cap_lines(signal.get("primary_evidence") or [], cap=3)
     supporting_evidence = _dedupe_cap_lines((signal.get("supporting_evidence") or []) + recurrence_support, cap=5)
@@ -221,6 +256,7 @@ def infer_root_cause(
 
     all_evidence = _dedupe_cap_lines(primary_evidence + supporting_evidence, cap=8)
     current_evidence_count = _to_int(signal.get("current_evidence_count"))
+    contradictions = _category_contradictions(category=category, latest_metrics=latest_metrics, report_text=report_text, signal=signal)
     confidence = _resolve_confidence(
         score=_to_float(signal.get("strength")),
         category=category,
@@ -228,6 +264,7 @@ def infer_root_cause(
         current_evidence_count=current_evidence_count,
         recurrence_count=len(recurring_patterns),
         data_completeness=_estimate_data_completeness(latest_metrics, learning, state_transition),
+        contradictions=contradictions,
     )
     reasoning = str(signal.get("reasoning") or "").strip() or "Deterministic signal rules identified the most likely contributing category."
     impacted_components = _dedupe_cap_lines(signal.get("impacted_components") or [], cap=6)
@@ -242,6 +279,7 @@ def infer_root_cause(
         "reasoning": reasoning,
         "impacted_components": impacted_components,
         "next_validation_step": next_validation_step,
+        "contradictions": contradictions[:4],
     }
 
 
@@ -350,20 +388,44 @@ def _detect_blocking_signal(report_text: str, latest_metrics: dict[str, Any], ac
     blocking_count = _to_int(active_payload.get("blocking_count"))
     if blocking_count == 0:
         blocking_count = _to_int(latest_metrics.get("blocking_count"))
+    critical_count = _to_int(active_payload.get("blocking_critical_count"))
+    warning_count = _to_int(active_payload.get("blocking_warning_count"))
+    if critical_count == 0 and warning_count == 0:
+        critical_count = _to_int(latest_metrics.get("blocking_critical_count"))
+        warning_count = _to_int(latest_metrics.get("blocking_warning_count"))
+    info_count = _to_int(active_payload.get("blocking_info_count"))
+    if info_count == 0:
+        info_count = _to_int(latest_metrics.get("blocking_info_count"))
     lock_wait = "row lock contention" in report_text or "enq: tx" in report_text
-    if blocking_count <= 0 and not lock_wait:
+    only_transient_info = blocking_count > 0 and critical_count <= 0 and warning_count <= 0 and info_count >= blocking_count
+    if only_transient_info and not lock_wait:
+        return {"present": False}
+    if blocking_count <= 0 and critical_count <= 0 and warning_count <= 0:
         return {"present": False}
     primary = []
-    if blocking_count > 0:
+    if critical_count > 0:
+        primary.append(f"Critical blocking chains observed (`blocking_critical_count={critical_count}`).")
+    elif warning_count > 0:
+        primary.append(f"Sustained blocking chains observed (`blocking_warning_count={warning_count}`).")
+    elif blocking_count > 0:
         primary.append(f"Active blocking sessions observed (`blocking_count={blocking_count}`).")
     if lock_wait:
         primary.append("Lock wait event detected (`enq: TX - row lock contention`).")
     supporting = []
     if "blocking chain" in report_text:
         supporting.append("Blocking-chain evidence is present in the current report.")
+    if info_count > 0 and critical_count <= 0 and warning_count <= 0:
+        supporting.append("Observed blockers are mostly transient/info severity.")
     return {
         "present": True,
-        "strength": min(82.0 + (8.0 if blocking_count >= 2 else 0.0) + (5.0 if lock_wait else 0.0), 96.0),
+        "strength": min(
+            70.0
+            + (15.0 if critical_count > 0 else 0.0)
+            + (8.0 if warning_count > 0 else 0.0)
+            + (5.0 if blocking_count >= 2 else 0.0)
+            + (5.0 if lock_wait else 0.0),
+            96.0,
+        ),
         "primary_evidence": primary,
         "supporting_evidence": supporting,
         "reasoning": "Current locking evidence indicates foreground session contention driven by blockers.",
@@ -379,9 +441,25 @@ def _detect_sql_regression_signal(learning: dict[str, Any], awr: dict[str, Any],
     sql_elapsed_delta = abs(_to_float(learning.get("sql_elapsed_delta")))
     sql_cpu_delta = abs(_to_float(learning.get("sql_cpu_delta")))
     top_elapsed_s = _to_float(latest_metrics.get("top_elapsed_sql_elapsed_s"))
-    material_delta = sql_elapsed_delta >= 15.0 or sql_cpu_delta >= 15.0 or top_elapsed_s >= 120.0
+    db_time_s = _to_float(latest_metrics.get("db_time_s")) or _to_float(_deep_get(awr, ["db_time_s"]))
+    elapsed_spike = _to_bool(_deep_get(awr, ["sql_change", "elapsed_per_exec_spike"])) or _to_bool(_deep_get(awr, ["sql_change_summary", "elapsed_per_exec_spike"]))
+    cpu_spike = _to_bool(_deep_get(awr, ["sql_change", "cpu_per_exec_spike"])) or _to_bool(_deep_get(awr, ["sql_change_summary", "cpu_per_exec_spike"]))
+    plan_changed = _to_bool(_deep_get(awr, ["sql_change", "plan_hash_changed_flag"])) or _to_bool(_deep_get(awr, ["sql_change_summary", "plan_hash_changed_flag"]))
+    material_delta = bool(
+        elapsed_spike
+        or cpu_spike
+        or sql_elapsed_delta >= 15.0
+        or sql_cpu_delta >= 15.0
+        or top_elapsed_s >= 30.0
+        or db_time_s >= 60.0
+        or (plan_changed and (elapsed_spike or cpu_spike))
+    )
     severe = sql_regression_severity in {"MEDIUM", "HIGH", "CRITICAL", "WARNING"}
     if not (sql_regression_flag or severe or material_delta):
+        return {"present": False}
+    if top_elapsed_s < 30.0 and db_time_s < 60.0 and not (
+        elapsed_spike or cpu_spike or sql_elapsed_delta >= 15.0 or sql_cpu_delta >= 15.0 or (plan_changed and (sql_elapsed_delta >= 15.0 or sql_cpu_delta >= 15.0))
+    ):
         return {"present": False}
     primary = []
     if sql_regression_flag:
@@ -391,7 +469,9 @@ def _detect_sql_regression_signal(learning: dict[str, Any], awr: dict[str, Any],
     if material_delta:
         primary.append(f"Material SQL delta observed (elapsed_delta={sql_elapsed_delta:.2f}, cpu_delta={sql_cpu_delta:.2f}).")
     supporting = []
-    if _to_bool(_deep_get(awr, ["sql_change", "plan_hash_changed_flag"])) or _to_bool(_deep_get(awr, ["sql_change_summary", "plan_hash_changed_flag"])):
+    if elapsed_spike or cpu_spike:
+        primary.append(f"Per-exec spike evidence exists (elapsed_per_exec_spike={elapsed_spike}, cpu_per_exec_spike={cpu_spike}).")
+    if plan_changed:
         supporting.append("Plan hash churn/regression indicators are present.")
     return {
         "present": True,
@@ -459,6 +539,10 @@ def _detect_cpu_signal(
     sql_cpu_delta = abs(_to_float(learning.get("sql_cpu_delta")))
     top_cpu_sql_s = _to_float(latest_metrics.get("top_cpu_sql_cpu_s"))
     active_sessions = _to_int(latest_metrics.get("active_sessions"))
+    true_active = _to_int(latest_metrics.get("true_active_non_idle"))
+    idle_active = _to_int(latest_metrics.get("active_idle_waiting"))
+    has_true_active_metric = "true_active_non_idle" in latest_metrics
+    activity_anchor = true_active if has_true_active_metric else active_sessions
     cpu_flag = _to_bool(_deep_get(awr, ["host_cpu_state", "cpu_pressure_flag"]))
     cpu_hotspot_text = "cpu hotspot" in report_text or "cpu pressure" in report_text or "db cpu" in report_text
     scope = str(host_check.get("host_check_scope") or "local_app_host")
@@ -469,8 +553,8 @@ def _detect_cpu_signal(
     oracle_cpu_corroboration = bool(
         cpu_flag
         or sql_cpu_delta >= 25.0
-        or ("on cpu" in report_text and active_sessions >= 3)
-        or ("db cpu" in report_text and active_sessions >= 3)
+        or ("on cpu" in report_text and activity_anchor >= 3)
+        or ("db cpu" in report_text and activity_anchor >= 3)
     )
     present = bool(host_saturated or (oracle_cpu_corroboration and cpu_hotspot_text))
     if scope == "local_app_host":
@@ -489,9 +573,11 @@ def _detect_cpu_signal(
             primary.append(f"Host/container CPU is elevated (`host_cpu_pct={host_cpu_pct:.2f}`, `container_cpu_pct={container_cpu_pct:.2f}`).")
     if cpu_flag:
         primary.append("AWR host CPU pressure flag is set.")
-    if sql_cpu_delta >= 25.0 or ("on cpu" in report_text and active_sessions >= 3):
+    if sql_cpu_delta >= 25.0 or ("on cpu" in report_text and activity_anchor >= 3):
         primary.append(
-            f"Database CPU corroboration exists (sql_cpu_delta={sql_cpu_delta:.2f}, top_cpu_sql_cpu_s={top_cpu_sql_s:.2f}, active_sessions={active_sessions})."
+            "Database CPU corroboration exists "
+            f"(sql_cpu_delta={sql_cpu_delta:.2f}, top_cpu_sql_cpu_s={top_cpu_sql_s:.2f}, "
+            f"true_active_non_idle={true_active}, active_sessions={active_sessions}, active_idle_waiting={idle_active})."
         )
     if not primary:
         primary.append("CPU pressure pattern is present in current workload evidence.")
@@ -519,76 +605,127 @@ def _detect_memory_signal(
     awr: dict[str, Any],
     latest_metrics: dict[str, Any],
     host_check: dict[str, Any],
+    supporting: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     memory_pct = _to_float(latest_metrics.get("memory_pct"))
     if memory_pct <= 0:
         memory_pct = _to_float(latest_metrics.get("host_memory_pct"))
+    container_memory_pct = _to_float(latest_metrics.get("container_memory_pct"))
     temp_usage_pct = _to_float(latest_metrics.get("temp_usage_pct"))
     mem_flag = _to_bool(learning.get("memory_pressure_flag")) or _to_bool(_deep_get(awr, ["memory_state", "memory_pressure_flag"]))
-    memory_hotspot_text = "memory hotspot" in report_text or "pga" in report_text and "pressure" in report_text
     scope = str(host_check.get("host_check_scope") or "local_app_host")
     mode = str(host_check.get("host_check_mode") or "local_app_host")
     if mode == "ssh_remote" and scope == "unavailable":
         return {"present": False}
-    has_oracle_memory_evidence = bool(mem_flag or temp_usage_pct >= 85.0 or "pga" in report_text)
-    present = mem_flag or memory_pct >= 85.0 or temp_usage_pct >= 85.0 or memory_hotspot_text
+
+    memory_cfg = (supporting or {}).get("memory_config") if isinstance((supporting or {}).get("memory_config"), dict) else {}
+    pga_sga_pct = _to_float(latest_metrics.get("pga_sga_pct")) or _to_float(latest_metrics.get("pga_to_sga_pct")) or _to_float(memory_cfg.get("pga_to_sga_pct"))
+    pga_mb = _to_float(latest_metrics.get("pga_mb")) or _to_float(memory_cfg.get("pga_mb"))
+    temp_consumers = _to_int(latest_metrics.get("temp_consumer_count")) or _to_int(memory_cfg.get("temp_consumer_count"))
+    memory_hotspot_triggered = _to_bool(latest_metrics.get("memory_hotspot_triggered"))
+    ora_memory_error = "ora-04030" in report_text or "ora-04031" in report_text
+    top_pga_sessions = memory_cfg.get("top_pga_sessions") if isinstance(memory_cfg.get("top_pga_sessions"), list) else []
+    top_session_memory_high = False
+    for row in top_pga_sessions[:10]:
+        if not isinstance(row, dict):
+            continue
+        if _to_float(row.get("pga_used_mb")) >= 512.0 or _to_float(row.get("temp_used_mb")) >= 512.0:
+            top_session_memory_high = True
+            break
+
+    indicator_flags = {
+        "pga_sga_pct_high": pga_sga_pct >= 25.0,
+        "pga_in_use_high": pga_mb >= 2048.0,
+        "temp_consumers_or_usage": temp_consumers > 0 or temp_usage_pct >= 70.0,
+        "os_or_container_memory_high": max(memory_pct, container_memory_pct) >= 85.0,
+        "memory_hotspot_triggered": memory_hotspot_triggered,
+        "ora_memory_error": ora_memory_error,
+        "top_sessions_high_pga_temp": top_session_memory_high,
+    }
+    current_indicator_count = sum(1 for active in indicator_flags.values() if active)
+    has_oracle_memory_evidence = bool(current_indicator_count >= 2 or mem_flag)
+    present = current_indicator_count >= 2
+
     if scope in {"disabled", "unavailable"} and not has_oracle_memory_evidence:
         present = False
     if scope == "local_app_host" and not has_oracle_memory_evidence:
         present = False
     if not present:
         return {"present": False}
+
     primary = []
-    if mem_flag:
-        primary.append("Memory pressure flag is asserted by transition/AWR intelligence.")
-    if memory_pct >= 85.0:
-        if scope == "local_app_host":
-            primary.append(f"Local app host memory is elevated (`memory_pct={memory_pct:.2f}`), not automatically the Oracle DB host.")
+    if indicator_flags["pga_sga_pct_high"]:
+        primary.append(f"PGA/SGA ratio is elevated (`pga_sga_pct={pga_sga_pct:.2f}`).")
+    if indicator_flags["pga_in_use_high"]:
+        primary.append(f"PGA in-use is materially high (`pga_mb={pga_mb:.2f}`).")
+    if indicator_flags["temp_consumers_or_usage"]:
+        if temp_consumers > 0:
+            primary.append(f"TEMP consumers are active (`temp_consumer_count={temp_consumers}`).")
         else:
-            primary.append(f"Host/container memory is elevated (`memory_pct={memory_pct:.2f}`).")
-    if temp_usage_pct >= 85.0:
-        primary.append(f"TEMP utilization is high (`temp_usage_pct={temp_usage_pct:.2f}`).")
-    if not primary:
-        primary.append("Memory pressure indicators are present in current runtime evidence.")
-    supporting = []
+            primary.append(f"TEMP utilization is high (`temp_usage_pct={temp_usage_pct:.2f}`).")
+    if indicator_flags["os_or_container_memory_high"]:
+        if scope == "local_app_host":
+            primary.append(
+                f"Local app host/container memory is elevated (`host_memory_pct={memory_pct:.2f}`, "
+                f"`container_memory_pct={container_memory_pct:.2f}`), not automatically the Oracle DB host."
+            )
+        else:
+            primary.append(
+                f"Host/container memory is elevated (`host_memory_pct={memory_pct:.2f}`, "
+                f"`container_memory_pct={container_memory_pct:.2f}`)."
+            )
+    if indicator_flags["memory_hotspot_triggered"]:
+        primary.append("Memory hotspot trigger is active in current host evidence.")
+    if indicator_flags["ora_memory_error"]:
+        primary.append("ORA-04030/ORA-04031 memory error signals were observed in current diagnostics.")
+    if indicator_flags["top_sessions_high_pga_temp"]:
+        primary.append("Top sessions show high PGA/TEMP usage.")
+
+    supporting_rows = []
+    if mem_flag:
+        supporting_rows.append("AWR/transition memory-pressure flag exists and supports current indicators.")
     if "pga" in report_text:
-        supporting.append("PGA usage evidence appears in current report details.")
+        supporting_rows.append("PGA usage evidence appears in current report details.")
     if scope == "local_app_host":
-        supporting.append("Host scope is local AutoDBA runtime; DB-host attribution requires Oracle-side corroboration.")
+        supporting_rows.append("Host scope is local AutoDBA runtime; DB-host attribution requires Oracle-side corroboration.")
+
     return {
         "present": True,
         "strength": min(
-            70.0 + (8.0 if memory_pct >= 90.0 and scope == "remote_db_host_ssh" else 0.0) + (6.0 if mem_flag else 0.0),
+            70.0 + (8.0 if max(memory_pct, container_memory_pct) >= 90.0 and scope == "remote_db_host_ssh" else 0.0) + (6.0 if mem_flag else 0.0),
             90.0,
         ),
         "primary_evidence": primary,
-        "supporting_evidence": supporting,
+        "supporting_evidence": supporting_rows,
         "reasoning": "Memory pressure indicators suggest constrained working-set resources for Oracle workload.",
         "impacted_components": ["memory management", "PGA/SGA consumers", "session runtime"],
         "next_validation_step": "Validate top PGA/TEMP consumers and memory parameters, then confirm pressure drops after workload correction.",
-        "current_evidence_count": len(primary) + len(supporting),
+        "current_evidence_count": len(primary) + len(supporting_rows),
     }
 
 
 def _detect_storage_or_alert_signal(report_text: str, latest_metrics: dict[str, Any]) -> dict[str, Any]:
     hottest_ts_pct = _to_float(latest_metrics.get("hottest_tablespace_pct"))
     fra_pct = _to_float(latest_metrics.get("fra_pct"))
-    alert_count = _to_int(latest_metrics.get("alert_log_count"))
+    alert_count = _to_int(latest_metrics.get("alert_ora_tns_count")) or _to_int(latest_metrics.get("alert_log_count"))
     listener_count = _to_int(latest_metrics.get("listener_error_count"))
+    archive_error_count = _to_int(latest_metrics.get("archive_dest_error_count"))
     ora_1653 = "ora-01653" in report_text
-    tns_error = "tns-" in report_text
-    present = ora_1653 or hottest_ts_pct >= 90.0 or fra_pct >= 85.0 or alert_count > 0 or listener_count > 0 or tns_error
+    present = hottest_ts_pct >= 90.0 or fra_pct >= 85.0 or alert_count > 0 or listener_count > 0 or archive_error_count > 0
     if not present:
         return {"present": False}
     primary = []
-    if ora_1653:
+    if ora_1653 and alert_count > 0:
         primary.append("Allocation failure detected (`ORA-01653`).")
     if hottest_ts_pct >= 90.0:
         primary.append(f"Tablespace pressure is high (`hottest_tablespace_pct={hottest_ts_pct:.2f}`).")
     if fra_pct >= 85.0:
         primary.append(f"FRA/archive pressure is elevated (`fra_pct={fra_pct:.2f}`).")
-    if alert_count > 0 or listener_count > 0 or tns_error:
-        primary.append(f"Alert/listener errors are present (`alert_log_count={alert_count}`, `listener_error_count={listener_count}`).")
+    if alert_count > 0 or listener_count > 0 or archive_error_count > 0:
+        primary.append(
+            "Alert/listener/archive errors are present "
+            f"(`alert_log_count={alert_count}`, `listener_error_count={listener_count}`, `archive_dest_error_count={archive_error_count}`)."
+        )
     if not primary:
         primary.append("Storage or alert-log error signals are present in current evidence.")
     return {
@@ -667,6 +804,38 @@ def _build_recurrence_support(recurring_patterns: list[str]) -> list[str]:
     return lines
 
 
+def _category_contradictions(
+    *,
+    category: str,
+    latest_metrics: dict[str, Any],
+    report_text: str,
+    signal: dict[str, Any],
+) -> list[str]:
+    out: list[str] = []
+    if category == "memory_pressure":
+        host_mem = _to_float(latest_metrics.get("memory_pct")) or _to_float(latest_metrics.get("host_memory_pct"))
+        container_mem = _to_float(latest_metrics.get("container_memory_pct"))
+        temp_consumers = _to_int(latest_metrics.get("temp_consumer_count"))
+        temp_pct = _to_float(latest_metrics.get("temp_usage_pct"))
+        pga_sga = _to_float(latest_metrics.get("pga_sga_pct")) or _to_float(latest_metrics.get("pga_to_sga_pct"))
+        if max(host_mem, container_mem) < 85.0 and temp_consumers <= 0 and temp_pct < 70.0 and pga_sga < 25.0 and "ora-0403" not in report_text:
+            out.append("Current memory indicators contradict memory_pressure (host/container/PGA/TEMP are not materially high).")
+    if category == "blocking_lock":
+        if _to_int(latest_metrics.get("blocking_count")) <= 0 and _to_int(signal.get("current_evidence_count")) <= 0:
+            out.append("Current metrics contradict blocking_lock (blocking_count=0).")
+    if category == "storage_or_alert_error":
+        alert_count = _to_int(latest_metrics.get("alert_ora_tns_count")) or _to_int(latest_metrics.get("alert_log_count"))
+        listener_count = _to_int(latest_metrics.get("listener_error_count"))
+        if alert_count <= 0 and listener_count <= 0 and _to_float(latest_metrics.get("hottest_tablespace_pct")) < 90.0 and _to_float(latest_metrics.get("fra_pct")) < 85.0:
+            out.append("Current metrics contradict storage_or_alert_error (no current ORA/TNS/storage pressure signals).")
+    if category == "sql_regression":
+        top_elapsed = _to_float(latest_metrics.get("top_elapsed_sql_elapsed_s"))
+        db_time_s = _to_float(latest_metrics.get("db_time_s"))
+        if top_elapsed < 30.0 and db_time_s < 60.0:
+            out.append("Current metrics contradict high SQL regression impact (DB Time/top elapsed are below incident thresholds).")
+    return _dedupe_cap_lines(out, cap=4)
+
+
 def _resolve_confidence(
     *,
     score: float,
@@ -675,6 +844,7 @@ def _resolve_confidence(
     current_evidence_count: int,
     recurrence_count: int,
     data_completeness: float,
+    contradictions: list[str] | None = None,
 ) -> str:
     adjusted = score
     if current_evidence_count >= 2:
@@ -692,6 +862,11 @@ def _resolve_confidence(
     if category == "inconclusive":
         return "LOW"
     resolved = _score_to_confidence(adjusted)
+    contradictions = contradictions or []
+    if contradictions and resolved == "HIGH":
+        resolved = "MEDIUM"
+    if any("contradicts" in item.lower() for item in contradictions):
+        resolved = "LOW"
     if category in {"cpu_pressure", "memory_pressure"} and host_check_scope == "local_app_host" and resolved == "HIGH":
         return "MEDIUM"
     if category in {"cpu_pressure", "memory_pressure"} and host_check_scope in {"disabled", "unavailable"}:

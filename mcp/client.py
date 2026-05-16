@@ -95,10 +95,27 @@ def submit_investigation_job(
     question: str,
     db_key: str | None = None,
     target: dict[str, Any] | None = None,
+    thread_id: str | None = None,
+    continue_context: bool | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"db_key": db_key, "question": question}
+    normalized = str(question or "").strip()
+    payload: dict[str, Any] = {
+        "db_key": db_key,
+        "problem_statement": normalized,
+        "question": normalized,  # backward-compatible alias
+    }
     if target is not None:
         payload["target"] = target
+    if (thread_id or "").strip():
+        payload["thread_id"] = str(thread_id).strip()
+    if continue_context is not None:
+        payload["continue_context"] = bool(continue_context)
+    if (user_id or "").strip():
+        payload["user_id"] = str(user_id).strip()
+    if (session_id or "").strip():
+        payload["session_id"] = str(session_id).strip()
     return _post_json("/investigate", payload)
 
 
@@ -249,8 +266,12 @@ def _sanitize_error_message(message: str) -> str:
     key_value_patterns = [
         r"(?i)(password\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(pass\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(passphrase\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(token\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(secret\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(credential\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(api[_-]?key\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(private[_-]?key\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(wallet[_\s-]*password\s*[:=]\s*)([^,\s;]+)",
     ]
     for pattern in key_value_patterns:

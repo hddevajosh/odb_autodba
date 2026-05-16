@@ -51,7 +51,7 @@ class PlannerTraceMetadataTests(unittest.TestCase):
                 "odb_autodba.agents.planner_agent.build_remediation_proposal",
                 return_value=proposal,
             ), patch(
-                "odb_autodba.agents.planner_agent.review_remediation_proposal",
+                "odb_autodba.agents.planner_agent.build_guardrail_review",
                 return_value=review,
             ), patch(
                 "odb_autodba.agents.planner_agent.HistoryService.compare_recent_runs",

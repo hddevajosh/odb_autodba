@@ -47,13 +47,13 @@ METRIC_CATALOG: tuple[MetricFamilySpec, ...] = (
             "blocking session",
             "blocking sessions",
         ),
-        fields=("blocking_count",),
+        fields=("blocking_count", "blocking_critical_count", "blocking_warning_count"),
     ),
     MetricFamilySpec(
         key="active_sessions",
         title="Active Sessions",
         aliases=("active sessions", "active session", "sessions", "session count"),
-        fields=("active_sessions",),
+        fields=("active_sessions", "true_active_non_idle", "active_idle_waiting", "on_cpu_sessions"),
     ),
     MetricFamilySpec(
         key="alerts",
@@ -65,7 +65,7 @@ METRIC_CATALOG: tuple[MetricFamilySpec, ...] = (
         key="tablespace",
         title="Tablespace Usage",
         aliases=("tablespace", "space", "storage", "disk usage"),
-        fields=("hottest_tablespace_pct",),
+        fields=("hottest_tablespace_pct", "highest_tablespace_pct"),
     ),
     MetricFamilySpec(
         key="cache",
@@ -91,6 +91,19 @@ METRIC_CATALOG: tuple[MetricFamilySpec, ...] = (
         aliases=("redo", "archive", "fra"),
         fields=("redo_switch_count", "fra_pct"),
     ),
+    MetricFamilySpec(
+        key="data_guard",
+        title="Data Guard / Standby",
+        aliases=("data guard", "standby", "apply lag", "transport lag", "archive gap", "mrp", "rfs"),
+        fields=(
+            "standby_mode_detected",
+            "mounted_physical_standby",
+            "standby_apply_checked",
+            "standby_lag_checked",
+            "archive_gap_checked",
+            "primary_style_checks_skipped_for_mounted_standby",
+        ),
+    ),
 )
 
 
@@ -100,4 +113,3 @@ def metric_catalog_by_key() -> dict[str, MetricFamilySpec]:
 
 def supported_metric_families() -> list[str]:
     return [item.key for item in METRIC_CATALOG]
-

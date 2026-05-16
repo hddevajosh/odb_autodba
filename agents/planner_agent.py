@@ -13,7 +13,7 @@ from odb_autodba.rag.trace_store import append_health_run_trace
 from odb_autodba.rag.indexer import get_index_status
 from odb_autodba.target_registry import get_oracle_target
 from odb_autodba.tools.action_proposals import build_remediation_proposal
-from odb_autodba.tools.action_reviewer import review_remediation_proposal
+from odb_autodba.tools.action_reviewer import build_guardrail_review
 from odb_autodba.utils.formatter import (
     format_dba_table,
     render_health_snapshot_report,
@@ -50,7 +50,7 @@ class PlannerAgent:
                     body = render_sql_id_deep_dive_report(deep_dive)
                     return PlannerResponse(mode="focused_domain_report", summary=f"SQL_ID {sql_id} deep dive completed.", body_markdown=body, recommendations=["Review plan hash diversity and child cursor behavior.", "Correlate with current blocking, waits, and AWR deltas."])
                 except Exception as exc:
-                    return PlannerResponse(mode="focused_domain_report", summary=f"SQL_ID {sql_id} deep dive could not be completed.", body_markdown=f"# SQL_ID Deep Dive\n\nUnable to collect SQL_ID evidence: {exc}", recommendations=["Verify Oracle connectivity and privileges for v$sqlstats, v$sql, and v$sql_plan."])
+                    return PlannerResponse(mode="focused_domain_report", summary=f"SQL_ID {sql_id} deep dive could not be completed.", body_markdown=f"# SQL_ID Deep Dive\n\nUnable to collect SQL_ID evidence: {exc}", recommendations=["Verify Oracle connectivity and privileges for gv$sqlstats, gv$sql, and gv$sql_plan."])
             if looks_like_active_sessions_request(user_text or ""):
                 try:
                     active_rows = [row.model_dump(mode="json") for row in get_running_sessions_inventory()]
@@ -73,6 +73,21 @@ class PlannerAgent:
                             "active_sessions": {
                                 "active_count": len(active_rows),
                                 "blocking_count": len(blocking_rows),
+                                "blocking_critical_count": sum(
+                                    1
+                                    for row in blocking_rows
+                                    if str((row or {}).get("blocking_severity") or "").upper() == "CRITICAL"
+                                ),
+                                "blocking_warning_count": sum(
+                                    1
+                                    for row in blocking_rows
+                                    if str((row or {}).get("blocking_severity") or "").upper() == "WARNING"
+                                ),
+                                "blocking_info_count": sum(
+                                    1
+                                    for row in blocking_rows
+                                    if str((row or {}).get("blocking_severity") or "").upper() == "INFO"
+                                ),
                                 "resource_candidates_count": len(resource_rows),
                             }
                         },
@@ -175,7 +190,7 @@ class PlannerAgent:
             database_name = snapshot.instance_info.db_name or snapshot.instance_info.instance_name or None
             history_context = self.history.compare_recent_runs(limit=10, database_name=database_name, db_key=resolved_db_key)
             proposal = build_remediation_proposal(snapshot)
-            review = review_remediation_proposal(proposal)
+            review = build_guardrail_review(proposal)
             body = render_health_snapshot_report(snapshot)
             trace_record = append_health_run_trace(
                 snapshot=snapshot,

@@ -87,7 +87,12 @@ def _blocking_lock_proposal(snapshot: HealthSnapshot) -> RemediationProposal | N
         kill_threshold=kill_threshold,
         kill_count_threshold=kill_count_threshold,
     )
-    action_title = _blocking_action_title(recommendation_mode, sid, blocker_classification)
+    action_title = _blocking_action_title(
+        recommendation_mode,
+        sid,
+        blocker_classification,
+        idle_in_transaction=idle_in_tx,
+    )
     reason_for_action = _reason_for_action(
         recommendation_mode=recommendation_mode,
         sid=sid,
@@ -458,13 +463,13 @@ def _recommendation_mode(
     return "review_first"
 
 
-def _blocking_action_title(mode: str, sid: int, classification: str) -> str:
+def _blocking_action_title(mode: str, sid: int, classification: str, *, idle_in_transaction: bool) -> str:
     if mode == "terminate":
-        if classification == "idle_in_transaction_blocker":
+        if idle_in_transaction and classification == "idle_in_transaction_blocker":
             return f"Kill idle-in-transaction blocker SID {sid}"
-        return f"Terminate blocking user session SID {sid}"
+        return f"Terminate blocking session SID {sid} after validation"
     if mode == "monitor":
-        return f"Monitor blocker SID {sid} before termination"
+        return f"Review blocker ownership before terminating SID {sid}"
     return f"Review blocker ownership before terminating SID {sid}"
 
 

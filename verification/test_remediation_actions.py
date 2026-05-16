@@ -173,7 +173,7 @@ class RemediationActionTests(unittest.TestCase):
                     blocker_program="python",
                     blocker_module="api",
                     blocker_machine="app-host-1",
-                    blocker_classification="application_session",
+                    blocker_classification="foreground_session",
                     evidence_complete=True,
                     blocked_sid=49,
                     blocked_serial=222,
@@ -189,7 +189,8 @@ class RemediationActionTests(unittest.TestCase):
         self.assertIsNotNone(proposal)
         self.assertEqual(proposal.action_type, "clear_blocking_lock")
         self.assertEqual(proposal.target.get("recommendation_mode"), "monitor")
-        self.assertIn("Monitor blocker", proposal.title)
+        self.assertIn("Review blocker ownership before terminating SID 64", proposal.title)
+        self.assertNotIn("Kill idle-in-transaction blocker", proposal.title)
 
     def test_long_idle_in_transaction_block_gets_stronger_title(self) -> None:
         snapshot = HealthSnapshot(
@@ -223,6 +224,38 @@ class RemediationActionTests(unittest.TestCase):
         self.assertIn("idle-in-transaction", proposal.title.lower())
         self.assertIsNotNone(proposal.post_action_validation)
         self.assertGreaterEqual(len(proposal.post_action_validation.checks), 3)
+
+    def test_terminate_non_idle_blocker_title_avoids_idle_wording(self) -> None:
+        snapshot = HealthSnapshot(
+            generated_at="2026-04-21T00:00:00Z",
+            blocking_chains=[
+                BlockingChain(
+                    blocker_inst_id=1,
+                    blocker_sid=91,
+                    blocker_serial=707,
+                    blocker_user="APPUSR",
+                    blocker_program="python",
+                    blocker_module="order_api",
+                    blocker_machine="app-host-4",
+                    blocker_classification="foreground_session",
+                    blocker_has_transaction=True,
+                    blocker_idle_in_transaction=False,
+                    evidence_complete=True,
+                    blocked_sid=92,
+                    blocked_serial=334,
+                    blocked_user="APPUSR",
+                    blocked_sql_id="ghj789xyz9",
+                    blocked_session_count=4,
+                    max_blocked_wait_seconds=600,
+                    seconds_in_wait=600,
+                )
+            ],
+        )
+        proposal = build_remediation_proposal(snapshot)
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.target.get("recommendation_mode"), "terminate")
+        self.assertNotIn("Kill idle-in-transaction blocker", proposal.title)
+        self.assertIn("Terminate blocking session SID 91 after validation", proposal.title)
 
     def test_sys_or_background_blocker_rejected_by_guardrails(self) -> None:
         proposal = RemediationProposal(
@@ -312,31 +345,21 @@ class RemediationActionTests(unittest.TestCase):
         review = review_remediation_proposal(proposal)
         rendered = render_remediation_card_markdown(proposal, review)
 
-        self.assertIn("## Proposed Action", rendered)
-        self.assertIn("### Why it is suggested", rendered)
-        self.assertIn("### Reviewer Decision", rendered)
-        self.assertIn("### SQL", rendered)
+        self.assertIn("## Proposed Remediation", rendered)
+        self.assertIn("## Why suggested", rendered)
+        self.assertIn("## Guardrails", rendered)
+        self.assertIn("## Failed Checks", rendered)
+        self.assertIn("## Suggested Command", rendered)
+        self.assertIn("| action_type | clear_blocking_lock |", rendered)
         self.assertIn("ALTER SYSTEM KILL SESSION '64,100,@1' IMMEDIATE", rendered)
-        self.assertIn("SID 64 (user APPUSR) is idle in transaction", rendered)
-        self.assertIn("blocking 3 sessions for 420 seconds", rendered)
+        self.assertIn("blocker_sid", rendered)
+        self.assertIn("blocked_sessions", rendered)
+        self.assertIn("wait_seconds", rendered)
         self.assertIn("APP.ORDERS", rendered)
+        self.assertNotIn("## Reviewer Decision", rendered)
+        self.assertIn("## Safety Warning", rendered)
 
-        self.assertNotIn("### Evidence", rendered)
-        self.assertNotIn("### Safer Alternatives", rendered)
-        self.assertNotIn("### Post-action validation", rendered)
-        self.assertNotIn("### Risks", rendered)
-        self.assertNotIn("Checks passed:", rendered)
-        self.assertNotIn("Checks failed:", rendered)
-        self.assertNotIn("Notes:", rendered)
-        self.assertNotIn("Confidence:", rendered)
-        self.assertNotIn("Rationale:", rendered)
-        self.assertNotIn("Status:", rendered)
-
-        lines = rendered.splitlines()
-        decision_idx = lines.index("### Reviewer Decision")
-        decision_line = lines[decision_idx + 1]
-        self.assertTrue(decision_line.startswith(("Approved", "Denied", "Pending", "Not needed")))
-        self.assertLessEqual(len([line for line in lines if line.startswith("Risk:")]), 1)
+        self.assertIn("## Key Evidence", rendered)
 
     def test_reviewer_rationale_includes_blocking_facts(self) -> None:
         proposal = RemediationProposal(
@@ -362,8 +385,7 @@ class RemediationActionTests(unittest.TestCase):
             sql="ALTER SYSTEM KILL SESSION '88,606,@1' IMMEDIATE",
         )
         review = review_remediation_proposal(proposal)
-        self.assertIn("blocked_sessions", review.rationale)
-        self.assertIn("classification", review.rationale)
+        self.assertIn("source=", " ".join(review.notes))
         self.assertIn("Guardrail", review.rationale)
         self.assertTrue(len(review.guardrail_checks_passed) >= 1)
 

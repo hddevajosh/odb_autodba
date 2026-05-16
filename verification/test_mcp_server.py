@@ -170,6 +170,25 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(payload.get("endpoint"), "/investigate")
         self.assertEqual(payload.get("error_type"), "ValidationError")
 
+    def test_post_investigate_accepts_problem_statement_alias(self) -> None:
+        bg = BackgroundTasks()
+        with patch(
+            "odb_autodba.mcp.server.create_job",
+            return_value={
+                "job_id": "job_inv_alias",
+                "status": "pending",
+                "db_key": "db1",
+                "job_type": "investigation",
+            },
+        ) as create_mock:
+            payload = investigate(InvestigateRequest(db_key="db1", problem_statement="List all the tables in database please?"), background_tasks=bg)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("job_id"), "job_inv_alias")
+        kwargs = create_mock.call_args.kwargs
+        sent_payload = kwargs.get("payload") or {}
+        self.assertEqual(sent_payload.get("problem_statement"), "List all the tables in database please?")
+        self.assertEqual(sent_payload.get("question"), "List all the tables in database please?")
+
     def test_post_sql_id_analyze_returns_job_id_immediately(self) -> None:
         bg = BackgroundTasks()
         with patch(

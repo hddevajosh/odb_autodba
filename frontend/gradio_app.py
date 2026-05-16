@@ -5,6 +5,8 @@ import logging
 import os
 import re
 from datetime import datetime, UTC
+from pathlib import Path
+from typing import Any
 
 import gradio as gr
 
@@ -12,7 +14,14 @@ from odb_autodba.agents.investigation_agent import InvestigationAgent
 from odb_autodba.agents.planner_agent import PlannerAgent
 from odb_autodba.guardrails.models import ExecutionContext
 from odb_autodba.guardrails.policy_engine import evaluate_action
-from odb_autodba.models.schemas import PlannerResponse, RemediationExecution, RemediationRecord, RemediationReview
+from odb_autodba.models.schemas import (
+    HealthSnapshot,
+    PlannerResponse,
+    RemediationExecution,
+    RemediationProposal,
+    RemediationRecord,
+    RemediationReview,
+)
 from odb_autodba.services.autodba_service import (
     analyze_awr,
     analyze_blocking_sessions,
@@ -21,8 +30,13 @@ from odb_autodba.services.autodba_service import (
 )
 from odb_autodba.tools.action_executor import execute_remediation_action
 from odb_autodba.tools.action_history import append_action_record, load_action_records, render_action_history_markdown
-from odb_autodba.tools.action_reviewer import review_remediation_proposal
-from odb_autodba.utils.formatter import render_investigation_final_report, render_planner_response, render_remediation_card_markdown
+from odb_autodba.tools.action_proposals import build_remediation_proposal
+from odb_autodba.tools.action_reviewer import build_guardrail_review
+from odb_autodba.utils.formatter import (
+    render_investigation_final_report,
+    render_planner_response,
+    render_remediation_card_markdown,
+)
 from odb_autodba.utils.sql_analysis import (
     detect_awr_analysis_intent,
     detect_blocking_analysis_intent,
@@ -481,11 +495,23 @@ def _submit_message_local(
         {"role": "user", "content": message},
         {"role": "assistant", "content": assistant_content},
     ]
-    response_state = {"response": response.model_dump(mode="json")}
-    has_proposal = response.remediation_proposal is not None
-    review_data = (response.supporting_data or {}).get("review")
+    payload = _ensure_guardrail_review_payload(response.model_dump(mode="json"))
+    response_state = {"response": payload}
+    review_data = (payload.get("supporting_data") or {}).get("review")
+    review = _review_from_response_payload(payload)
+    proposal_action_id = _proposal_action_id(response.remediation_proposal)
+    LOGGER.info(
+        "local_remediation_state db_key=%s action_id=%s action_type=%s guardrail_decision=%s guardrail_passed=%s guardrail_failed=%s",
+        (selected_db_key or "").strip(),
+        proposal_action_id,
+        response.remediation_proposal.action_type if response.remediation_proposal else "",
+        str(review.status).lower() if review else "unknown",
+        len(review.guardrail_checks_passed) if review else 0,
+        len(review.guardrail_checks_failed) if review else 0,
+    )
     remediation_md = render_remediation_card_markdown(response.remediation_proposal, review_data)
-    return chat_state, chat_state, response_state, remediation_md, False, gr.update(interactive=has_proposal), "", _action_history_markdown(selected_db_key)
+    execute_interactive = _execute_enabled_for_payload(response_state.get("response") or {}, confirmed=False)
+    return chat_state, chat_state, response_state, remediation_md, False, gr.update(interactive=execute_interactive), "", _action_history_markdown(selected_db_key)
 
 
 def _submit_investigation(message: str, chat_state: list[dict], selected_db_key: str | None = None, target_label: str | None = None):
@@ -529,7 +555,10 @@ def _submit_investigation(message: str, chat_state: list[dict], selected_db_key:
                 lines.append("Status: completed")
                 lines.append(f"MCP job {job_id} completed.")
                 lines.append("")
-                lines.append(_render_mcp_result(polled, fallback_title="Oracle Investigation"))
+                render_payload = dict(polled or {})
+                render_payload.setdefault("job_id", job_id)
+                render_payload.setdefault("status", status)
+                lines.append(_render_mcp_result(render_payload, fallback_title="Oracle Investigation"))
             elif status == "failed":
                 raise RuntimeError(polled.get("error") or "investigation job failed")
             else:
@@ -647,7 +676,10 @@ def _submit_message_via_mcp(
         lines.append("Status: completed")
         lines.append(f"MCP job {job_id} completed.")
         lines.append("")
-        assistant_content = _render_mcp_result(polled, fallback_title=fallback_title)
+        render_payload = dict(polled or {})
+        render_payload.setdefault("job_id", job_id)
+        render_payload.setdefault("status", status)
+        assistant_content = _render_mcp_result(render_payload, fallback_title=fallback_title)
         if route == "health" and target_label:
             assistant_content = _with_target_notice(assistant_content, target_label)
     elif status == "failed":
@@ -660,13 +692,35 @@ def _submit_message_via_mcp(
         {"role": "assistant", "content": "\n".join(lines) + "\n" + assistant_content},
     ]
     response_state = {}
+    remediation_md = "No remediation proposed for the current analysis."
+    execute_update = gr.update(interactive=False)
+    if route == "health":
+        hydrated_payload, no_proposal_reason = _hydrate_mcp_remediation_payload(
+            route=route,
+            polled=polled,
+            db_key=db_key,
+            job_id=job_id,
+        )
+        if hydrated_payload is not None:
+            response_state = {"response": hydrated_payload}
+            review = _review_from_response_payload(hydrated_payload)
+            proposal = _proposal_from_response_payload(hydrated_payload)
+            remediation_md = render_remediation_card_markdown(proposal, review.model_dump(mode="json") if review else None)
+            execute_update = gr.update(interactive=_execute_enabled_for_payload(hydrated_payload, confirmed=False))
+        elif no_proposal_reason:
+            LOGGER.info(
+                "mcp_remediation_hydration_no_proposal db_key=%s job_id=%s reason=%s",
+                (db_key or "").strip(),
+                job_id,
+                no_proposal_reason,
+            )
     return (
         chat_state,
         chat_state,
         response_state,
-        "No remediation proposed for the current analysis.",
+        remediation_md,
         False,
-        gr.update(interactive=False),
+        execute_update,
         "",
         _action_history_markdown(db_key),
     )
@@ -720,26 +774,59 @@ def _latest_report_message(*, db_key: str | None, report_type: str = "health") -
 
 def _render_mcp_result(job_payload: dict, *, fallback_title: str) -> str:
     result = job_payload.get("result") if isinstance(job_payload.get("result"), dict) else {}
-    if isinstance(result.get("rendered_report"), str) and result.get("rendered_report").strip():
-        return str(result.get("rendered_report"))
+    report_text = str(result.get("report_text") or "").strip()
+    rendered_report = str(result.get("rendered_report") or "").strip()
+    is_investigation = fallback_title.strip().lower() == "oracle investigation"
+    status = str(job_payload.get("status") or "unknown").strip()
+    completed = status.lower() == "completed"
+    report_path = str(result.get("report_path") or "").strip()
+    trace_path = str(result.get("trace_path") or "").strip()
+
+    if is_investigation and completed:
+        if report_text:
+            return report_text
+        if rendered_report:
+            return rendered_report
+        if report_path and Path(report_path).exists():
+            try:
+                from_file = Path(report_path).read_text(encoding="utf-8").strip()
+            except Exception:
+                from_file = ""
+            if from_file:
+                return from_file
+        lines = [
+            f"# {fallback_title}",
+            "",
+            "Investigation completed but inline report_text was missing.",
+            f"Status: `{status}`",
+            f"Trace path: `{trace_path or 'n/a'}`",
+            f"Report path: `{report_path or 'n/a'}`",
+        ]
+        return "\n".join(lines)
+
+    if rendered_report:
+        return rendered_report
+
     summary_raw = result.get("summary") or job_payload.get("summary")
     summary = str(summary_raw).strip() if summary_raw is not None else ""
     if summary:
         lines = [f"# {fallback_title}", "", summary]
     else:
-        trace_path = str(result.get("trace_path") or "").strip()
-        is_investigation = fallback_title.strip().lower() == "oracle investigation"
-        if is_investigation and trace_path:
+        if _debug_payloads_enabled():
+            fallback_obj = result if result else job_payload
+            compact_json = json.dumps(fallback_obj, ensure_ascii=True, indent=2, default=str)
+            lines = [f"# {fallback_title}", "", "Debug payload:", "```json", compact_json, "```"]
+        else:
+            status = str(job_payload.get("status") or "unknown")
+            error = _safe_error_message(str(job_payload.get("error") or result.get("error") or ""))
             lines = [
                 f"# {fallback_title}",
                 "",
-                "Investigation trace was captured, but a hydrated report was unavailable.",
-                f"Trace path: `{trace_path}`",
+                "No rendered report or summary was provided by the MCP job.",
+                f"Status: `{status}`",
             ]
-        else:
-            fallback_obj = result if result else job_payload
-            compact_json = json.dumps(fallback_obj, ensure_ascii=True, indent=2, default=str)
-            lines = [f"# {fallback_title}", "", "No rendered report/summary was provided. Compact job payload:", "```json", compact_json, "```"]
+            if error:
+                lines.append(f"Error: {error}")
     supporting = result.get("supporting_data")
     if isinstance(supporting, dict):
         history_sources = supporting.get("history_data_sources")
@@ -759,8 +846,12 @@ def _safe_error_message(text: str) -> str:
     patterns = [
         r"(?i)(password\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(pass\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(passphrase\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(token\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(secret\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(credential\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(api[_-]?key\s*[:=]\s*)([^,\s;]+)",
+        r"(?i)(private[_-]?key\s*[:=]\s*)([^,\s;]+)",
         r"(?i)(wallet[_\s-]*password\s*[:=]\s*)([^,\s;]+)",
     ]
     for pattern in patterns:
@@ -769,6 +860,11 @@ def _safe_error_message(text: str) -> str:
     raw = re.sub(r"(?i)(//[^:/@\s]+:)([^@\s]+)@", r"\1***REDACTED***@", raw)
     raw = raw.replace("\n", " ").strip()
     return raw[:400]
+
+
+def _debug_payloads_enabled() -> bool:
+    raw = (os.getenv("ODB_AUTODBA_UI_DEBUG_PAYLOADS") or os.getenv("PLANNER_DEBUG_MODE") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _truncate_inline(text: str, limit: int = 80) -> str:
@@ -827,17 +923,190 @@ def _action_history_markdown(db_key: str | None = None) -> str:
     return render_action_history_markdown(load_action_records(db_key=db_key))
 
 
+def _review_from_response_payload(payload: dict[str, Any]) -> RemediationReview | None:
+    if not isinstance(payload, dict):
+        return None
+    supporting = payload.get("supporting_data") if isinstance(payload.get("supporting_data"), dict) else {}
+    review_data = payload.get("remediation_review")
+    if not isinstance(review_data, dict):
+        review_data = supporting.get("review")
+    if not isinstance(review_data, dict):
+        return None
+    try:
+        return RemediationReview.model_validate(review_data)
+    except Exception:
+        return None
+
+
+def _ensure_guardrail_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    next_payload = dict(payload)
+    supporting = next_payload.get("supporting_data") if isinstance(next_payload.get("supporting_data"), dict) else {}
+    next_supporting = dict(supporting)
+    proposal = _proposal_from_response_payload(next_payload)
+    review = _review_from_response_payload(next_payload)
+    if proposal is not None and review is None:
+        review = build_guardrail_review(proposal)
+    if review is not None:
+        next_supporting["review"] = review.model_dump(mode="json")
+    next_payload["supporting_data"] = next_supporting
+    return next_payload
+
+
+def _proposal_requires_approval(proposal: RemediationProposal) -> bool:
+    target = proposal.target or {}
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        mode = str(target.get("recommendation_mode") or "").strip().lower()
+        return mode == "terminate"
+    return False
+
+
+def _proposal_from_response_payload(payload: dict[str, Any]) -> RemediationProposal | None:
+    proposal_data = payload.get("remediation_proposal")
+    if not isinstance(proposal_data, dict):
+        return None
+    try:
+        return RemediationProposal.model_validate(proposal_data)
+    except Exception:
+        return None
+
+
+def _execute_enabled_for_payload(payload: dict[str, Any], *, confirmed: bool) -> bool:
+    proposal = _proposal_from_response_payload(payload)
+    if proposal is None:
+        return False
+    review = _review_from_response_payload(payload)
+    if review is None or str(review.status).lower() != "approved":
+        return False
+    requires_approval = _proposal_requires_approval(proposal)
+    if requires_approval and not bool(confirmed):
+        return False
+    decision = evaluate_action(proposal, ExecutionContext(confirmed=(bool(confirmed) if requires_approval else True)))
+    return bool(decision.allowed)
+
+
+def _execute_button_update(confirmed: bool, response_state: dict) -> Any:
+    payload = (response_state or {}).get("response") or {}
+    interactive = _execute_enabled_for_payload(payload, confirmed=bool(confirmed))
+    return gr.update(interactive=interactive)
+
+
+def _proposal_action_id(proposal: RemediationProposal | None) -> str:
+    if proposal is None:
+        return ""
+    target = proposal.target or {}
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        return f"{proposal.action_type}:{target.get('inst_id')}:{target.get('sid')}:{target.get('serial#')}"
+    if proposal.action_type == "extend_tablespace":
+        return f"{proposal.action_type}:{target.get('tablespace_name')}"
+    return proposal.action_type
+
+
+def _hydrate_mcp_remediation_payload(
+    *,
+    route: str,
+    polled: dict[str, Any],
+    db_key: str | None,
+    job_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    result = polled.get("result") if isinstance(polled.get("result"), dict) else {}
+    supporting = result.get("supporting_data") if isinstance(result.get("supporting_data"), dict) else {}
+    summary = str(result.get("summary") or polled.get("summary") or "Oracle health check completed.").strip()
+    rendered_report = str(result.get("rendered_report") or "").strip()
+    issues_data = result.get("issues") if isinstance(result.get("issues"), list) else []
+    proposal = None
+    proposal_data = result.get("remediation_proposal")
+    if not isinstance(proposal_data, dict):
+        proposal_data = supporting.get("remediation_proposal")
+    if isinstance(proposal_data, dict):
+        try:
+            proposal = RemediationProposal.model_validate(proposal_data)
+        except Exception:
+            proposal = None
+
+    reason_no_proposal: str | None = None
+    if proposal is None:
+        if route == "health":
+            snapshot_data = result.get("health_snapshot")
+            if not isinstance(snapshot_data, dict):
+                snapshot_data = supporting.get("health_snapshot")
+            if isinstance(snapshot_data, dict):
+                try:
+                    snapshot = HealthSnapshot.model_validate(snapshot_data)
+                    proposal = build_remediation_proposal(snapshot)
+                except Exception as exc:
+                    reason_no_proposal = f"Deterministic remediation proposal build failed: {_safe_error_message(str(exc))}"
+            else:
+                reason_no_proposal = "No deterministic action proposal generated because MCP result did not include structured health evidence."
+        else:
+            reason_no_proposal = "No deterministic action proposal generated for non-health MCP route."
+
+    review = build_guardrail_review(proposal) if proposal is not None else None
+    proposal_count = 1 if proposal is not None else 0
+    selected_action_id = _proposal_action_id(proposal)
+    structured_findings = len(issues_data)
+    guardrail_decision = str(review.status).lower() if review is not None else "unknown"
+    reason_not_executable = ""
+    if proposal is not None and review is not None and guardrail_decision != "approved":
+        reason_not_executable = review.rationale or f"guardrail_decision={guardrail_decision}"
+    action_type = proposal.action_type if proposal is not None else ""
+
+    LOGGER.info(
+        "mcp_remediation_hydration db_key=%s job_id=%s findings=%s deterministic_proposals=%s selected_action_id=%s action_type=%s guardrail_decision=%s guardrail_passed=%s guardrail_failed=%s reason_no_proposal=%s reason_not_executable=%s",
+        (db_key or "").strip(),
+        job_id,
+        structured_findings,
+        proposal_count,
+        selected_action_id,
+        action_type,
+        guardrail_decision,
+        len(review.guardrail_checks_passed) if review else 0,
+        len(review.guardrail_checks_failed) if review else 0,
+        reason_no_proposal or "",
+        reason_not_executable,
+    )
+
+    if proposal is None:
+        return None, reason_no_proposal
+
+    next_supporting = dict(supporting)
+    if review is not None:
+        next_supporting["review"] = review.model_dump(mode="json")
+    next_supporting["mcp_job_id"] = job_id
+    next_supporting["mcp_route"] = route
+    if reason_not_executable:
+        next_supporting["remediation_not_executable_reason"] = reason_not_executable
+
+    payload = {
+        "mode": "full_health_report",
+        "summary": summary or "Oracle health check completed.",
+        "body_markdown": rendered_report or "# Oracle AutoDBA Report",
+        "issues": issues_data,
+        "recommendations": [],
+        "remediation_proposal": proposal.model_dump(mode="json"),
+        "supporting_data": next_supporting,
+    }
+    return _ensure_guardrail_review_payload(payload), reason_no_proposal
+
+
 def _execute_remediation(confirmed: bool, response_state: dict, selected_db_key: str | None = None):
     payload = (response_state or {}).get("response") or {}
     proposal_data = payload.get("remediation_proposal")
     if not proposal_data:
         return "No remediation proposal is available.", _action_history_markdown(selected_db_key)
     proposal = PlannerResponse.model_validate(payload).remediation_proposal
-    review = review_remediation_proposal(proposal)
-    review_text = _format_review_summary(review)
-    if review.status != "approved":
-        return f"Execution blocked by reviewer.\n{review_text}", _action_history_markdown(selected_db_key)
-    decision = evaluate_action(proposal, ExecutionContext(confirmed=confirmed))
+    review = _review_from_response_payload(payload) or build_guardrail_review(proposal)
+    review_text = _format_guardrail_summary(review)
+    if str(review.status).lower() != "approved":
+        return f"Execution blocked by guardrails.\n{review_text}", _action_history_markdown(selected_db_key)
+    requires_approval = _proposal_requires_approval(proposal)
+    if requires_approval and not bool(confirmed):
+        return (
+            f"{review_text}\nExecution blocked: user approval is required for high-risk actions.",
+            _action_history_markdown(selected_db_key),
+        )
+    decision = evaluate_action(proposal, ExecutionContext(confirmed=(bool(confirmed) if requires_approval else True)))
     if not decision.allowed:
         reasons = "; ".join(v.message for v in decision.violations)
         return f"{review_text}\nExecution blocked by guardrails: {reasons}", _action_history_markdown(selected_db_key)
@@ -847,17 +1116,13 @@ def _execute_remediation(confirmed: bool, response_state: dict, selected_db_key:
     return f"{review_text}\nExecution status: {execution.status}. {execution.message}", _action_history_markdown(selected_db_key)
 
 
-def _format_review_summary(review: RemediationReview) -> str:
-    icon = "🟢" if review.status == "approved" else "🔴" if review.status == "rejected" else "🔵"
-    rationale = review.rationale or "No reviewer rationale provided."
-    notes_source = review.notes or review.reviewer_notes
-    notes = "; ".join(notes_source[:3]) if notes_source else "No reviewer notes."
+def _format_guardrail_summary(review: RemediationReview) -> str:
+    rationale = review.rationale or "No guardrail rationale provided."
     passed = ", ".join(review.guardrail_checks_passed[:4]) if review.guardrail_checks_passed else "none"
     failed = ", ".join(review.guardrail_checks_failed[:4]) if review.guardrail_checks_failed else "none"
-    return (
-        f"Reviewer decision: {icon} {review.status} (confidence={review.confidence}). "
-        f"{rationale} Checks passed: {passed}. Checks failed: {failed}. Notes: {notes}"
-    )
+    status = str(review.status).lower()
+    icon = "🟢" if status == "approved" else ("🔴" if status == "rejected" else "⚪")
+    return f"Guardrail decision: {icon} {status}. {rationale} Checks passed: {passed}. Checks failed: {failed}."
 
 
 def _clear_chat(selected_db_key: str | None = None):
@@ -1095,6 +1360,7 @@ def build_app() -> gr.Blocks:
         investigate_btn.click(_submit_investigation_ui, inputs=[message, chat_state, target_db, labels_state], outputs=[chatbot, chat_state])
         clear_btn.click(_clear_chat, inputs=[target_db], outputs=[chatbot, chat_state, response_state, remediation_md, confirm_checkbox, execute_btn, validation_md, action_history_md])
         execute_btn.click(_execute_remediation, inputs=[confirm_checkbox, response_state, target_db], outputs=[validation_md, action_history_md])
+        confirm_checkbox.change(_execute_button_update, inputs=[confirm_checkbox, response_state], outputs=[execute_btn])
         target_db.change(_action_history_markdown, inputs=[target_db], outputs=[action_history_md])
         refresh_jobs_btn.click(_recent_jobs_markdown, inputs=[target_db], outputs=[recent_jobs_md])
         target_db.change(_recent_jobs_markdown, inputs=[target_db], outputs=[recent_jobs_md])

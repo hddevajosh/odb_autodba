@@ -339,9 +339,10 @@ class HistoryStateDiffTests(unittest.TestCase):
             "Incident Drivers",
             "Persistent Background Risks",
             "Change Since Last Report",
-            "AWR Workload Changes",
-            "Wait Class Shift",
-            "SQL Change Summary",
+            "AWR Snapshot Chain Diagnostic",
+            "AWR Workload Delta",
+            "AWR Wait Class Shift",
+            "AWR SQL Delta",
             "Event Timeline",
             "Learning Features",
             "Confidence + Coverage Notes",
@@ -660,6 +661,12 @@ class HistoryStateDiffTests(unittest.TestCase):
         awr_diff = AwrStateDiff(
             available=True,
             snapshot_quality=AwrSnapshotQuality(confidence="MEDIUM", coverage_quality="MEDIUM", comparability_score=0.7),
+            structured_sections={
+                "workload_delta": [
+                    {"Metric": "DB Time", "Previous": 120.4, "Current": 143.9, "Delta": 23.5, "Per Min": 2.4, "Interpretation": "DB Time increased by 19.50% (MEDIUM)."},
+                    {"Metric": "Hard Parses", "Previous": 12.0, "Current": None, "Delta": None, "Per Min": None, "Interpretation": "Hard Parses was partially available; comparison confidence is limited."},
+                ]
+            },
             workload_metrics=[
                 AwrMetricDelta(
                     metric_name="DB Time",
@@ -690,9 +697,7 @@ class HistoryStateDiffTests(unittest.TestCase):
         self.assertIn("DB Time", rendered)
         self.assertIn("120.4", rendered)
         self.assertIn("143.9", rendered)
-        self.assertIn("+23.50", rendered)
-        self.assertIn("+19.50%", rendered)
-        self.assertIn("MEDIUM", rendered)
+        self.assertIn("23.5", rendered)
         self.assertIn("Hard Parses", rendered)
         self.assertIn("Hard Parses was partial", rendered)
 
@@ -703,6 +708,18 @@ class HistoryStateDiffTests(unittest.TestCase):
         ]
         awr_diff = AwrStateDiff(
             available=True,
+            structured_sections={
+                "wait_class_shift": [
+                    {
+                        "Wait Class": "User I/O",
+                        "Previous Wait s": 10,
+                        "Current Wait s": 12,
+                        "Delta s": 2,
+                        "Current % DB Time": 8.0,
+                        "Interpretation": "No material wait-class shift detected.",
+                    }
+                ]
+            },
             wait_shift_summary=AwrWaitShiftSummary(
                 previous_dominant_wait_class="User I/O",
                 current_dominant_wait_class="User I/O",
@@ -720,9 +737,8 @@ class HistoryStateDiffTests(unittest.TestCase):
         ):
             context = JsonlHistoryService().compare_recent_runs(limit=2)
         rendered = render_history_answer({"context": context, "state_transition": context.state_transition, "summary_lines": []})
-        self.assertIn("previous_dominant_wait_class", rendered)
-        self.assertIn("current_dominant_wait_class", rendered)
-        self.assertIn("db file sequential read", rendered)
+        self.assertIn("AWR Wait Class Shift", rendered)
+        self.assertIn("User I/O", rendered)
         self.assertIn("No material wait-class", rendered)
 
     def test_sql_change_summary_includes_richer_context(self) -> None:
@@ -732,6 +748,27 @@ class HistoryStateDiffTests(unittest.TestCase):
         ]
         awr_diff = AwrStateDiff(
             available=True,
+            structured_sections={
+                "sql_delta": [
+                    {
+                        "SQL_ID": "b39m8n96gxk7c",
+                        "Plan": 123456,
+                        "Schema": "DEVA1",
+                        "Module": "APP_B",
+                        "Execs": 10,
+                        "Elapsed s": 45.0,
+                        "Elapsed/Exec s": 4.5,
+                        "CPU s": 21.0,
+                        "I/O Wait s": 5.0,
+                        "App Wait s": 2.0,
+                        "Conc Wait s": 1.0,
+                        "Gets/Exec": 1200,
+                        "Reads/Exec": 40,
+                        "DB Time %": 28.0,
+                        "Classification": "significant_contributor",
+                    }
+                ]
+            },
             sql_change_summary=AwrSqlChangeSummary(
                 dominant_sql_id_previous="bd1s1g2dc3w14",
                 dominant_sql_id_current="b39m8n96gxk7c",
@@ -755,11 +792,49 @@ class HistoryStateDiffTests(unittest.TestCase):
         ):
             context = JsonlHistoryService().compare_recent_runs(limit=2)
         rendered = render_history_answer({"context": context, "state_transition": context.state_transition, "summary_lines": []})
-        self.assertIn("dominant_sql_schema_previous", rendered)
-        self.assertIn("dominant_sql_module_current", rendered)
-        self.assertIn("sql_regression_severity", rendered)
-        self.assertIn("LOW", rendered)
-        self.assertIn("Dominant SQL shifted", rendered)
+        self.assertIn("AWR SQL Delta", rendered)
+        self.assertIn("DEVA1", rendered)
+        self.assertIn("APP_B", rendered)
+        self.assertIn("significant_contributor", rendered)
+
+    def test_same_snap_adjacent_mapping_does_not_emit_mapping_weak_source_message(self) -> None:
+        traces = [
+            _trace(run_id="r2", completed_at="2026-04-22T09:05:00Z", status="WARNING", summary="current"),
+            _trace(run_id="r1", completed_at="2026-04-22T08:55:00Z", status="WARNING", summary="previous"),
+        ]
+        mapping = AwrRunPairWindowMapping(
+            previous=AwrSnapshotWindowMapping(
+                dbid=1234,
+                instance_number=1,
+                startup_time="2026-04-22T00:00:00",
+                begin_snap_id=296,
+                end_snap_id=297,
+                matched_snap_id=297,
+                mapping_quality="MEDIUM",
+                window_use="baseline",
+            ),
+            current=AwrSnapshotWindowMapping(
+                dbid=1234,
+                instance_number=1,
+                startup_time="2026-04-22T00:00:00",
+                begin_snap_id=297,
+                end_snap_id=298,
+                matched_snap_id=298,
+                mapping_quality="MEDIUM",
+                window_use="structured_delta",
+            ),
+            comparability_score=0.65,
+            confidence="MEDIUM",
+            debug={"same_snap_adjacent_interval_mode": True, "same_snap_selected": False},
+        )
+        awr_diff = AwrStateDiff(available=True, window_mapping=mapping, snapshot_quality=AwrSnapshotQuality(window_quality="MEDIUM", usage="context_only", confidence="MEDIUM", coverage_quality="MEDIUM"))
+        with (
+            patch("odb_autodba.history.jsonl_service.read_health_run_traces", return_value=traces),
+            patch.object(JsonlHistoryService, "_build_optional_awr_diff", return_value=(awr_diff, [], "none")),
+        ):
+            context = JsonlHistoryService().compare_recent_runs(limit=2)
+        self.assertIn("structured DBA_HIST adjacent-interval comparison", context.state_transition.awr_source_summary)
+        self.assertNotIn("snapshot mapping weak", context.state_transition.awr_source_summary.lower())
 
     def test_section_naming_changes_by_transition_outcome(self) -> None:
         worsened_traces = [

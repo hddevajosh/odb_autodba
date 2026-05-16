@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import html
+import re
 import textwrap
 from typing import Any
 
@@ -24,27 +25,52 @@ STATUS_ICONS = {
     "INFO": "🔵",
 }
 
+INVESTIGATION_RENDER_ROW_LIMIT = 50
+
 SECTION_COLUMNS = {
     "Database Status": ["db_name", "open_mode", "database_role", "log_mode", "instance_name", "instance_status"],
     "Alert Log Errors": ["source", "window_hours", "filter", "rows_found", "status", "ts", "severity", "code", "message"],
     "Tablespace Usage": [
         "tablespace_name",
-        "allocated_gb",
-        "used_gb",
-        "free_allocated_gb",
-        "allocated_used_pct",
-        "max_gb",
-        "max_used_pct",
-        "autoextensible",
+        "pct_used",
+        "pct_free",
     ],
-    "Temp Usage": ["sid", "serial_num", "username", "program", "module", "sql_id", "gb_used"],
-    "Locks And Blocking": ["waiter_sid", "waiter_user", "waiter_sql_id", "seconds_in_wait", "blocker_sid", "blocker_user", "blocker_sql_id", "blocker_program"],
+    "Tablespace Allocation Details": ["tablespace_name", "allocated_gb", "used_allocated_gb", "free_allocated_gb", "max_gb", "allocated_used_pct", "max_used_pct", "autoextensible", "allocation_anomaly"],
+    "Temp Tablespace Capacity": ["tablespace_name", "temp_allocated_gb", "temp_current_allocated_gb", "temp_free_gb", "temp_used_gb", "temp_used_pct"],
+    "Temp Session Consumers": ["inst_id", "sid", "serial_num", "username", "sql_id", "module", "tablespace", "temp_used_mb"],
+    "Locks And Blocking": ["waiter_inst_id", "waiter_sid", "waiter_user", "waiter_sql_id", "waiter_wait_class", "seconds_in_wait", "blocker_inst_id", "blocker_sid", "blocker_user", "blocker_sql_id", "blocker_classification", "blocking_severity", "blocking_reason"],
     "Objects And Validity": ["owner", "object_name", "object_type"],
-    "Redo And Archiving": ["redo_switches", "redo_per_hour", "log_mode", "archive_dest"],
+    "Redo And Archiving": ["thread#", "switches_24h", "switches_per_hour", "event", "avg_wait_ms", "log_mode", "archive_dest"],
+    "Services And Routing": ["inst_id", "service_name", "network_name", "con_id", "container_name", "status", "finding"],
+    "Database Role Mode": ["role", "open_mode", "standby_health_mode", "primary_style_checks_skipped"],
+    "Standby Role / Open Mode": ["db_name", "database_role", "open_mode", "protection_mode", "protection_level", "switchover_status", "log_mode"],
+    "Managed Recovery Process": ["inst_id", "process", "status", "client_process", "thread#", "sequence#", "block#", "blocks"],
+    "Data Guard Lag": ["name", "value", "unit", "time_computed", "datum_time", "parsed_seconds", "severity"],
+    "Archive Gap": ["thread#", "low_sequence#", "high_sequence#"],
+    "Archive Destination Status": [
+        "dest_id",
+        "status",
+        "type",
+        "database_mode",
+        "recovery_mode",
+        "protection_mode",
+        "destination",
+        "error",
+        "archived_thread#",
+        "archived_seq#",
+        "applied_thread#",
+        "applied_seq#",
+    ],
+    "Data Guard Status Messages": ["timestamp", "severity", "facility", "error_code", "message"],
+    "Standby Alert Log Signals": ["originating_timestamp", "component_id", "message_type", "message_level", "severity", "message_text"],
+    "Listener / Connectivity Log Signals": ["source", "severity", "message"],
+    "Standby Active Services": ["inst_id", "service_name", "network_name", "con_id", "container_name", "status", "finding"],
+    "DBA Trust Checks": ["check", "value"],
     "Backup And Recovery": ["session_key", "input_type", "status", "completed"],
     "Scheduler Jobs": ["owner", "job_name", "status", "error", "started"],
     "Performance Overview": ["sql_id", "plan_hash_value", "executions", "elapsed_s", "cpu_s", "ela_per_exec_s", "buffer_gets", "disk_reads"],
     "Current Wait Profile": ["event", "wait_class", "time_waited_s", "total_waits", "avg_wait_ms"],
+    "Session Wait Correlation": ["inst_id", "event", "wait_class", "sql_id", "module", "username", "session_count", "max_seconds_in_wait"],
     "AWR Wait Events": ["event_name", "ms_per_occ"],
     "Cache Ratios": ["buffer_hit_pct", "library_hit_pct", "dictionary_hit_pct"],
     "Transactions And Undo": ["sid", "serial_num", "username", "minutes", "sql_id", "tablespace_name", "used_pct"],
@@ -108,15 +134,19 @@ SECTION_COLUMNS = {
 SECTION_COMPACT_COLUMNS = {
     "Tablespace Usage": [
         "tablespace_name",
-        "allocated_gb",
-        "used_gb",
-        "free_allocated_gb",
-        "allocated_used_pct",
-        "max_gb",
-        "max_used_pct",
-        "autoextensible",
+        "pct_used",
+        "pct_free",
     ],
-    "Temp Usage": ["sid", "username", "sql_id", "segtype", "temp_used", "tablespace"],
+    "Temp Tablespace Capacity": ["tablespace_name", "temp_used_pct", "temp_used_gb", "temp_free_gb"],
+    "Temp Session Consumers": ["inst_id", "sid", "username", "sql_id", "tablespace", "temp_used_mb"],
+    "Managed Recovery Process": ["inst_id", "process", "status", "client_process", "thread#", "sequence#"],
+    "Data Guard Lag": ["name", "value", "parsed_seconds", "severity"],
+    "Archive Gap": ["thread#", "low_sequence#", "high_sequence#"],
+    "Archive Destination Status": ["dest_id", "status", "error", "archived_seq#", "applied_seq#"],
+    "Data Guard Status Messages": ["timestamp", "severity", "error_code", "message"],
+    "Standby Alert Log Signals": ["originating_timestamp", "severity", "message_text"],
+    "Listener / Connectivity Log Signals": ["severity", "message"],
+    "Standby Active Services": ["inst_id", "service_name", "status", "finding"],
     "Memory And Configuration": ["sid", "serial_num", "username", "sql_id", "pga_used", "pga_alloc", "temp_used", "module", "program"],
     "CPU Hotspots": ["row_type", "os_pid", "process_group", "cpu_pct", "memory_pct", "sid", "username", "sql_id", "module", "program", "source"],
     "Memory Hotspots": ["row_type", "os_pid", "process_group", "memory_pct", "rss", "sid", "username", "sql_id", "pga_used", "pga_alloc", "temp_used", "module", "program", "source"],
@@ -400,9 +430,17 @@ def choose_section_render_mode(section_name: str, rows: list[dict[str, Any]]) ->
         "Memory And Configuration",
         "Transactions And Undo",
         "Performance Overview",
+        "Managed Recovery Process",
+        "Data Guard Lag",
+        "Archive Gap",
+        "Archive Destination Status",
+        "Data Guard Status Messages",
+        "Standby Alert Log Signals",
+        "Listener / Connectivity Log Signals",
+        "Standby Active Services",
     }:
         return "table_compact"
-    if section_name in {"Database Status", "Init Parameters", "Scheduler Jobs", "Redo And Archiving", "Backup And Recovery"}:
+    if section_name in {"Database Status", "Database Role Mode", "Standby Role / Open Mode", "Init Parameters", "Scheduler Jobs", "Redo And Archiving", "Backup And Recovery"}:
         return "table_numeric"
     if not rows:
         return "note"
@@ -642,222 +680,179 @@ def render_history_answer(answer: dict[str, Any]) -> str:
     else:
         lines.append("No issue-transition rows were captured.")
 
-    workload_metric_rows = awr_data.get("workload_metrics") if isinstance(awr_data.get("workload_metrics"), list) else []
-    if not workload_metric_rows:
-        load_profile_rows = awr_data.get("load_profile") if isinstance(awr_data.get("load_profile"), list) else []
-        workload_metric_rows = [
-            {
-                "metric_name": row.get("metric_name"),
-                "previous_value": row.get("previous"),
-                "current_value": row.get("current"),
-                "delta_value": row.get("delta"),
-                "percent_delta": row.get("pct_change"),
-                "significance": row.get("significance"),
-                "interpretation": row.get("interpretation"),
-            }
-            for row in load_profile_rows
-        ]
     historical_confidence = _history_mapping(transition_data.get("historical_confidence"))
-    awr_rows: list[dict[str, Any]] = []
-    if single_window_awr:
-        lines.extend(["", _section_heading("AWR Analysis Mode", informational=True), ""])
-        lines.append("AWR Analysis Mode: Single-window interpretation (historical context applied)")
+    structured_awr = _history_mapping(awr_data.get("structured_sections"))
+    unavailable_reasons = structured_awr.get("unavailable_reasons") if isinstance(structured_awr.get("unavailable_reasons"), list) else []
+    unavailable_reason_text = ", ".join(str(item) for item in unavailable_reasons if str(item).strip())
+    snapshot_quality = _history_mapping(awr_data.get("snapshot_quality"))
+
+    lines.extend(["", _section_heading("AWR Snapshot Chain Diagnostic", informational=True), ""])
+    chain_rows = structured_awr.get("snapshot_chain_diagnostic") if isinstance(structured_awr.get("snapshot_chain_diagnostic"), list) else snapshot_quality.get("diagnostic_rows")
+    if isinstance(chain_rows, list) and chain_rows:
+        lines.append(_render_table(chain_rows, ["DBID", "Instance", "Startup Time", "Snap Min", "Snap Max", "Begin Time", "End Time", "Rows", "Selected"]))
+        if sum(1 for row in chain_rows if str(row.get("Selected") or "").lower() == "no") > 0:
+            lines.append(
+                "Multiple AWR snapshot chains exist for this time range. AutoDBA selected snapshots matching current DBID/instance/startup chain. Other chains were ignored."
+            )
     else:
-        lines.extend(["", _section_heading("AWR Workload Changes", informational=True), ""])
-    if workload_metric_rows and not single_window_awr:
-        for row in workload_metric_rows[:20]:
-            awr_rows.append(
+        lines.append("AWR snapshot chain diagnostic rows were unavailable.")
+
+    lines.extend(["", _section_heading("AWR Snapshot Quality", informational=True), ""])
+    window_rows = structured_awr.get("snapshot_windows") if isinstance(structured_awr.get("snapshot_windows"), list) else snapshot_quality.get("window_rows")
+    if isinstance(window_rows, list) and window_rows:
+        lines.append(_render_table(window_rows, ["Window", "DBID", "Instance", "Startup Time", "Begin Snap", "End Snap", "Begin Time", "End Time", "Duration Min", "Quality", "Use"]))
+    else:
+        lines.append("AWR snapshot window rows were unavailable.")
+    quality_summary_rows = [
+        {
+            "Window quality": snapshot_quality.get("window_quality") or "LOW",
+            "Usage": snapshot_quality.get("usage") or "context_only",
+            "Reason": snapshot_quality.get("reason") or "AWR snapshot quality was not available.",
+        }
+    ]
+    lines.append(_render_table(quality_summary_rows, ["Window quality", "Usage", "Reason"]))
+    if str(snapshot_quality.get("window_quality") or "").upper() == "LOW":
+        lines.append("AWR current window is low quality; AWR findings are context only and cannot drive CRITICAL RCA alone.")
+
+    lines.extend(["", _section_heading("AWR Workload Delta", informational=True), ""])
+    workload_rows = structured_awr.get("workload_delta") if isinstance(structured_awr.get("workload_delta"), list) else []
+    if workload_rows:
+        lines.append(_render_table(workload_rows, ["Metric", "Previous", "Current", "Delta", "Per Min", "Interpretation"]))
+    else:
+        lines.append(
+            "AWR workload delta rows were unavailable."
+            + (f" Reason: {unavailable_reason_text}." if unavailable_reason_text else "")
+        )
+
+    lines.extend(["", _section_heading("AWR Wait Class Shift", informational=True), ""])
+    wait_shift_rows = structured_awr.get("wait_class_shift") if isinstance(structured_awr.get("wait_class_shift"), list) else []
+    if wait_shift_rows:
+        lines.append(_render_table(wait_shift_rows, ["Wait Class", "Previous Wait s", "Current Wait s", "Delta s", "Current % DB Time", "Interpretation"]))
+    else:
+        lines.append(
+            "AWR wait class shift rows were unavailable."
+            + (f" Reason: {unavailable_reason_text}." if unavailable_reason_text else "")
+        )
+
+    lines.extend(["", _section_heading("AWR Top Wait Events", informational=True), ""])
+    top_wait_rows = structured_awr.get("top_wait_events") if isinstance(structured_awr.get("top_wait_events"), list) else []
+    if top_wait_rows:
+        lines.append(_render_table(top_wait_rows, ["Event", "Wait Class", "Prev Wait s", "Curr Wait s", "Delta s", "Waits", "Avg Latency", "Impact", "DBA Interpretation"]))
+    else:
+        lines.append(
+            "AWR top wait-event rows were unavailable."
+            + (f" Reason: {unavailable_reason_text}." if unavailable_reason_text else "")
+        )
+
+    lines.extend(["", _section_heading("AWR SQL Delta", informational=True), ""])
+    sql_delta_rows = structured_awr.get("sql_delta") if isinstance(structured_awr.get("sql_delta"), list) else []
+    if sql_delta_rows:
+        lines.append(
+            _render_table(
+                sql_delta_rows,
+                [
+                    "SQL_ID",
+                    "Plan",
+                    "Schema",
+                    "Module",
+                    "Execs",
+                    "Elapsed s",
+                    "Elapsed/Exec s",
+                    "CPU s",
+                    "I/O Wait s",
+                    "App Wait s",
+                    "Conc Wait s",
+                    "Gets/Exec",
+                    "Reads/Exec",
+                    "DB Time %",
+                    "Classification",
+                    "sql_text_sample",
+                    "Interpretation",
+                ],
+            )
+        )
+    else:
+        lines.append(
+            "AWR SQL delta rows were unavailable."
+            + (f" Reason: {unavailable_reason_text}." if unavailable_reason_text else "")
+        )
+
+    lines.extend(["", _section_heading("AWR Plan Stability", informational=True), ""])
+    plan_rows = structured_awr.get("plan_stability") if isinstance(structured_awr.get("plan_stability"), list) else []
+    if plan_rows:
+        lines.append(_render_table(plan_rows, ["SQL_ID", "Plans", "Previous Plan", "Current Plan", "Plan Changed", "Prev Elapsed/Exec", "Curr Elapsed/Exec", "Regression Evidence"]))
+    else:
+        lines.append("AWR plan-stability rows were unavailable.")
+
+    lines.extend(["", _section_heading("AWR Blocking / ASH Concurrency", informational=True), ""])
+    ash_rows = structured_awr.get("ash_blocking") if isinstance(structured_awr.get("ash_blocking"), list) else []
+    if ash_rows:
+        lines.append(_render_table(ash_rows, ["Event", "Wait Class", "Samples", "Distinct Waiters", "Blocking Inst", "Blocking SID", "Top SQL_ID", "Object", "Interpretation"]))
+    else:
+        lines.append("ASH concurrency rows were unavailable.")
+
+    lines.extend(["", _section_heading("AWR Object Hotspots", informational=True), ""])
+    object_rows = structured_awr.get("object_hotspots") if isinstance(structured_awr.get("object_hotspots"), list) else []
+    if object_rows:
+        lines.append(_render_table(object_rows, ["Object", "Object Type", "Event", "Wait Class", "Samples", "Top SQL_ID", "Interpretation"]))
+    else:
+        lines.append("AWR object hotspot rows were unavailable.")
+
+    lines.extend(["", _section_heading("AWR Redo / Commit Profile", informational=True), ""])
+    redo_rows = structured_awr.get("redo_commit_profile") if isinstance(structured_awr.get("redo_commit_profile"), list) else []
+    if redo_rows:
+        lines.append(_render_table(redo_rows, ["Metric", "Previous", "Current", "Delta", "Interpretation"]))
+    else:
+        lines.append("AWR redo/commit profile rows were unavailable.")
+
+    lines.extend(["", _section_heading("AWR Current Evidence Correlation", informational=True), ""])
+    current_metrics = {}
+    if context is not None and context.latest_run is not None and isinstance(context.latest_run.metrics, dict):
+        current_metrics = context.latest_run.metrics
+    blocking_count = current_metrics.get("blocking_count")
+    correlation_rows: list[dict[str, Any]] = []
+    if any("enq: tx" in str(row.get("Event") or "").lower() for row in ash_rows):
+        if (blocking_count or 0) > 0:
+            correlation_rows.append(
                 {
-                    "metric": row.get("metric_name"),
-                    "previous": _format_metric_number(row.get("previous_value")),
-                    "current": _format_metric_number(row.get("current_value")),
-                    "delta": _format_signed_metric_number(row.get("delta_value")),
-                    "%delta": _format_percent_delta(row.get("percent_delta")),
-                    "significance": row.get("significance") or "-",
-                    "interpretation": row.get("interpretation") or "-",
+                    "AWR Signal": "TX row lock contention",
+                    "Current Health Evidence": f"blocking_count={blocking_count}",
+                    "Correlation": "confirmed",
+                    "Decision": "active driver",
                 }
             )
-        if should_collapse_unavailable_awr_table(awr_rows, ["previous", "current", "delta"]):
-            lines.append(
-                render_compact_awr_unavailable_note(
-                    "AWR workload metrics were unavailable in the mapped comparison window.",
-                    awr_rows,
-                    metric_key="metric",
-                )
+        else:
+            correlation_rows.append(
+                {
+                    "AWR Signal": "TX row lock contention",
+                    "Current Health Evidence": f"blocking_count={blocking_count or 0} in latest health run",
+                    "Correlation": "historical/transient",
+                    "Decision": "AWR confirms row-lock contention occurred in previous AWR window, but it is not active now.",
+                }
             )
-        else:
-            lines.append(_render_table(awr_rows, ["metric", "previous", "current", "delta", "%delta", "significance", "interpretation"]))
-            awr_workload_interpretation = transition_data.get("awr_workload_interpretation") or _history_mapping(awr_data.get("workload_interpretation")).get("summary")
-            if awr_workload_interpretation:
-                lines.append(f"- {awr_workload_interpretation}")
-    elif not single_window_awr:
-        fallback_reason = fallback_info.get("awr_user_message") or historical_confidence.get("fallback_reason") or "AWR workload comparison unavailable; JSONL fallback used."
-        lines.append(f"AWR workload comparison fallback: {fallback_reason}")
+    if correlation_rows:
+        lines.append(_render_table(correlation_rows, ["AWR Signal", "Current Health Evidence", "Correlation", "Decision"]))
+    else:
+        lines.append("No strong AWR-to-current correlation rows were available.")
 
-    lines.extend(["", _section_heading("Wait Event Profile" if single_window_awr else "Wait Class Shift", informational=True), ""])
-    wait_shift = _history_mapping(awr_data.get("wait_shift_summary")) or _history_mapping(awr_data.get("wait_class_shift"))
-    if wait_shift:
-        wait_summary_rows = [
-            {
-                "previous_dominant_wait_class": wait_shift.get("previous_dominant_wait_class") or wait_shift.get("dominant_wait_class_previous") or "-",
-                "current_dominant_wait_class": wait_shift.get("current_dominant_wait_class") or wait_shift.get("dominant_wait_class_current") or "-",
-                "previous_top_event": wait_shift.get("previous_top_event") or "-",
-                "current_top_event": wait_shift.get("current_top_event") or "-",
-                "wait_class_shift_flag": wait_shift.get("wait_class_shift_flag"),
-                "cpu_to_io_shift": wait_shift.get("cpu_to_io_shift"),
-                "cpu_to_concurrency_shift": wait_shift.get("cpu_to_concurrency_shift"),
-                "interpretation": wait_shift.get("interpretation") or "No material wait-class shift detected.",
-            }
+    lines.extend(["", _section_heading("AWR DBA Recommendations", informational=True), ""])
+    rec_rows = structured_awr.get("dba_recommendations") if isinstance(structured_awr.get("dba_recommendations"), list) else []
+    if rec_rows:
+        lines.append(_render_table(rec_rows, ["Priority", "Recommendation", "Reason"]))
+    else:
+        lines.append("No AWR-specific recommendations were generated.")
+
+    lines.extend(["", _section_heading("AWR Confidence / Coverage Notes", informational=True), ""])
+    confidence_rows = structured_awr.get("confidence_coverage") if isinstance(structured_awr.get("confidence_coverage"), list) else []
+    if confidence_rows:
+        lines.append(_render_table(confidence_rows, ["Item", "Value"]))
+    else:
+        confidence_fallback = [
+            {"Item": "AWR mode", "Value": "structured DBA_HIST comparison"},
+            {"Item": "Current window quality", "Value": snapshot_quality.get("window_quality") or "LOW"},
+            {"Item": "Confidence", "Value": historical_confidence.get("confidence_level") or snapshot_quality.get("confidence") or "LOW"},
         ]
-        if should_collapse_unavailable_awr_table(
-            wait_summary_rows,
-            ["previous_dominant_wait_class", "current_dominant_wait_class", "previous_top_event", "current_top_event"],
-        ):
-            if single_window_awr:
-                lines.append("AWR wait-event details were unavailable for the mapped snapshot window.")
-            else:
-                lines.append("AWR wait-class shift details were unavailable for the mapped comparison window.")
-        else:
-            lines.append(_render_table(wait_summary_rows, list(wait_summary_rows[0].keys())))
-    else:
-        lines.append("Wait-class shift evidence unavailable.")
-
-    lines.extend(["", _section_heading("SQL Activity Summary" if single_window_awr else "SQL Change Summary", informational=True), ""])
-    sql_change = _history_mapping(awr_data.get("sql_change_summary")) or _history_mapping(awr_data.get("sql_change"))
-    if sql_change:
-        sql_summary_rows = [
-            {
-                "dominant_sql_id_previous": sql_change.get("dominant_sql_id_previous"),
-                "dominant_sql_id_current": sql_change.get("dominant_sql_id_current"),
-                "dominant_sql_schema_previous": sql_change.get("dominant_sql_schema_previous") or "-",
-                "dominant_sql_schema_current": sql_change.get("dominant_sql_schema_current") or "-",
-                "dominant_sql_module_previous": sql_change.get("dominant_sql_module_previous") or "-",
-                "dominant_sql_module_current": sql_change.get("dominant_sql_module_current") or "-",
-                "dominant_sql_class_previous": sql_change.get("dominant_sql_class_previous") or "-",
-                "dominant_sql_class_current": sql_change.get("dominant_sql_class_current") or "-",
-                "sql_regression_flag": sql_change.get("sql_regression_flag"),
-                "sql_regression_severity": sql_change.get("sql_regression_severity") or "-",
-                "plan_hash_changed_flag": sql_change.get("plan_hash_changed_flag"),
-                "elapsed_per_exec_spike": sql_change.get("elapsed_per_exec_spike"),
-                "cpu_per_exec_spike": sql_change.get("cpu_per_exec_spike"),
-                "interpretation": sql_change.get("interpretation") or "-",
-            }
-        ]
-        if should_collapse_unavailable_awr_table(
-            sql_summary_rows,
-            [
-                "dominant_sql_id_previous",
-                "dominant_sql_id_current",
-                "dominant_sql_schema_previous",
-                "dominant_sql_schema_current",
-                "dominant_sql_module_previous",
-                "dominant_sql_module_current",
-            ],
-        ):
-            if single_window_awr:
-                lines.append("AWR SQL details were unavailable for the mapped snapshot window.")
-            else:
-                lines.append("AWR SQL-change details were unavailable for the mapped comparison window.")
-        else:
-            lines.append(_render_table(sql_summary_rows, list(sql_summary_rows[0].keys())))
-    else:
-        if single_window_awr:
-            lines.append("AWR SQL activity details were unavailable for this snapshot window.")
-        else:
-            lines.append("AWR SQL-change intelligence unavailable; SQL regression inferred from JSONL metric deltas when possible.")
-
-    snapshot_mapping_summary = transition_data.get("snapshot_mapping_summary")
-    lines.extend(["", _section_heading("AWR Snapshot Window", informational=True), ""])
-    window_rows: list[dict[str, Any]] = []
-    if previous_window.get("begin_snap_id") is not None:
-        window_rows.append(
-            {
-                "window": "previous",
-                "begin_snap": previous_window.get("begin_snap_id"),
-                "end_snap": previous_window.get("end_snap_id"),
-                "quality": previous_window.get("mapping_quality") or "-",
-            }
-        )
-    if current_window.get("begin_snap_id") is not None:
-        window_rows.append(
-            {
-                "window": "current",
-                "begin_snap": current_window.get("begin_snap_id"),
-                "end_snap": current_window.get("end_snap_id"),
-                "quality": current_window.get("mapping_quality") or "-",
-            }
-        )
-    if window_rows:
-        lines.append(_render_table(window_rows, ["window", "begin_snap", "end_snap", "quality"]))
-    else:
-        lines.append("AWR snapshot window mapping was unavailable.")
-
-    lines.extend(["", _section_heading("Load Profile Summary", informational=True), ""])
-    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("load_profile_summary"), list):
-        load_items = [str(row) for row in awr_report_text_summary.get("load_profile_summary", [])[:8] if str(row).strip()]
-        lines.extend(_render_awr_bullet_lines(load_items, empty="Load-profile highlights were not available for this snapshot window."))
-    elif workload_metric_rows:
-        concise = [
-            row
-            for row in awr_rows
-            if row.get("previous") != "-" or row.get("current") != "-" or row.get("delta") != "-"
-        ][:6]
-        if concise:
-            lines.append(_render_table(concise, ["metric", "previous", "current", "delta", "%delta", "significance"]))
-        else:
-            lines.append("Load-profile metrics were sparse in this mapped interval.")
-    else:
-        lines.append("Load-profile summary unavailable.")
-
-    lines.extend(["", _section_heading("Main Bottlenecks", informational=True), ""])
-    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("main_bottlenecks"), list):
-        bottlenecks = [str(item) for item in awr_report_text_summary.get("main_bottlenecks", []) if str(item).strip()]
-        lines.extend(_render_awr_bullet_lines(bottlenecks[:5], empty="Main bottleneck details were not available for this snapshot window."))
-    else:
-        interpretation = wait_shift.get("interpretation") if isinstance(wait_shift, dict) else None
-        if interpretation:
-            lines.append(f"- {interpretation}")
-        else:
-            lines.append("- Main bottleneck evidence unavailable.")
-
-    lines.extend(["", _section_heading("SQL Contributors", informational=True), ""])
-    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("sql_contributors"), list):
-        sql_lines = [str(item) for item in awr_report_text_summary.get("sql_contributors", []) if str(item).strip()]
-        lines.extend(
-            _render_awr_bullet_lines(
-                sql_lines[:5],
-                empty="SQL contributor details were not available for this snapshot window.",
-            )
-        )
-    elif sql_change:
-        dom_prev = sql_change.get("dominant_sql_id_previous") or "-"
-        dom_curr = sql_change.get("dominant_sql_id_current") or "-"
-        if dom_prev == "-" and dom_curr == "-":
-            lines.append("- SQL contributor details were not available for this snapshot window.")
-        else:
-            lines.append(f"- Dominant SQL previous/current: {dom_prev} -> {dom_curr}")
-    else:
-        lines.append("- SQL contributor evidence unavailable.")
-
-    lines.extend(["", _section_heading("Recommended Follow-up", informational=True), ""])
-    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("recommended_follow_up"), list):
-        follow_up = [str(item) for item in awr_report_text_summary.get("recommended_follow_up", []) if str(item).strip()]
-        lines.extend(_render_awr_bullet_lines(follow_up[:6], empty="No AWR-specific follow-up suggestions were generated."))
-    else:
-        lines.append("- Capture a wider AWR interval with matching ASH window if mapped sections remain sparse.")
-
-    lines.extend(["", _section_heading("AWR Interpretation Summary", informational=True), ""])
-    interpretation_items = []
-    if awr_report_text_summary.get("available") and isinstance(awr_report_text_summary.get("interpretation_summary"), list):
-        interpretation_items = [str(item) for item in awr_report_text_summary.get("interpretation_summary", []) if str(item).strip()]
-    if single_window_awr:
-        interpretation_items.append("AWR trend context is limited because previous and current runs mapped to the same snapshot window.")
-    lines.extend(
-        _render_awr_bullet_lines(
-            _dedupe_strings(interpretation_items)[:6],
-            empty="AWR interpretation summary was unavailable for this snapshot window.",
-        )
-    )
+        lines.append(_render_table(confidence_fallback, ["Item", "Value"]))
 
     lines.extend(["", _section_heading("Event Timeline", informational=True), ""])
     timeline_entries = transition_data.get("event_timeline_entries")
@@ -900,9 +895,6 @@ def render_history_answer(answer: dict[str, Any]) -> str:
         lines.append(f"- Previous window: SNAP {previous_window.get('begin_snap_id')}..{previous_window.get('end_snap_id')}")
     if not single_window_awr and current_window.get("begin_snap_id") is not None:
         lines.append(f"- Current window: SNAP {current_window.get('begin_snap_id')}..{current_window.get('end_snap_id')}")
-    if snapshot_mapping_summary and previous_window.get("begin_snap_id") is None and current_window.get("begin_snap_id") is None:
-        lines.append(f"- Snapshot mapping: {snapshot_mapping_summary}")
-
     lines.extend(["", _section_heading("Recurring Patterns", status="WARNING" if context and context.recurring_findings else "OK"), ""])
     ranked_recurring = transition_data.get("recurring_patterns_ranked") or (context.recurring_findings if context else [])
     if ranked_recurring:
@@ -943,6 +935,9 @@ def render_sql_id_deep_dive_report(deep_dive: SqlIdDeepDive) -> str:
     lock_analysis = _deep_dive_mapping(deep_dive.lock_analysis)
     ash = _deep_dive_mapping(deep_dive.ash)
     awr = _deep_dive_mapping(deep_dive.awr)
+    recommended_plan_decision = (
+        plan_analysis.get("recommended_plan_decision") if isinstance(plan_analysis.get("recommended_plan_decision"), dict) else {}
+    )
 
     wait_events = wait_profile.get("event_breakdown") if isinstance(wait_profile.get("event_breakdown"), list) else []
     plan_lines = execution_plan.get("lines") if isinstance(execution_plan.get("lines"), list) else []
@@ -1006,7 +1001,13 @@ def render_sql_id_deep_dive_report(deep_dive: SqlIdDeepDive) -> str:
         ),
         "",
         "## Plan Stability Analysis",
-        _render_sql_metric_table(plan_analysis, default_text="Plan stability evidence was unavailable."),
+        _render_sql_metric_table(
+            {k: v for k, v in plan_analysis.items() if k != "recommended_plan_decision"},
+            default_text="Plan stability evidence was unavailable.",
+        ),
+        "",
+        "## Recommended Plan Decision",
+        _render_recommended_plan_decision(recommended_plan_decision, deep_dive.sql_id),
         "",
         _render_sql_metric_table(
             {k: v for k, v in awr.items() if k not in {"plan_changes"}},
@@ -1080,6 +1081,35 @@ def _render_sql_rows(rows: list[dict[str, Any]], *, default_text: str) -> str:
     if not rows:
         return default_text
     return _render_table(rows, _infer_columns(rows, limit=8))
+
+
+def _render_recommended_plan_decision(payload: dict[str, Any], sql_id: str) -> str:
+    if not payload:
+        return "No plan recommendation possible from AWR for this SQL_ID/lookback window."
+    why_items = payload.get("why") if isinstance(payload.get("why"), list) else []
+    why_lines = [f"- {str(item).strip()}" for item in why_items if str(item).strip()]
+    return "\n".join(
+        [
+            _render_sql_metric_table(
+                {
+                    "SQL_ID": payload.get("sql_id") or sql_id,
+                    "Recommended plan": payload.get("recommended_plan"),
+                    "Current live plan": payload.get("current_live_plan"),
+                    "Dominant historical plan": payload.get("dominant_historical_plan"),
+                    "Baseline/fastest eligible plan": payload.get("baseline_fastest_eligible_plan"),
+                    "Decision": payload.get("decision"),
+                    "Confidence": payload.get("confidence"),
+                },
+                default_text="No recommendation details were generated.",
+            ),
+            "",
+            "Why:",
+            "\n".join(why_lines) if why_lines else "- No specific rationale lines were captured.",
+            "",
+            "DBA recommendation:",
+            str(payload.get("dba_recommendation") or "No DBA recommendation was captured."),
+        ]
+    )
 
 
 def _deep_dive_mapping(payload: Any) -> dict[str, Any]:
@@ -1783,41 +1813,31 @@ def _prepare_rows_for_section(section_name: str, rows: list[dict[str, Any]]) -> 
     prepared: list[dict[str, Any]] = [dict(row) for row in rows]
     if section_name == "Tablespace Usage":
         for row in prepared:
-            allocated_mb = _to_float(row.get("allocated_mb"))
-            if allocated_mb is None:
-                allocated_mb = _to_float(row.get("total_mb"))
-            used_mb = _to_float(row.get("used_mb"))
-            free_allocated_mb = _to_float(row.get("free_allocated_mb"))
-            if free_allocated_mb is None:
-                free_allocated_mb = _to_float(row.get("free_mb"))
-            allocated_pct = _to_float(row.get("allocated_used_pct"))
-            if allocated_pct is None:
-                allocated_pct = _to_float(row.get("used_pct"))
-            max_mb = _to_float(row.get("max_mb"))
-            max_pct = _to_float(row.get("max_used_pct"))
-
-            row["allocated_gb"] = _format_gb_from_mb(allocated_mb)
-            row["used_gb"] = _format_gb_from_mb(used_mb)
-            row["free_allocated_gb"] = _format_gb_from_mb(free_allocated_mb)
-            row["allocated_used_pct"] = _format_pct(allocated_pct)
-            row["max_gb"] = _format_gb_from_mb(max_mb)
-            row["max_used_pct"] = _format_pct(max_pct)
-            row["autoextensible"] = str(row.get("autoextensible") or "NO")
-
-            # Keep legacy fields for compatibility in other renderers/tests.
-            row["used_pct"] = _format_pct(allocated_pct)
-            row["used_mb"] = format_storage_value(used_mb, source_unit="mb")
-            row["free_mb"] = format_storage_value(free_allocated_mb, source_unit="mb")
-            row["total_mb"] = format_storage_value(allocated_mb, source_unit="mb")
+            pct_used = _to_float(row.get("pct_used"))
+            if pct_used is None:
+                pct_used = _to_float(row.get("used_pct"))
+            pct_free = _to_float(row.get("pct_free"))
+            row["pct_used"] = _format_pct(pct_used)
+            row["pct_free"] = _format_pct(pct_free)
+            row["used_pct"] = _format_pct(pct_used)
         return prepared
-    if section_name == "Temp Usage":
+    if section_name == "Tablespace Allocation Details":
         for row in prepared:
-            mb_used = row.get("mb_used")
-            gb_used = row.get("gb_used")
-            if _has_value(mb_used):
-                row["gb_used"] = format_storage_value(mb_used, source_unit="mb")
-            elif _has_value(gb_used):
-                row["gb_used"] = f"{_format_value(gb_used)} GB"
+            row["allocated_gb"] = _format_value(_to_float(row.get("allocated_gb")))
+            row["used_allocated_gb"] = _format_value(_to_float(row.get("used_allocated_gb")))
+            row["free_allocated_gb"] = _format_value(_to_float(row.get("free_allocated_gb")))
+            row["max_gb"] = _format_value(_to_float(row.get("max_gb")))
+            row["allocated_used_pct"] = _format_pct(_to_float(row.get("allocated_used_pct")))
+            row["max_used_pct"] = _format_pct(_to_float(row.get("max_used_pct")))
+        return prepared
+    if section_name == "Temp Tablespace Capacity":
+        for row in prepared:
+            row["temp_used_pct"] = _format_pct(_to_float(row.get("temp_used_pct")))
+        return prepared
+    if section_name == "Temp Session Consumers":
+        for row in prepared:
+            if "temp_used_mb" in row:
+                row["temp_used_mb"] = format_storage_value(row.get("temp_used_mb"), source_unit="mb")
         return prepared
     if section_name == "Memory And Configuration":
         for row in prepared:
@@ -1966,7 +1986,8 @@ def _highest_tablespace(snapshot: HealthSnapshot) -> str:
     if not snapshot.tablespaces:
         return "n/a"
     top = snapshot.tablespaces[0]
-    return f"{top.tablespace_name} {top.used_pct:.1f}%"
+    pct = top.pct_used if top.pct_used is not None else top.used_pct
+    return f"{top.tablespace_name} {float(pct or 0.0):.1f}%"
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
@@ -2026,61 +2047,206 @@ def _has_value(value: Any) -> bool:
 
 
 def render_investigation_final_report(report: InvestigationReport) -> str:
+    summary_line = str(report.summary or "").strip() or f"Ran {len(report.steps or [])} read-only SQL step(s)."
+    question_text = _coerce_problem_statement_for_render(report)
+    success_steps = [step for step in (report.steps or []) if str(step.status or "").lower() == "success"]
+    latest_step = report.steps[-1] if report.steps else None
+
     sections = [
-        "# AI Investigation Report",
+        "# AI Investigation Result",
         "",
-        "## Problem Understood",
-        report.problem_statement,
+        "## Question",
         "",
-        "## Investigation Summary",
-        report.summary,
+        question_text or "Not provided.",
         "",
-        "## Likely Cause",
-        report.likely_cause,
+        "## Summary",
         "",
-        "## Supporting Evidence",
+        summary_line,
+        "",
+        "## Result",
+        "",
+        "See SQL Evidence Collected below.",
+        "",
+        "## SQL Evidence Collected",
+        "",
     ]
-    if report.evidence:
-        sections.extend(f"- {line}" for line in report.evidence)
+    if bool(report.thread_continued) and str(report.thread_id or "").strip():
+        known_sql_ids = ", ".join((report.thread_context_summary or {}).get("known_sql_ids") or []) or "none"
+        known_tables = ", ".join((report.thread_context_summary or {}).get("known_tables") or []) or "none"
+        sections[10:10] = [
+            "Continuing previous investigation context:",
+            f"- thread_id: {report.thread_id}",
+            f"- known SQL_IDs: {known_sql_ids}",
+            f"- known tables: {known_tables}",
+            "",
+        ]
+
+    if success_steps:
+        for step in success_steps:
+            sections.extend(_render_sql_evidence_step(step))
+            sections.append("")
+    elif latest_step is not None:
+        sections.extend(["No successful SQL result was produced.", "", latest_step.result_preview or "Investigation step failed.", ""])
     else:
-        sections.append("- No strong evidence captured.")
-    sections.extend(["", "## Recommended Next Actions"])
-    sections.extend(f"- {line}" for line in (report.recommended_next_actions or ["Review the SQL steps and confirm the suspected cause."]))
-    sections.extend(["", "## SQL Steps Run"])
-    for step in report.steps:
-        sections.extend([
-            f"### Step {step.step_number}: {step.goal}",
-            "",
-            "```sql",
-            step.sql,
-            "```",
-            "",
-            step.result_preview,
-            "",
-        ])
-        sections.extend(_render_investigation_step_output(step))
+        sections.extend(["No SQL steps were executed.", ""])
+
+    correction_blocks: list[str] = []
+    for step in report.steps or []:
+        correction_lines = _render_correction_attempts(step)
+        if correction_lines:
+            correction_blocks.extend(correction_lines + [""])
+    if correction_blocks:
+        sections.extend(["## Correction Attempts", ""])
+        sections.extend(correction_blocks)
+
+    observations: list[str] = []
+    for step in report.steps or []:
+        observations.append(
+            f"Step {step.step_number} ({step.goal}): status={step.status}, rows={int(step.row_count or 0)}, result={step.result_preview}"
+        )
+        if str(step.finding or "").strip():
+            observations.append(step.finding.strip())
+    observations = _dedupe_strings(observations)
+    sections.extend(["## Observation", ""])
+    if observations:
+        sections.extend(f"- {item}" for item in observations[:12])
+    else:
+        sections.append("- No observations captured.")
+
+    sections.extend(["", "## DBA Inference", ""])
+    inference = str(report.likely_cause or "").strip()
+    sections.append(inference or "No DBA inference was produced.")
+
+    sections.extend(["", "## Evidence Source", ""])
+    sections.append(f"- Source: {str(report.evidence_source or 'SQL')}")
+    sections.append(f"- Historical context used: {str(bool(report.historical_context_used)).lower()}")
+    if isinstance(report.required_evidence_status, dict) and report.required_evidence_status:
+        completed = sum(1 for value in report.required_evidence_status.values() if bool(value))
+        total = len(report.required_evidence_status)
+        sections.append(f"- Required evidence satisfied: {completed}/{total}")
+
+    sections.extend(["", "## Confidence / Termination", ""])
+    sections.append(f"- confidence: {str(report.confidence or 'MEDIUM')}")
+    sections.append(f"- inference_confidence: {str(report.inference_confidence or report.confidence or 'MEDIUM')}")
+    sections.append(f"- termination_reason: {str(report.termination_reason or 'completed')}")
+    if int(report.sql_execution_cap or 0) > 0:
+        sections.append(f"- sql_execution_budget: {int(report.sql_execution_count or 0)}/{int(report.sql_execution_cap or 0)}")
+    if str(report.clarification_question or "").strip():
+        sections.append(f"- clarification: {report.clarification_question.strip()}")
+
+    notes = _normalize_notes_list(report.planner_notes)
+    if report.fallback_used:
+        notes.append("AI stepwise planner unavailable; fallback SQL path was used.")
+    notes = _dedupe_strings(notes)
+    if notes:
+        sections.extend(["", "## Planner Notes", ""])
+        sections.extend(f"- {line}" for line in notes)
+
     return "\n".join(sections)
+
+
+def _coerce_problem_statement_for_render(report: InvestigationReport) -> str:
+    primary = str(getattr(report, "problem_statement", "") or "").strip()
+    if primary:
+        return primary
+    for key in ("question", "prompt", "user_question"):
+        value = getattr(report, key, "")
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _render_correction_attempts(step: InvestigationStep) -> list[str]:
+    failed_attempts = _investigation_failed_attempts(step)
+    if not failed_attempts:
+        return []
+    attempts = _investigation_attempt_records(step)
+    lines: list[str] = [f"Step {step.step_number}: {step.goal}", ""]
+    for failed in failed_attempts:
+        attempt_no = int(failed.get("attempt_no") or failed.get("attempt") or 0)
+        sql = str(failed.get("sql") or "").strip()
+        error = str(failed.get("error") or "").strip()
+        repair_reason = str(failed.get("repair_reason") or "").strip()
+        repaired_sql = ""
+        for entry in attempts:
+            entry_no = int(entry.get("attempt_no") or entry.get("attempt") or 0)
+            entry_status = str(entry.get("execution_status") or entry.get("status") or "").strip().lower()
+            entry_sql = str(entry.get("sql") or "").strip()
+            if entry_no > attempt_no and entry_status == "success" and entry_sql:
+                repaired_sql = entry_sql
+                break
+        lines.append(f"Attempt {attempt_no} failed:")
+        if sql:
+            lines.extend(["SQL:", "```sql", sql, "```"])
+        if error:
+            lines.extend([f"- Error: {error}"])
+        if repair_reason:
+            lines.extend([f"- Repair reason: {repair_reason}"])
+        if repaired_sql:
+            lines.extend(["Final repaired SQL:", "```sql", repaired_sql, "```"])
+        lines.append("")
+    return lines
+
+
+def _render_sql_evidence_step(step: InvestigationStep) -> list[str]:
+    status_label = _investigation_status_label(step)
+    row_count = int(step.row_count or 0)
+    columns = [str(col) for col in (step.result_columns or []) if str(col).strip()]
+    if not columns and step.result_rows:
+        columns = [str(key) for key in list(step.result_rows[0].keys())[:8] if str(key).strip()]
+    lines: list[str] = [
+        f"### Step {step.step_number} — {step.goal or 'Investigation step'}",
+        f"Status: {status_label}",
+        f"Rows: {row_count}",
+        f"Columns: {', '.join(columns) if columns else 'none'}",
+        f"Repaired from failed attempt: {'yes' if _investigation_repair_used(step) else 'no'}",
+        "",
+        "SQL:",
+        "```sql",
+        str(step.sql or "").strip() or "-- SQL unavailable --",
+        "```",
+        "",
+        "Output:",
+    ]
+    lines.extend(_render_investigation_step_output(step))
+    return lines
+
+
+def _normalize_notes_list(notes: Any) -> list[str]:
+    if notes is None:
+        return []
+    if isinstance(notes, str):
+        text = notes.strip()
+        return [text] if text else []
+    if isinstance(notes, list):
+        return [str(item).strip() for item in notes if str(item).strip()]
+    try:
+        return [str(item).strip() for item in list(notes) if str(item).strip()]
+    except Exception:
+        text = str(notes).strip()
+        return [text] if text else []
 
 
 def _render_investigation_step_output(step: InvestigationStep) -> list[str]:
     if step.status != "success":
         return []
-    if not step.result_rows:
-        return ["No row output returned.", ""]
-    keys = _investigation_output_columns(step)
-    columns = [{"header": key, "width": 18, "key": key} for key in keys]
+    rows = _sanitize_investigation_rows(step.result_rows or [])
+    if not rows:
+        return ["Returned 0 rows.", ""]
+    clipped = rows[:INVESTIGATION_RENDER_ROW_LIMIT]
+    keys = _investigation_output_columns(step=step, rows=clipped)
+    columns = _investigation_output_column_specs(rows=clipped, keys=keys)
     lines = [
-        "**SQL Output:**",
-        "",
-        _render_scroll_pre(format_dba_table(step.result_rows, columns)),
+        _render_scroll_pre(format_dba_table(clipped, columns)),
     ]
-    if step.result_truncated:
-        lines.append(f"Displayed first {len(step.result_rows)} row(s).")
+    if step.result_truncated or int(step.row_count or 0) > len(clipped):
+        lines.append(f"Displayed first {len(clipped)} row(s); output truncated.")
     lines.append("")
     return lines
 
 
-def _investigation_output_columns(step: InvestigationStep) -> list[str]:
+def _investigation_output_columns(*, step: InvestigationStep, rows: list[dict[str, Any]]) -> list[str]:
     keys: list[str] = []
     preferred = [str(col) for col in (step.result_columns or []) if col]
     for key in preferred:
@@ -2088,7 +2254,7 @@ def _investigation_output_columns(step: InvestigationStep) -> list[str]:
             keys.append(key)
         if len(keys) >= 8:
             return keys
-    for row in step.result_rows:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         for key in row:
@@ -2099,35 +2265,259 @@ def _investigation_output_columns(step: InvestigationStep) -> list[str]:
     return keys[:8]
 
 
+def _investigation_output_column_specs(*, rows: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for key in keys:
+        header_len = len(str(key))
+        sample_values = [str((row.get(key) if isinstance(row, dict) else "") or "") for row in rows[:20]]
+        max_value_len = max([0] + [len(value) for value in sample_values])
+        width = max(10, header_len + 2, min(40, max_value_len + 2))
+        specs.append({"header": key, "width": width, "key": key})
+    return specs
+
+
+def _investigation_attempt_records(step: InvestigationStep) -> list[dict[str, Any]]:
+    attempts = step.correction_attempts if isinstance(step.correction_attempts, list) else []
+    records: list[dict[str, Any]] = []
+    for entry in attempts:
+        if hasattr(entry, "model_dump"):
+            record = entry.model_dump(mode="json")
+        elif isinstance(entry, dict):
+            record = dict(entry)
+        else:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _investigation_failed_attempts(step: InvestigationStep) -> list[dict[str, Any]]:
+    failed: list[dict[str, Any]] = []
+    for record in _investigation_attempt_records(step):
+        status = str(record.get("execution_status") or record.get("status") or "").strip().lower()
+        if status and status != "success":
+            failed.append(record)
+    return failed
+
+
+def _investigation_repair_used(step: InvestigationStep) -> bool:
+    return bool(_investigation_failed_attempts(step))
+
+
+def _investigation_status_label(step: InvestigationStep) -> str:
+    if str(step.status or "").lower() != "success":
+        return str(step.status or "unknown")
+    if _investigation_repair_used(step):
+        return "success after repair"
+    return "success"
+
+
+def _sanitize_investigation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in row.items():
+            key = str(raw_key)
+            value = raw_value
+            if any(token in key.lower() for token in ("password", "passwd", "token", "secret", "api_key", "apikey", "private_key", "credential")):
+                cleaned[key] = "***REDACTED***"
+                continue
+            text = str(value or "")
+            text = re.sub(r"(?i)(password\s*[:=]\s*)([^,\s;]+)", r"\1***REDACTED***", text)
+            text = re.sub(r"(?i)(token\s*[:=]\s*)([^,\s;]+)", r"\1***REDACTED***", text)
+            text = re.sub(r"(?i)(secret\s*[:=]\s*)([^,\s;]+)", r"\1***REDACTED***", text)
+            cleaned[key] = text if isinstance(value, str) else value
+        sanitized.append(cleaned)
+    return sanitized
+
+
 def render_remediation_card_markdown(proposal: RemediationProposal | None, review: RemediationReview | dict[str, Any] | None = None) -> str:
     if proposal is None:
         return "No remediation proposed for the current analysis."
-    parsed_review: RemediationReview | None = None
-    if isinstance(review, RemediationReview):
-        parsed_review = review
-    elif isinstance(review, dict):
-        try:
-            parsed_review = RemediationReview.model_validate(review)
-        except Exception:
-            parsed_review = None
+    review_data = _review_to_dict(review)
+    sql = _normalized_sql_command(proposal.execution_sql or proposal.sql)
+    safety_level = _proposal_safety_level(proposal)
+    severity = _proposal_severity(proposal)
+    approval = "required" if safety_level == "high_risk" else "not_required"
+    failed_rows, passed_rows = _guardrail_detail_rows_from_review(review_data)
+    decision_status = _guardrail_decision_status(review_data, failed_rows)
+    decision_icon = "🟢" if decision_status == "approved" else "🔴"
+    evidence_rows = _render_evidence_rows(proposal)
     why_line = _remediation_why_line(proposal)
-    reviewer_line = _reviewer_decision_line(proposal, parsed_review)
-    sql = proposal.execution_sql or proposal.sql
-    risk_line = _compact_risk_line(proposal)
     lines = [
-        "## Proposed Action",
-        f"**{proposal.title}**",
+        "## Proposed Remediation",
         "",
-        "### Why it is suggested",
+        *_markdown_table(("Field", "Value"), [
+            ("title", proposal.title),
+            ("action_type", proposal.action_type),
+            ("safety_level", safety_level),
+            ("severity", severity),
+            ("guardrail_decision", f"{decision_icon} {decision_status}"),
+            ("approval", approval),
+        ]),
+        "",
+        "## Why suggested",
+        "",
         why_line,
         "",
-        "### Reviewer Decision",
-        reviewer_line,
+        "## Guardrails",
+        "",
+        *_markdown_table(("Result", "Count"), [
+            ("Passed", str(len(passed_rows))),
+            ("Failed", str(len(failed_rows))),
+        ]),
+        "",
+        "## Failed Checks",
+        "",
     ]
-    if risk_line:
-        lines.extend(["", risk_line])
-    lines.extend(["", "### SQL", "```sql", sql or "-- No executable SQL generated for this proposal.", "```"])
+    if failed_rows:
+        lines.extend(_markdown_table(("Guardrail", "Reason"), failed_rows))
+    else:
+        lines.append("No failed guardrails.")
+    lines.extend([
+        "",
+        "## Key Evidence",
+        "",
+        *_markdown_table(("Field", "Value"), evidence_rows),
+        "",
+        "## Suggested Command",
+        "```sql",
+        sql or "-- No executable SQL generated for this proposal.",
+        "```",
+    ])
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        lines.extend(
+            [
+                "",
+                "## Safety Warning",
+                "Killing the session may roll back the blocker transaction and affect application users. Validate blocker ownership before execution.",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _markdown_table(headers: tuple[str, str], rows: list[tuple[str, str]]) -> list[str]:
+    h1, h2 = headers
+    lines: list[str] = []
+    lines.append(f"| {h1} | {h2} |")
+    lines.append("|---|---|")
+    for left, right in rows:
+        lines.append(f"| {_table_escape(left)} | {_table_escape(right)} |")
+    return lines
+
+
+def _table_escape(value: str) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _guardrail_decision_status(review_data: dict[str, Any], failed_rows: list[tuple[str, str]]) -> str:
+    status = str(review_data.get("status") or "").strip().lower()
+    if status in {"approved", "rejected"}:
+        return status
+    return "rejected" if failed_rows else "approved"
+
+
+def _reviewer_decision_rows(
+    *,
+    reviewer_state: dict[str, Any],
+    source_label: str,
+    reason_value: str,
+    decision_value: str,
+    reviewer_name: str,
+    reviewer_model: str,
+) -> list[tuple[str, str]]:
+    primary_status = str(reviewer_state.get("primary_reviewer_status") or reviewer_state.get("reviewer_status") or "").strip().lower()
+    fallback_used = _display_fallback_used(reviewer_state)
+    fallback_status = str(reviewer_state.get("fallback_reviewer_status") or reviewer_state.get("reviewer_status") or "").strip().lower()
+    if fallback_used:
+        normalized_primary_status = primary_status if primary_status in {"unavailable", "timeout", "error", "failed"} else "unavailable"
+        normalized_fallback_status = fallback_status if fallback_status in {"approved", "rejected"} else "rejected"
+        fallback_icon = "🟢" if normalized_fallback_status == "approved" else "🔴"
+        return [
+            ("decision", f"{fallback_icon} fallback {normalized_fallback_status}"),
+            ("primary_reviewer", reviewer_name),
+            ("primary_status", normalized_primary_status),
+            ("fallback_reviewer", str(reviewer_state.get("fallback_reviewer_provider") or "Deterministic Guardrail Reviewer")),
+            ("fallback_decision", f"{fallback_icon} {normalized_fallback_status}"),
+            ("fallback_reason", reason_value or str(reviewer_state.get("fallback_reason") or "openai_error")),
+            ("source", source_label),
+        ]
+    rows: list[tuple[str, str]] = [
+        ("decision", decision_value),
+        ("reviewer", reviewer_name),
+        ("reviewer_model", reviewer_model or "deterministic"),
+        ("source", source_label),
+    ]
+    if reason_value:
+        rows.append(("reason", reason_value))
+    return rows
+
+
+def _review_source_label(state: dict[str, Any]) -> str:
+    fallback_used = _display_fallback_used(state)
+    primary_provider = str(state.get("primary_reviewer_provider") or "")
+    if "Deterministic Guardrail Reviewer" in primary_provider and not fallback_used:
+        return "existing_guardrails_policy_engine"
+    if fallback_used:
+        return "existing_guardrails_policy_engine + deterministic_fallback"
+    return "existing_guardrails_policy_engine + openai_reviewer"
+
+
+def _display_fallback_used(state: dict[str, Any]) -> bool:
+    if not bool(state.get("fallback_used")):
+        return False
+    primary_provider = str(state.get("primary_reviewer_provider") or "").strip().lower()
+    selected_reviewer = str(state.get("selected_reviewer") or "").strip().lower()
+    fallback_reason = str(state.get("fallback_reason") or "").strip().lower()
+    primary_status = str(state.get("primary_reviewer_status") or "").strip().lower()
+    if "deterministic guardrail reviewer" in primary_provider and fallback_reason.startswith("guardrail_precheck_"):
+        return False
+    if "chatgpt" in primary_provider or "openai" in primary_provider:
+        return True
+    if "chatgpt" in selected_reviewer or "openai" in selected_reviewer:
+        return True
+    return primary_status in {"timeout", "error", "failed", "unavailable"}
+
+
+def _guardrail_detail_rows_from_review(review_data: dict[str, Any]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    notes: list[str] = []
+    for source_key in ("reviewer_notes", "notes"):
+        source = review_data.get(source_key)
+        if isinstance(source, list):
+            notes.extend(str(item or "").strip() for item in source if str(item or "").strip())
+    passed_rows: list[tuple[str, str]] = []
+    failed_rows: list[tuple[str, str]] = []
+    for note in notes:
+        if note.startswith("guardrail_passed="):
+            raw = note.split("=", 1)[1]
+            check, sep, message = raw.partition("|")
+            passed_rows.append((check.strip() or "-", message.strip() or "-"))
+        elif note.startswith("guardrail_failed="):
+            raw = note.split("=", 1)[1]
+            check, sep, message = raw.partition("|")
+            failed_rows.append((check.strip() or "-", message.strip() or "-"))
+    if not passed_rows:
+        passed_rows = [(str(name), "-") for name in review_data.get("guardrail_checks_passed") or []]
+    if not failed_rows:
+        failed_rows = [(str(name), "-") for name in review_data.get("guardrail_checks_failed") or []]
+    return _dedupe_guardrail_rows(failed_rows), _dedupe_guardrail_rows(passed_rows)
+
+
+def _dedupe_guardrail_rows(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    deduped: dict[str, str] = {}
+    ordered: list[str] = []
+    for check, reason in rows:
+        name = str(check or "-").strip() or "-"
+        message = str(reason or "-").strip() or "-"
+        if name not in deduped:
+            deduped[name] = message
+            ordered.append(name)
+            continue
+        if deduped[name] in {"", "-", "unknown"} and message not in {"", "-", "unknown"}:
+            deduped[name] = message
+    return [(name, deduped[name]) for name in ordered]
 
 
 def _remediation_why_line(proposal: RemediationProposal) -> str:
@@ -2136,10 +2526,6 @@ def _remediation_why_line(proposal: RemediationProposal) -> str:
     target = proposal.target or {}
     sid = _coerce_int(target.get("sid"))
     sid_label = str(sid) if sid is not None else "unknown"
-    username = str(target.get("username") or "-")
-    classification = str(target.get("blocker_classification") or "unknown")
-    idle_in_tx = bool(target.get("blocker_idle_in_transaction")) or classification == "idle_in_transaction_blocker"
-    reason = "idle in transaction" if idle_in_tx else "a blocking session"
     blocked_count = _coerce_int(target.get("blocked_session_count"))
     blocked_label = str(blocked_count) if blocked_count is not None else "unknown"
     session_label = "session" if blocked_count == 1 else "sessions"
@@ -2149,44 +2535,425 @@ def _remediation_why_line(proposal: RemediationProposal) -> str:
     object_owner = str(target.get("object_owner") or "").strip()
     object_label = f"{object_owner}.{object_name}" if object_owner and object_name else object_name
     object_fragment = f" on {object_label}" if object_label else ""
-    return (
-        f"SID {sid_label} (user {username}) is {reason} and blocking {blocked_label} {session_label} "
-        f"for {wait_label} seconds{object_fragment}."
-    )
+    return f"SID {sid_label} is blocking {blocked_label} {session_label} for {wait_label} seconds{object_fragment}."
 
 
-def _reviewer_decision_line(proposal: RemediationProposal, review: RemediationReview | None) -> str:
-    if review is None:
-        return "Pending - reviewer decision not available."
-    status = str(review.status or "pending").lower()
-    if status == "approved":
-        if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
-            target = proposal.target or {}
-            classification = str(target.get("blocker_classification") or "unknown")
-            blocked_count = _coerce_int(target.get("blocked_session_count")) or 0
-            max_wait_s = _coerce_int(target.get("max_blocked_wait_seconds")) or 0
-            sustained_impact = blocked_count >= 2 or max_wait_s >= 300
-            if classification in {"application_session", "idle_in_transaction_blocker"} and sustained_impact:
-                return "Approved - guardrail checks passed for a foreground user blocker with sustained wait impact."
-        return "Approved - guardrail checks passed for the proposed remediation."
-    if status == "rejected":
-        failed = {str(item) for item in review.guardrail_checks_failed}
-        protected_failures = {
-            "target_not_protected_user",
-            "target_not_background_process",
-            "target_not_protected_maintenance_session",
-            "blocker_not_internal_or_background",
-            "protected_user",
-            "background_process",
-            "protected_maintenance_session",
-            "protected_blocker_class",
-        }
-        if failed & protected_failures:
-            return "Denied - target session is protected by guardrails."
-        return "Denied - guardrail checks failed for this remediation action."
-    if status == "not_needed":
-        return "Not needed - no reviewer action required."
-    return "Pending - reviewer decision in progress."
+def reviewer_display_name(provider: str | None, model: str | None = None) -> str:
+    provider_text = str(provider or "").strip()
+    model_text = str(model or "").strip()
+    combined = f"{provider_text} {model_text}".lower()
+    if "chatgpt" in combined or "openai" in combined or combined.startswith("gpt-"):
+        return "ChatGPT Action Reviewer"
+    if "gemini" in combined and "flash" in combined:
+        return "Gemini 2.5 Flash Agent"
+    if "deterministic" in combined:
+        return "Deterministic Guardrail Reviewer"
+    if provider_text:
+        return provider_text
+    return "Unknown Reviewer"
+
+
+def reviewer_decision_icon(status: str | None, approved: bool | None = None) -> str:
+    if approved is True:
+        return "🟢"
+    if approved is False:
+        return "🔴"
+    normalized = str(status or "").strip().lower()
+    if normalized in {"approved", "allow", "allowed", "pass", "passed", "accepted"}:
+        return "🟢"
+    if normalized in {"rejected", "denied", "blocked", "failed", "error"}:
+        return "🔴"
+    if normalized in {"pending", "running", "awaiting_review", "awaiting-review"}:
+        return "🟡"
+    if normalized in {"skipped", "unavailable", "disabled", "not_needed", "not-needed"}:
+        return "⚪"
+    return "⚪"
+
+
+def reviewer_state_fields(review: RemediationReview | dict[str, Any] | None) -> dict[str, Any]:
+    data = _review_to_dict(review)
+    provider_raw, model_raw = _review_provider_model_raw(data)
+    status_raw = str(data.get("reviewer_status") or data.get("status") or "pending").strip().lower()
+    selection_meta = _review_selection_meta(data)
+    approved_raw = data.get("reviewer_approved")
+    if approved_raw is None and "approved" in data and isinstance(data.get("approved"), bool):
+        approved_raw = data.get("approved")
+    approved = approved_raw if isinstance(approved_raw, bool) else _approved_from_status(status_raw)
+    normalized_status = _normalized_reviewer_status(status_raw, approved)
+    icon = reviewer_decision_icon(normalized_status, approved)
+    reason = str(data.get("reviewer_reason") or data.get("rationale") or "").strip()
+    passed_checks = [str(item) for item in data.get("guardrail_checks_passed") or [] if str(item).strip()]
+    failed_checks = [str(item) for item in data.get("guardrail_checks_failed") or [] if str(item).strip()]
+    guardrail_summary = str(data.get("guardrail_summary") or "").strip() or f"passed={len(passed_checks)}, failed={len(failed_checks)}"
+    fallback_reason = str(selection_meta["fallback_reason"] or "").strip()
+    fallback_used = selection_meta["fallback_used"]
+    if fallback_used is None and fallback_reason:
+        fallback_used = True
+    return {
+        "reviewer_provider_raw": provider_raw,
+        "reviewer_model_raw": model_raw,
+        "reviewer_display_name": reviewer_display_name(provider_raw, model_raw),
+        "reviewer_status": normalized_status,
+        "reviewer_approved": approved,
+        "reviewer_icon": icon,
+        "reviewer_reason": reason,
+        "guardrail_summary": guardrail_summary,
+        "reviewer_decision_label": _reviewer_decision_label(normalized_status, approved),
+        "reviewer_decision_word": _reviewer_decision_word(normalized_status, approved),
+        "reviewer_selection_requested": selection_meta["reviewer_selection_requested"],
+        "openai_api_key_present": selection_meta["openai_api_key_present"],
+        "selected_reviewer": selection_meta["selected_reviewer"],
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "primary_reviewer_provider": selection_meta["primary_reviewer_provider"],
+        "primary_reviewer_model": selection_meta["primary_reviewer_model"],
+        "primary_reviewer_status": selection_meta["primary_reviewer_status"],
+        "fallback_reviewer_provider": selection_meta["fallback_reviewer_provider"],
+        "fallback_reviewer_status": selection_meta["fallback_reviewer_status"],
+        "effective_reviewer_provider": selection_meta["effective_reviewer_provider"],
+        "effective_reviewer_status": selection_meta["effective_reviewer_status"],
+        "openai_elapsed_ms": selection_meta["openai_elapsed_ms"],
+        "openai_timeout_sec": selection_meta["openai_timeout_sec"],
+        "guardrails_passed_count": len(passed_checks),
+        "guardrails_failed_count": len(failed_checks),
+    }
+
+
+def _review_to_dict(review: RemediationReview | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(review, RemediationReview):
+        return review.model_dump(mode="json")
+    if isinstance(review, dict):
+        return dict(review)
+    return {}
+
+
+def _review_provider_model_raw(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    provider = str(data.get("reviewer_provider_raw") or data.get("reviewer_provider") or "").strip() or None
+    model = str(data.get("reviewer_model_raw") or data.get("reviewer_model") or "").strip() or None
+    notes: list[str] = []
+    for source_key in ("reviewer_notes", "notes"):
+        source = data.get(source_key)
+        if isinstance(source, list):
+            notes.extend(str(item or "").strip() for item in source if str(item or "").strip())
+    for note in notes:
+        lower = note.lower()
+        if lower.startswith("reviewer provider="):
+            value = note.split("=", 1)[1].strip()
+            if value:
+                provider = value
+        elif "reviewer provider is deterministic" in lower:
+            provider = "deterministic"
+        if lower.startswith("gemini model=") or lower.startswith("openai_model="):
+            value = note.split("=", 1)[1].strip()
+            if value:
+                model = value
+    return provider, model
+
+
+def _review_selection_meta(data: dict[str, Any]) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "reviewer_selection_requested": None,
+        "openai_api_key_present": None,
+        "selected_reviewer": "",
+        "fallback_used": None,
+        "fallback_reason": "",
+        "openai_model": "",
+        "openai_timeout_sec": None,
+        "primary_reviewer_provider": "",
+        "primary_reviewer_model": "",
+        "primary_reviewer_status": "",
+        "fallback_reviewer_provider": "",
+        "fallback_reviewer_status": "",
+        "effective_reviewer_provider": "",
+        "effective_reviewer_status": "",
+        "openai_elapsed_ms": None,
+    }
+    notes: list[str] = []
+    for source_key in ("reviewer_notes", "notes"):
+        source = data.get(source_key)
+        if isinstance(source, list):
+            notes.extend(str(item or "").strip() for item in source if str(item or "").strip())
+    for note in notes:
+        lower = note.lower()
+        if lower.startswith("reviewer_selection_requested="):
+            meta["reviewer_selection_requested"] = _to_optional_bool(note.split("=", 1)[1].strip())
+        elif lower.startswith("openai_api_key_present="):
+            meta["openai_api_key_present"] = _to_optional_bool(note.split("=", 1)[1].strip())
+        elif lower.startswith("google_api_key_present=") and meta["openai_api_key_present"] is None:
+            meta["openai_api_key_present"] = _to_optional_bool(note.split("=", 1)[1].strip())
+        elif lower.startswith("selected_reviewer="):
+            meta["selected_reviewer"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("openai_model="):
+            meta["openai_model"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("openai_timeout_sec="):
+            meta["openai_timeout_sec"] = _to_optional_float(note.split("=", 1)[1].strip())
+        elif lower.startswith("fallback_used="):
+            meta["fallback_used"] = _to_optional_bool(note.split("=", 1)[1].strip())
+        elif lower.startswith("fallback_reason="):
+            meta["fallback_reason"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("primary_reviewer_provider="):
+            meta["primary_reviewer_provider"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("primary_reviewer_model="):
+            meta["primary_reviewer_model"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("primary_reviewer_status="):
+            meta["primary_reviewer_status"] = note.split("=", 1)[1].strip().lower()
+        elif lower.startswith("fallback_reviewer_provider="):
+            meta["fallback_reviewer_provider"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("fallback_reviewer_status="):
+            meta["fallback_reviewer_status"] = note.split("=", 1)[1].strip().lower()
+        elif lower.startswith("effective_reviewer_provider="):
+            meta["effective_reviewer_provider"] = note.split("=", 1)[1].strip()
+        elif lower.startswith("effective_reviewer_status="):
+            meta["effective_reviewer_status"] = note.split("=", 1)[1].strip().lower()
+        elif lower.startswith("openai_elapsed_ms="):
+            meta["openai_elapsed_ms"] = _to_optional_int(note.split("=", 1)[1].strip())
+        elif lower.startswith("gemini_elapsed_ms=") and meta["openai_elapsed_ms"] is None:
+            meta["openai_elapsed_ms"] = _to_optional_int(note.split("=", 1)[1].strip())
+        elif lower.startswith("gemini_timeout_sec=") and meta["openai_timeout_sec"] is None:
+            meta["openai_timeout_sec"] = _to_optional_float(note.split("=", 1)[1].strip())
+    return meta
+
+
+def _to_optional_bool(raw: str) -> bool | None:
+    normalized = str(raw or "").strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    return None
+
+
+def _to_optional_int(raw: str) -> int | None:
+    try:
+        return int(float(str(raw or "").strip()))
+    except Exception:
+        return None
+
+
+def _to_optional_float(raw: str) -> float | None:
+    try:
+        return float(str(raw or "").strip())
+    except Exception:
+        return None
+
+
+def _approved_from_status(status: str) -> bool | None:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"approved", "allow", "allowed", "pass", "passed", "accepted"}:
+        return True
+    if normalized in {"rejected", "denied", "blocked", "failed", "error"}:
+        return False
+    return None
+
+
+def _normalized_reviewer_status(status: str, approved: bool | None) -> str:
+    if approved is True:
+        return "approved"
+    if approved is False and str(status or "").strip().lower() not in {"error", "failed"}:
+        return "rejected"
+    normalized = str(status or "").strip().lower()
+    if normalized:
+        return normalized
+    return "unknown"
+
+
+def _reviewer_decision_label(status: str, approved: bool | None) -> str:
+    if approved is True:
+        return "Approved"
+    if approved is False:
+        if status in {"error", "failed"}:
+            return "Reviewer error"
+        return "Rejected"
+    if status in {"pending", "running", "awaiting_review", "awaiting-review"}:
+        return "Pending"
+    if status in {"skipped", "unavailable", "disabled", "not_needed", "not-needed"}:
+        return "Skipped"
+    if status in {"error", "failed"}:
+        return "Reviewer error"
+    if status in {"approved", "allow", "allowed", "pass", "passed", "accepted"}:
+        return "Approved"
+    if status in {"rejected", "denied", "blocked"}:
+        return "Rejected"
+    return "Unknown"
+
+
+def _reviewer_decision_word(status: str, approved: bool | None) -> str:
+    label = _reviewer_decision_label(status, approved).lower()
+    return "reviewer error" if label == "reviewer error" else label
+
+
+def _proposal_action_id(proposal: RemediationProposal) -> str:
+    target = proposal.target or {}
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        return f"{proposal.action_type}:{target.get('inst_id')}:{target.get('sid')}:{target.get('serial#')}"
+    if proposal.action_type == "extend_tablespace":
+        return f"{proposal.action_type}:{target.get('tablespace_name')}"
+    return proposal.action_type
+
+
+def _proposal_safety_level(proposal: RemediationProposal) -> str:
+    target = proposal.target or {}
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        mode = str(target.get("recommendation_mode") or "").strip().lower()
+        return "high_risk" if mode == "terminate" else "medium_risk"
+    return "low_risk"
+
+
+def _proposal_severity(proposal: RemediationProposal) -> str:
+    target = proposal.target or {}
+    if proposal.action_type in {"clear_blocking_lock", "kill_session"}:
+        blocked = _coerce_int(target.get("blocked_session_count")) or 0
+        wait_s = _coerce_int(target.get("max_blocked_wait_seconds")) or 0
+        if blocked >= 2 or wait_s >= 300:
+            return "CRITICAL"
+        return "WARNING"
+    if proposal.action_type == "extend_tablespace":
+        pct = float(target.get("used_pct") or 0)
+        return "CRITICAL" if pct >= 90.0 else "WARNING"
+    return "INFO"
+
+
+def _proposal_review_status(state: dict[str, Any]) -> str:
+    primary_status = str(state.get("primary_reviewer_status") or "").strip().lower()
+    fallback_used = bool(state.get("fallback_used"))
+    fallback_status = str(state.get("fallback_reviewer_status") or "").strip().lower()
+    effective_status = str(state.get("effective_reviewer_status") or state.get("reviewer_status") or "").strip().lower()
+    if primary_status in {"timeout", "error"} and fallback_used:
+        return "fallback_approved" if fallback_status == "approved" else "fallback_rejected"
+    if primary_status in {"timeout", "error"} and not fallback_used:
+        return "review_unavailable"
+    if effective_status in {"approved", "rejected", "pending"}:
+        return effective_status
+    return state.get("reviewer_status") or "pending"
+
+
+def _normalized_sql_command(sql: str | None) -> str:
+    text = str(sql or "").strip()
+    if not text:
+        return ""
+    if not text.endswith(";"):
+        return f"{text};"
+    return text
+
+
+def _reviewer_decision_lines(state: dict[str, Any]) -> list[str]:
+    primary_provider = str(state.get("primary_reviewer_provider") or state.get("reviewer_display_name") or "Unknown Reviewer")
+    primary_model = str(state.get("primary_reviewer_model") or state.get("reviewer_model_raw") or state.get("openai_model") or "")
+    primary_status = str(state.get("primary_reviewer_status") or state.get("reviewer_status") or "pending").strip().lower()
+    fallback_used = bool(state.get("fallback_used"))
+    fallback_reason = str(state.get("fallback_reason") or "")
+    fallback_provider = str(state.get("fallback_reviewer_provider") or "Deterministic Guardrail Reviewer").strip()
+    fallback_status = str(state.get("fallback_reviewer_status") or state.get("reviewer_status") or "").strip().lower()
+    reason = str(state.get("reviewer_reason") or "").strip()
+    elapsed = state.get("openai_elapsed_ms")
+    timeout_sec = state.get("openai_timeout_sec")
+    if primary_status in {"timeout", "error"} and fallback_used:
+        icon = "🟢" if fallback_status == "approved" else "🔴"
+        lines = [
+            "- ⚪ ChatGPT reviewer unavailable",
+            f"- Primary reviewer: {primary_provider}",
+            f"- Primary reviewer model: {primary_model or '-'}",
+            f"- Fallback reviewer: {fallback_provider}",
+            f"- Fallback decision: {icon} {fallback_status or 'rejected'}",
+            f"- Fallback reason: {reason or 'ChatGPT reviewer unavailable; deterministic fallback applied.'}",
+            f"- Fallback reason code: {fallback_reason or 'openai_error'}",
+        ]
+        if elapsed is not None:
+            lines.append(f"- OpenAI elapsed ms: {elapsed}")
+        if timeout_sec is not None:
+            lines.append(f"- OpenAI timeout sec: {timeout_sec}")
+        return lines
+    if primary_status in {"timeout", "error"} and not fallback_used:
+        lines = [
+            "- ⚪ ChatGPT reviewer unavailable",
+            f"- Reviewer: {primary_provider}",
+            f"- Reviewer model: {primary_model or '-'}",
+            f"- Reason: {reason or 'Reviewer unavailable; fallback disabled.'}",
+            f"- Fallback reason code: {fallback_reason or 'openai_error'}",
+        ]
+        if elapsed is not None:
+            lines.append(f"- OpenAI elapsed ms: {elapsed}")
+        if timeout_sec is not None:
+            lines.append(f"- OpenAI timeout sec: {timeout_sec}")
+        return lines
+    decision_icon = state["reviewer_icon"]
+    decision_label = str(state["reviewer_decision_label"] or "").lower()
+    return [
+        f"- {decision_icon} {decision_label}",
+        f"- Reviewer: {primary_provider}",
+        f"- Reviewer model: {primary_model or state.get('reviewer_model_raw') or '-'}",
+        f"- Reason: {reason or 'No reviewer rationale provided.'}",
+    ]
+
+
+def _render_evidence_rows(proposal: RemediationProposal) -> list[tuple[str, str]]:
+    if proposal.action_type == "extend_tablespace":
+        target = proposal.target or {}
+        pct_used = target.get("used_pct")
+        pct_free = target.get("pct_free")
+        if pct_free in (None, "") and pct_used not in (None, ""):
+            try:
+                pct_free = round(100.0 - float(pct_used), 4)
+            except Exception:
+                pct_free = None
+        contents = str(target.get("contents") or "PERMANENT").upper()
+        allocated_mb = target.get("total_mb") if target.get("total_mb") not in (None, "") else target.get("allocated_mb")
+        free_mb = target.get("free_mb") if target.get("free_mb") not in (None, "") else target.get("free_allocated_mb")
+        allocated_gb = round(float(allocated_mb) / 1024.0, 4) if allocated_mb not in (None, "") else "unknown"
+        free_allocated_gb = round(float(free_mb) / 1024.0, 4) if free_mb not in (None, "") else "unknown"
+        max_gb = target.get("max_gb")
+        if max_gb in (None, "") and target.get("max_mb") not in (None, ""):
+            max_gb = round(float(target.get("max_mb")) / 1024.0, 4)
+        return [
+            ("tablespace_name", str(target.get("tablespace_name") or "unknown")),
+            ("pct_used", str(pct_used if pct_used not in (None, "") else "unknown")),
+            ("pct_free", str(pct_free if pct_free not in (None, "") else "unknown")),
+            ("tablespace_type", "temp" if contents == "TEMPORARY" else "permanent"),
+            ("autoextend_status", str(target.get("autoextensible") or "unknown")),
+            ("allocated_gb", str(allocated_gb)),
+            ("max_gb", str(max_gb if max_gb not in (None, "") else "unknown")),
+            ("free_allocated_gb", str(free_allocated_gb)),
+            (
+                "proposed_size_change",
+                (
+                    f"initial_gb={target.get('initial_gb') if target.get('initial_gb') not in (None, '') else 'unknown'}, "
+                    f"next_mb={target.get('next_mb') if target.get('next_mb') not in (None, '') else 'unknown'}, "
+                    f"max_gb={target.get('max_gb') if target.get('max_gb') not in (None, '') else 'unknown'}"
+                ),
+            ),
+        ]
+    if proposal.action_type not in {"clear_blocking_lock", "kill_session"}:
+        return [
+            ("rationale", str(proposal.reason_for_action or proposal.rationale or proposal.description)),
+        ]
+    target = proposal.target or {}
+    blocked_details = target.get("blocked_session_details")
+    blocked_sample = blocked_details[0] if isinstance(blocked_details, list) and blocked_details else {}
+    blocked_sid = blocked_sample.get("sid")
+    blocked_serial = blocked_sample.get("serial#")
+    object_owner = str(target.get("object_owner") or "").strip()
+    object_name = str(target.get("object_name") or "").strip()
+    object_label = f"{object_owner}.{object_name}" if object_owner and object_name else (object_name or "unknown")
+    wait_event = str(blocked_sample.get("event") or target.get("wait_event") or "unknown")
+    wait_class = str(blocked_sample.get("wait_class") or target.get("wait_class") or "unknown")
+    return [
+        ("blocked_sid", str(blocked_sid if blocked_sid is not None else "unknown")),
+        ("blocked_serial", str(blocked_serial if blocked_serial is not None else "unknown")),
+        ("blocker_sid", str(target.get("sid") if target.get("sid") is not None else "unknown")),
+        ("blocker_serial", str(target.get("serial#") if target.get("serial#") is not None else "unknown")),
+        ("blocker_inst_id", str(target.get("inst_id") if target.get("inst_id") is not None else "unknown")),
+        ("blocked_sessions", str(target.get("blocked_session_count") if target.get("blocked_session_count") is not None else "unknown")),
+        ("wait_seconds", str(target.get("max_blocked_wait_seconds") if target.get("max_blocked_wait_seconds") is not None else "unknown")),
+        ("wait_event", wait_event),
+        ("wait_class", wait_class),
+        ("blocker_user", str(target.get("username") or "-")),
+        ("blocker_program", str(target.get("program") or "-")),
+        ("blocker_module", str(target.get("module") or "-")),
+        ("blocker_classification", str(target.get("blocker_classification") or "unknown")),
+        ("idle_in_transaction", str(bool(target.get("blocker_idle_in_transaction")))),
+        ("object", object_label),
+        ("evidence_complete", str(bool(target.get("evidence_complete")))),
+    ]
 
 
 def _compact_risk_line(proposal: RemediationProposal) -> str | None:
@@ -2258,11 +3025,17 @@ def render_action_history_markdown(records: list[RemediationRecord]) -> str:
     lines = []
     for record in records[-10:][::-1]:
         icon = severity_icon("WARNING" if record.execution.status == "succeeded" else "CRITICAL")
-        review_icon = "🟢" if record.review.status == "approved" else "🔴" if record.review.status == "rejected" else "🔵"
+        review_state = reviewer_state_fields(record.review)
         rationale = record.review.rationale or "No reviewer rationale provided."
         notes = "; ".join(record.review.reviewer_notes[:2]) if record.review.reviewer_notes else "No reviewer notes."
+        passed_count = int(review_state.get("guardrails_passed_count") or 0)
+        failed_count = int(review_state.get("guardrails_failed_count") or 0)
+        status_word = "approved" if str(record.review.status).lower() == "approved" else "rejected"
+        guardrail_icon = "🟢" if status_word == "approved" else "🔴"
+        review_label = f"{guardrail_icon} Guardrails {status_word}"
         lines.append(
             f"- {icon} {record.created_at} — {record.proposal.title} — "
-            f"review={review_icon} {record.review.status} ({rationale}; {notes}) — execution={record.execution.status}"
+            f"guardrails={review_label} ({passed_count} passed/{failed_count} failed) — execution={record.execution.status} "
+            f"(details: {rationale}; {notes})"
         )
     return "\n".join(lines)

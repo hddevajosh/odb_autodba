@@ -16,14 +16,14 @@ def collect_plan_history_for_sql_id(sql_id: str) -> PlanEvidence:
     queries = [
         """
         select distinct plan_hash_value
-        from v$sql
-        where sql_id = :sql_id and plan_hash_value is not null
+        from gv$sql
+        where sql_id = :sql_id and plan_hash_value is not null and plan_hash_value <> 0
         order by plan_hash_value
         """,
         """
         select distinct plan_hash_value
         from dba_hist_sqlstat
-        where sql_id = :sql_id and plan_hash_value is not null
+        where sql_id = :sql_id and plan_hash_value is not null and plan_hash_value <> 0
         order by plan_hash_value
         """,
     ]
@@ -62,6 +62,17 @@ def collect_formatted_execution_plan(
     awr = awr or {}
     raw_plan_lines = raw_plan_lines or []
     notes: list[str] = []
+    if str(current_stats.get("sql_kind") or "").upper() == "PL_SQL_WRAPPER":
+        return FormattedPlanSection(
+            available=False,
+            source_used=None,
+            child_number=_as_int(_first_non_null(child_cursors, "child_number")),
+            plan_hash_value=_as_int(current_stats.get("plan_hash_value")),
+            format_used=None,
+            lines=[],
+            interpretation="PL/SQL wrapper detected; execution plan for wrapper is not meaningful.",
+            notes=["PLAN_UNAVAILABLE"],
+        )
 
     preferred_child = _as_int(_first_non_null(child_cursors, "child_number"))
     preferred_plan_hash = _as_int(current_stats.get("plan_hash_value"))
@@ -105,7 +116,7 @@ def collect_formatted_execution_plan(
     interpreted = _interpret_plan(raw_plan_lines=raw_plan_lines, rendered_lines=fallback_lines)
     return FormattedPlanSection(
         available=bool(fallback_lines),
-        source_used="v$sql_plan (fallback)" if fallback_lines else None,
+        source_used="gv$sql_plan (fallback)" if fallback_lines else None,
         child_number=preferred_child,
         plan_hash_value=preferred_plan_hash,
         format_used="structured fallback",

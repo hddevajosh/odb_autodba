@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from odb_autodba.frontend import gradio_app
@@ -146,7 +148,7 @@ class GradioMcpModeTests(unittest.TestCase):
         planner_mock.assert_not_called()
         self.assertIn("# Historical CPU Consumption", out[0][-1]["content"])
 
-    def test_mcp_investigation_displays_hydrated_report_when_present(self) -> None:
+    def test_mcp_investigation_displays_inline_report_text_when_present(self) -> None:
         hydrated = (
             "# AI Investigation Result\n\n"
             "## SQL Executed\n```sql\nselect 1 from dual\n```\n\n"
@@ -156,13 +158,12 @@ class GradioMcpModeTests(unittest.TestCase):
             "odb_autodba.frontend.gradio_app.submit_investigation_job", return_value={"ok": True, "job_id": "jobhydr"}
         ), patch(
             "odb_autodba.frontend.gradio_app.poll_job",
-            return_value={"status": "completed", "result": {"rendered_report": hydrated, "trace_path": "/tmp/inv.jsonl"}},
+            return_value={"status": "completed", "result": {"report_text": hydrated, "rendered_report": "OLDER", "trace_path": "/tmp/inv.jsonl"}},
         ):
             out = gradio_app._submit_investigation("What is the size of the database?", [], "prod__db__1521__pdb1")
         assistant = out[0][-1]["content"]
         self.assertIn("## SQL Executed", assistant)
-        self.assertNotIn("Compact job payload", assistant)
-        self.assertNotIn("/tmp/inv.jsonl", assistant)
+        self.assertNotIn("OLDER", assistant)
 
     def test_direct_mode_passes_db_key_to_planner(self) -> None:
         local = self._local_tuple()
@@ -223,7 +224,7 @@ class GradioMcpModeTests(unittest.TestCase):
         self.assertIn("Compact summary only", assistant)
         self.assertNotIn("No rendered report/summary was provided.", assistant)
 
-    def test_completed_job_uses_compact_json_last_resort(self) -> None:
+    def test_completed_job_uses_sanitized_message_not_raw_json_last_resort(self) -> None:
         with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
             "odb_autodba.frontend.gradio_app._message_route_for_mcp", return_value="history"
         ), patch("odb_autodba.frontend.gradio_app.submit_history_job", return_value={"ok": True, "job_id": "jobjson"}), patch(
@@ -232,8 +233,9 @@ class GradioMcpModeTests(unittest.TestCase):
         ):
             out = gradio_app._submit_message("history", [], {}, "prod__db__1521__pdb1")
         assistant = out[0][-1]["content"]
-        self.assertIn("Compact job payload", assistant)
-        self.assertIn("\"supporting_data\"", assistant)
+        self.assertIn("No rendered report or summary was provided", assistant)
+        self.assertNotIn("Compact job payload", assistant)
+        self.assertNotIn("\"supporting_data\"", assistant)
 
     def test_investigation_trace_only_shows_hydration_failure_message_not_raw_json(self) -> None:
         with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
@@ -244,9 +246,44 @@ class GradioMcpModeTests(unittest.TestCase):
         ):
             out = gradio_app._submit_investigation("What is the size of the database?", [], "prod__db__1521__pdb1")
         assistant = out[0][-1]["content"]
-        self.assertIn("hydrated report was unavailable", assistant)
+        self.assertIn("Investigation completed but inline report_text was missing.", assistant)
         self.assertIn("/tmp/trace_only.jsonl", assistant)
         self.assertNotIn("Compact job payload", assistant)
+
+    def test_investigation_completed_renders_report_from_report_path_when_inline_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            report_path = Path(td) / "investigation_jobx.md"
+            report_path.write_text("# AI Investigation Result\n\nRendered from file.", encoding="utf-8")
+            with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
+                "odb_autodba.frontend.gradio_app.submit_investigation_job", return_value={"ok": True, "job_id": "jobx"}
+            ), patch(
+                "odb_autodba.frontend.gradio_app.poll_job",
+                return_value={
+                    "status": "completed",
+                    "result": {"summary": "done", "report_path": str(report_path), "trace_path": "/tmp/inv.jsonl"},
+                },
+                ):
+                    out = gradio_app._submit_investigation("continue from previous investigation", [], "prod__db__1521__pdb1")
+        assistant = out[0][-1]["content"]
+        self.assertIn("Rendered from file.", assistant)
+        self.assertNotIn("Investigation failed.", assistant)
+
+    def test_investigation_completed_without_markdown_shows_clear_missing_export_message(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
+            "odb_autodba.frontend.gradio_app.submit_investigation_job", return_value={"ok": True, "job_id": "jobmiss"}
+        ), patch(
+            "odb_autodba.frontend.gradio_app.poll_job",
+            return_value={
+                "status": "completed",
+                "result": {"summary": "done", "trace_path": "/tmp/inv_missing.jsonl", "thread_id": "invth_abc"},
+            },
+        ):
+            out = gradio_app._submit_investigation("continue from previous investigation", [], "prod__db__1521__pdb1")
+        assistant = out[0][-1]["content"]
+        self.assertIn("Investigation completed but inline report_text was missing.", assistant)
+        self.assertIn("Trace path: `/tmp/inv_missing.jsonl`", assistant)
+        self.assertIn("Report path: `n/a`", assistant)
+        self.assertNotIn("Investigation failed.", assistant)
 
     def test_timeout_handled_cleanly(self) -> None:
         with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(

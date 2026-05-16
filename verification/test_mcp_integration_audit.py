@@ -95,6 +95,41 @@ class McpIntegrationAuditTests(unittest.TestCase):
             gradio_app._submit_message("average cpu consumption on all health reports", [], {}, "prod__db__1521__pdb1")
         planner_mock.assert_not_called()
 
+    def test_mcp_mode_fallback_disabled_does_not_call_direct_agents(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
+            "odb_autodba.frontend.gradio_app.submit_investigation_job",
+            return_value={"ok": False, "error": "backend down"},
+        ), patch(
+            "odb_autodba.frontend.gradio_app.mcp_fallback_local_enabled",
+            return_value=False,
+        ), patch(
+            "odb_autodba.frontend.gradio_app._process_user_message_with_response"
+        ) as planner_mock, patch(
+            "odb_autodba.frontend.gradio_app._investigator"
+        ) as investigator_factory:
+            out = gradio_app._submit_message("why is db slow", [], {}, "prod__db__1521__pdb1")
+        planner_mock.assert_not_called()
+        investigator_factory.assert_not_called()
+        self.assertIn("MCP job failed/unavailable", out[0][-1]["content"])
+
+    def test_mcp_mode_investigate_button_fallback_disabled_does_not_call_direct_investigator(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(
+            "odb_autodba.frontend.gradio_app.submit_investigation_job",
+            return_value={"ok": False, "error": "backend down"},
+        ), patch(
+            "odb_autodba.frontend.gradio_app.mcp_fallback_local_enabled",
+            return_value=False,
+        ), patch(
+            "odb_autodba.frontend.gradio_app._investigator"
+        ) as investigator_factory:
+            out = gradio_app._submit_investigation("why is db slow", [], "prod__db__1521__pdb1")
+        investigator_factory.assert_not_called()
+        self.assertIn("MCP job failed/unavailable", out[0][-1]["content"])
+
+    def test_live_and_historical_blocking_route_to_different_mcp_jobs(self) -> None:
+        self.assertEqual(gradio_app._message_route_for_mcp("were there any blocking locks ever?"), "history_metric_question")
+        self.assertEqual(gradio_app._message_route_for_mcp("show blocking sessions now"), "blocking_analysis")
+
 
 if __name__ == "__main__":
     unittest.main()

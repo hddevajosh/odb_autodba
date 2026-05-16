@@ -1,0 +1,320 @@
+{
+  "version": 1,
+  "generated_at": "2026-05-06T01:46:26.554959+00:00",
+  "analyzed_files": [
+    "__init__.py",
+    "__main__.py",
+    "agents/__init__.py",
+    "agents/correlation_engine.py",
+    "agents/investigation_agent.py",
+    "agents/openai_assistant.py",
+    "agents/planner_agent.py",
+    "agents/planner_tool_executor.py",
+    "agents/planner_tools.py",
+    "agents/prompts.py",
+    "agents/root_cause_engine.py",
+    "agents/symptom_evolution.py",
+    "all_in_one.py",
+    "config.py",
+    "db/__init__.py",
+    "db/ash_checks.py",
+    "db/awr_checks.py",
+    "db/connection.py",
+    "db/extended_health_checks.py",
+    "db/health_checks.py",
+    "db/investigation_sql.py",
+    "db/log_checks.py",
+    "db/logs.py",
+    "db/module_health.py",
+    "db/plan_checks.py",
+    "db/query_deep_dive.py",
+    "db/remediation_sql.py",
+    "db/running_sessions.py",
+    "db/sql_monitor.py",
+    "db/sql_text.py",
+    "frontend/__init__.py",
+    "frontend/gradio_app.py",
+    "guardrails/__init__.py",
+    "guardrails/models.py",
+    "guardrails/policy_engine.py",
+    "guardrails/rules.py",
+    "history/__init__.py",
+    "history/jsonl_service.py",
+    "history/metric_catalog.py",
+    "history/service.py",
+    "host/__init__.py",
+    "host/health_checks.py",
+    "mcp/__init__.py",
+    "mcp/client.py",
+    "mcp/jobs.py",
+    "mcp/server.py",
+    "migrate_runtime.py",
+    "models/__init__.py",
+    "models/schemas.py",
+    "rag/__init__.py",
+    "rag/indexer.py",
+    "rag/investigation_trace_store.py",
+    "rag/retriever.py",
+    "rag/trace_store.py",
+    "runtime_migration.py",
+    "runtime_paths.py",
+    "services/__init__.py",
+    "services/autodba_service.py",
+    "target_registry.py",
+    "tools/__init__.py",
+    "tools/action_executor.py",
+    "tools/action_history.py",
+    "tools/action_proposals.py",
+    "tools/action_reviewer.py",
+    "utils/__init__.py",
+    "utils/env_loader.py",
+    "utils/formatter.py",
+    "utils/oracle_env.py",
+    "utils/report_normalizer.py",
+    "utils/severity.py",
+    "utils/sql_analysis.py"
+  ],
+  "not_analyzed_files": [
+    {
+      "path": "README.md",
+      "reason": "other"
+    },
+    {
+      "path": "agent.md",
+      "reason": "other"
+    },
+    {
+      "path": "odb_autodba.egg-info/SOURCES.txt",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "odb_autodba.egg-info/dependency_links.txt",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "odb_autodba.egg-info/entry_points.txt",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "odb_autodba.egg-info/requires.txt",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "odb_autodba.egg-info/top_level.txt",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "pyproject.toml",
+      "reason": "other"
+    },
+    {
+      "path": "verification/test_all_in_one.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_awr_history_mapping.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_connection_settings.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_connection_target_routing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_correlation_engine.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_dynamic_target_ui.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_formatter_section_aware.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_button_styles.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_full_mcp_routing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_layout_parity.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_mcp_mode.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_recent_jobs.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_gradio_target_selector.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_hardening_audit.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_health_hotspots.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_history_dedupe.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_history_metric_questions.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_history_metric_routing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_history_state_diff.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_host_check_scope.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_index_status.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_indexer_metric_baselines.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_investigation_hydration.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_investigation_rendering.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_job_concurrency.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_job_dedup.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_job_retention.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_mcp_client.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_mcp_integration_audit.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_mcp_jobs.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_mcp_server.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_oracle_target_config.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_pg_pattern_parity.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_planner_active_sessions.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_planner_health_failure_diagnostics.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_planner_trace_metadata.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_remediation_actions.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_root_cause_engine.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_runtime_migration.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_runtime_paths.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_secret_redaction.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_service_layer.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_smoke.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_sql_id_deep_dive.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_sql_id_mcp_routing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_sql_id_routing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_ssh_host_checks.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_storage_sizing.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_target_registry.py",
+      "reason": "codeboardingignore"
+    },
+    {
+      "path": "verification/test_trace_isolation.py",
+      "reason": "codeboardingignore"
+    }
+  ],
+  "summary": {
+    "total_files": 129,
+    "analyzed": 71,
+    "not_analyzed": 58,
+    "not_analyzed_by_reason": {
+      "other": 3,
+      "codeboardingignore": 55
+    }
+  }
+}

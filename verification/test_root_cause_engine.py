@@ -130,11 +130,12 @@ class RootCauseEngineTests(unittest.TestCase):
         rc = infer_root_cause(mode="health", summary="x", supporting_data=supporting, rendered_report="ORA-01653 unable to extend table")
         self.assertEqual(rc.get("category"), "storage_or_alert_error")
 
-    def test_historical_recurrence_only_when_no_stronger_signal(self) -> None:
+    def test_historical_recurrence_without_current_evidence_is_not_active_root_cause(self) -> None:
         supporting = _base_supporting()
         supporting["state_transition"]["recurring_patterns_ranked"] = ["same warning repeatedly"]
         rc = infer_root_cause(mode="history", summary="x", supporting_data=supporting, rendered_report="# report")
-        self.assertEqual(rc.get("category"), "historical_recurrence")
+        self.assertEqual(rc.get("category"), "inconclusive")
+        self.assertTrue(any("historical_not_current" in str(item).lower() for item in (rc.get("supporting_evidence") or [])))
 
     def test_inconclusive_when_evidence_weak(self) -> None:
         rc = infer_root_cause(mode="health", summary="", supporting_data={}, rendered_report="")

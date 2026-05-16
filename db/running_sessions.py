@@ -2,206 +2,202 @@ from __future__ import annotations
 
 from typing import Any
 
-from odb_autodba.db.connection import fetch_all
+from odb_autodba.db.connection import fetch_all, fetch_one
 from odb_autodba.models.schemas import BlockingChain, HostProcessRow, SessionProcessCorrelationRow, SessionRow
 
 
 ACTIVE_SESSIONS_SQL = """
-select inst_id, sid, serial# as serial_num, username, status, sql_id, event, wait_class,
-       module, program, machine, seconds_in_wait, last_call_et,
-       blocking_instance, blocking_session
+select s.inst_id,
+       s.sid,
+       s.serial# as serial_num,
+       s.username,
+       s.status,
+       s.sql_id,
+       s.prev_sql_id,
+       s.module,
+       s.action,
+       s.program,
+       s.machine,
+       s.event,
+       s.wait_class,
+       s.state,
+       s.seconds_in_wait,
+       s.last_call_et,
+       s.blocking_instance,
+       s.blocking_session,
+       s.final_blocking_instance,
+       s.final_blocking_session,
+       case
+           when s.status = 'ACTIVE' and nvl(s.wait_class,'?') <> 'Idle'
+                then 'TRUE_ACTIVE_NON_IDLE'
+           when s.status = 'ACTIVE' and nvl(s.wait_class,'?') = 'Idle'
+                then 'ACTIVE_IDLE_WAITING'
+           when s.blocking_session is not null or s.final_blocking_session is not null
+                then 'BLOCKED'
+           else 'OTHER'
+       end as activity_class
+from gv$session s
+where s.type = 'USER'
+  and s.username is not null
+  and (
+       s.status = 'ACTIVE'
+       or s.blocking_session is not null
+       or s.final_blocking_session is not null
+  )
+order by
+       case
+           when s.blocking_session is not null or s.final_blocking_session is not null then 1
+           when s.status = 'ACTIVE' and nvl(s.wait_class,'?') <> 'Idle' then 2
+           when s.status = 'ACTIVE' and nvl(s.wait_class,'?') = 'Idle' then 3
+           else 4
+       end,
+       s.inst_id,
+       s.sid
+"""
+
+ACTIVE_SESSION_SUMMARY_SQL = """
+select count(*) as active_total,
+       sum(case when status='ACTIVE' and nvl(wait_class,'?') <> 'Idle' then 1 else 0 end) as true_active_non_idle,
+       sum(case when status='ACTIVE' and nvl(wait_class,'?') = 'Idle' then 1 else 0 end) as active_idle_waiting,
+       sum(case when blocking_session is not null or final_blocking_session is not null then 1 else 0 end) as blocked_sessions,
+       sum(case when state = 'ON CPU' then 1 else 0 end) as on_cpu_sessions
 from gv$session
-where type = 'USER'
+where type='USER'
   and username is not null
-  and status = 'ACTIVE'
-order by last_call_et desc
-fetch first 25 rows only
+  and (
+       status='ACTIVE'
+       or blocking_session is not null
+       or final_blocking_session is not null
+  )
 """
 
 BLOCKING_SQL = """
-with lock_map as (
-    select l.inst_id,
-           l.sid,
-           max(case when l.request = 0 then l.type end) as held_lock_type,
-           max(case when l.request = 0 then l.lmode end) as held_lock_mode,
-           max(case when l.request > 0 then l.type end) as requested_lock_type,
-           max(case when l.request > 0 then l.request end) as requested_lock_mode
-    from gv$lock l
-    group by l.inst_id, l.sid
+with blocked as (
+    select s.inst_id as blocked_inst_id,
+           s.sid as blocked_sid,
+           s.serial# as blocked_serial,
+           s.username as blocked_user,
+           s.sql_id as blocked_sql_id,
+           s.module as blocked_module,
+           s.program as blocked_program,
+           s.event as blocked_event,
+           s.wait_class as blocked_wait_class,
+           s.seconds_in_wait as blocked_seconds_in_wait,
+           s.blocking_instance as blocker_inst_id,
+           s.blocking_session as blocker_sid,
+           s.final_blocking_instance,
+           s.final_blocking_session,
+           s.row_wait_obj#,
+           s.row_wait_file#,
+           s.row_wait_block#,
+           s.row_wait_row#
+    from gv$session s
+    where s.type = 'USER'
+      and s.username is not null
+      and (s.blocking_session is not null or s.final_blocking_session is not null)
 ),
-tx_map as (
-    select t.inst_id, t.ses_addr
-    from gv$transaction t
+blocker as (
+    select s.inst_id,
+           s.sid,
+           s.serial#,
+           s.username,
+           s.sql_id,
+           s.prev_sql_id,
+           s.module,
+           s.program,
+           s.machine,
+           s.status,
+           s.event,
+           s.wait_class,
+           s.seconds_in_wait,
+           s.taddr,
+           case
+               when s.type = 'BACKGROUND'
+                    or regexp_like(nvl(s.program,'x'), '\\((DBW|CKPT|LGWR|PMON|SMON|MMON|MMNL|ARC|RVWR|CJQ|VKTM|LREG|MMAN|DBRM|GEN|DIAG|VKRM)[0-9]*\\)')
+               then 'BACKGROUND_PROCESS'
+               when s.username is null
+               then 'UNKNOWN_OR_BACKGROUND'
+               when s.status = 'INACTIVE' and s.taddr is not null
+               then 'IDLE_IN_TRANSACTION_BLOCKER'
+               else 'FOREGROUND_SESSION'
+           end as blocker_classification
+    from gv$session s
 ),
-sql_text_map as (
-    select q.inst_id, q.sql_id, max(substr(q.sql_text, 1, 200)) as sql_text_sample
-    from gv$sql q
-    where q.sql_id is not null
-    group by q.inst_id, q.sql_id
+txn as (
+    select inst_id,
+           ses_addr,
+           start_date,
+           used_ublk,
+           used_urec
+    from gv$transaction
 )
-select b.inst_id as blocked_inst_id,
-       b.sid as blocked_sid,
-       b.serial# as blocked_serial,
-       nvl(b.username, '-') as blocked_user,
-       b.status as blocked_status,
-       nvl(b.sql_id, '-') as blocked_sql_id,
-       bs.sql_text_sample as blocked_sql_text,
-       nvl(b.event, '-') as event,
-       nvl(b.wait_class, '-') as wait_class,
-       nvl(b.seconds_in_wait, 0) as seconds_in_wait,
-       b.blocking_session as blocked_blocking_session,
-       b.blocking_instance as blocked_blocking_instance,
-       b.final_blocking_session as blocked_final_blocking_session,
-       b.final_blocking_instance as blocked_final_blocking_instance,
-       nvl(b.program, '-') as blocked_program,
-       nvl(b.module, '-') as blocked_module,
-       nvl(b.machine, '-') as blocked_machine,
-       nvl(b.osuser, '-') as blocked_osuser,
-       to_char(b.logon_time, 'YYYY-MM-DD HH24:MI:SS') as blocked_logon_time,
-       nvl(b.last_call_et, 0) as blocked_last_call_et,
-       b.row_wait_obj# as blocked_row_wait_obj,
-       b.row_wait_file# as blocked_row_wait_file,
-       b.row_wait_block# as blocked_row_wait_block,
-       b.row_wait_row# as blocked_row_wait_row,
-       bp.spid as blocked_spid,
-       s.inst_id as blocker_inst_id,
-       s.sid as blocker_sid,
-       s.serial# as blocker_serial,
-       nvl(s.username, '-') as blocker_user,
-       s.status as blocker_status,
-       nvl(s.sql_id, '-') as blocker_sql_id,
-       ss.sql_text_sample as blocker_sql_text,
-       nvl(s.event, '-') as blocker_event,
-       nvl(s.wait_class, '-') as blocker_wait_class,
-       nvl(s.seconds_in_wait, 0) as blocker_seconds_in_wait,
-       s.blocking_session as blocker_blocking_session,
-       s.blocking_instance as blocker_blocking_instance,
-       s.final_blocking_session as blocker_final_blocking_session,
-       s.final_blocking_instance as blocker_final_blocking_instance,
-       nvl(s.program, '-') as blocker_program,
-       nvl(s.module, '-') as blocker_module,
-       nvl(s.machine, '-') as blocker_machine,
-       nvl(s.osuser, '-') as blocker_osuser,
-       to_char(s.logon_time, 'YYYY-MM-DD HH24:MI:SS') as blocker_logon_time,
-       nvl(s.last_call_et, 0) as blocker_last_call_et,
-       s.row_wait_obj# as blocker_row_wait_obj,
-       s.row_wait_file# as blocker_row_wait_file,
-       s.row_wait_block# as blocker_row_wait_block,
-       s.row_wait_row# as blocker_row_wait_row,
-       sp.spid as blocker_spid,
-       case when tx.ses_addr is not null then 1 else 0 end as blocker_has_transaction,
-       case
-           when tx.ses_addr is not null
-             and s.status = 'INACTIVE'
-             and nvl(s.last_call_et, 0) >= 60
-           then 1
-           else 0
-       end as blocker_idle_in_transaction,
-       lm.held_lock_type,
-       lm.held_lock_mode,
-       lm.requested_lock_type,
-       lm.requested_lock_mode,
-       count(*) over (partition by s.inst_id, s.sid, s.serial#) as blocked_session_count,
-       max(nvl(b.seconds_in_wait, 0)) over (partition by s.inst_id, s.sid, s.serial#) as max_blocked_wait_seconds,
+select b.blocked_inst_id,
+       b.blocked_sid,
+       b.blocked_serial,
+       b.blocked_user,
+       b.blocked_sql_id,
+       b.blocked_module,
+       b.blocked_program,
+       b.blocked_event as event,
+       b.blocked_wait_class as wait_class,
+       b.blocked_seconds_in_wait as seconds_in_wait,
+       nvl(b.blocker_inst_id, b.final_blocking_instance) as blocker_inst_id,
+       nvl(b.blocker_sid, b.final_blocking_session) as blocker_sid,
+       bl.serial# as blocker_serial,
+       bl.username as blocker_user,
+       bl.sql_id as blocker_sql_id,
+       bl.prev_sql_id as blocker_prev_sql_id,
+       bl.module as blocker_module,
+       bl.program as blocker_program,
+       bl.machine as blocker_machine,
+       bl.status as blocker_status,
+       bl.event as blocker_event,
+       bl.wait_class as blocker_wait_class,
+       bl.seconds_in_wait as blocker_seconds_in_wait,
+       bl.blocker_classification,
        o.owner as object_owner,
        o.object_name,
-       o.object_type
-from gv$session b
-join gv$session s
-  on s.inst_id = b.blocking_instance
- and s.sid = b.blocking_session
-left join gv$process bp
-  on bp.inst_id = b.inst_id
- and bp.addr = b.paddr
-left join gv$process sp
-  on sp.inst_id = s.inst_id
- and sp.addr = s.paddr
-left join lock_map lm
-  on lm.inst_id = s.inst_id
- and lm.sid = s.sid
-left join tx_map tx
-  on tx.inst_id = s.inst_id
- and tx.ses_addr = s.saddr
-left join sql_text_map bs
-  on bs.inst_id = b.inst_id
- and bs.sql_id = b.sql_id
-left join sql_text_map ss
-  on ss.inst_id = s.inst_id
- and ss.sql_id = s.sql_id
+       o.object_type,
+       to_char(t.start_date, 'YYYY-MM-DD HH24:MI:SS') as blocker_txn_start_date,
+       round((sysdate - t.start_date) * 24 * 60, 2) as blocker_txn_age_min,
+       t.used_ublk as blocker_undo_blocks,
+       t.used_urec as blocker_undo_records,
+       count(*) over (partition by nvl(b.blocker_inst_id, b.final_blocking_instance), nvl(b.blocker_sid, b.final_blocking_session)) as blocked_session_count,
+       max(nvl(b.blocked_seconds_in_wait, 0)) over (partition by nvl(b.blocker_inst_id, b.final_blocking_instance), nvl(b.blocker_sid, b.final_blocking_session)) as max_blocked_wait_seconds,
+       case
+           when b.blocked_seconds_in_wait >= 60
+                and b.blocked_wait_class in ('Application','Concurrency')
+                and bl.blocker_classification in ('FOREGROUND_SESSION','IDLE_IN_TRANSACTION_BLOCKER')
+           then 'CRITICAL'
+           when b.blocked_seconds_in_wait >= 10
+                and b.blocked_wait_class in ('Application','Concurrency','Configuration')
+                and nvl(bl.blocker_classification, '?') <> 'BACKGROUND_PROCESS'
+           then 'WARNING'
+           else 'INFO'
+       end as blocking_severity,
+       case
+           when b.blocked_seconds_in_wait < 10 then 'transient_or_moving_block'
+           when bl.blocker_classification = 'BACKGROUND_PROCESS' then 'background_process_not_application_blocker'
+           when b.blocked_wait_class = 'Idle' then 'idle_wait_not_blocking_pressure'
+           when bl.blocker_classification = 'IDLE_IN_TRANSACTION_BLOCKER' then 'idle_transaction_blocker'
+           else 'foreground_blocking_chain'
+       end as blocking_reason
+from blocked b
+left join blocker bl
+       on bl.inst_id = nvl(b.blocker_inst_id, b.final_blocking_instance)
+      and bl.sid = nvl(b.blocker_sid, b.final_blocking_session)
+left join txn t
+       on t.inst_id = bl.inst_id
+      and t.ses_addr = bl.taddr
 left join dba_objects o
-  on o.object_id = b.row_wait_obj#
-where b.blocking_session is not null
-order by nvl(b.seconds_in_wait, 0) desc
-"""
-
-BLOCKING_SQL_FALLBACK = """
-select b.inst_id as blocked_inst_id,
-       b.sid as blocked_sid,
-       b.serial# as blocked_serial,
-       nvl(b.username, '-') as blocked_user,
-       b.status as blocked_status,
-       nvl(b.sql_id, '-') as blocked_sql_id,
-       cast(null as varchar2(200)) as blocked_sql_text,
-       nvl(b.event, '-') as event,
-       nvl(b.wait_class, '-') as wait_class,
-       nvl(b.seconds_in_wait, 0) as seconds_in_wait,
-       b.blocking_session as blocked_blocking_session,
-       b.blocking_instance as blocked_blocking_instance,
-       cast(null as number) as blocked_final_blocking_session,
-       cast(null as number) as blocked_final_blocking_instance,
-       nvl(b.program, '-') as blocked_program,
-       nvl(b.module, '-') as blocked_module,
-       nvl(b.machine, '-') as blocked_machine,
-       nvl(b.osuser, '-') as blocked_osuser,
-       to_char(b.logon_time, 'YYYY-MM-DD HH24:MI:SS') as blocked_logon_time,
-       nvl(b.last_call_et, 0) as blocked_last_call_et,
-       b.row_wait_obj# as blocked_row_wait_obj,
-       b.row_wait_file# as blocked_row_wait_file,
-       b.row_wait_block# as blocked_row_wait_block,
-       b.row_wait_row# as blocked_row_wait_row,
-       cast(null as varchar2(20)) as blocked_spid,
-       s.inst_id as blocker_inst_id,
-       s.sid as blocker_sid,
-       s.serial# as blocker_serial,
-       nvl(s.username, '-') as blocker_user,
-       s.status as blocker_status,
-       nvl(s.sql_id, '-') as blocker_sql_id,
-       cast(null as varchar2(200)) as blocker_sql_text,
-       nvl(s.event, '-') as blocker_event,
-       nvl(s.wait_class, '-') as blocker_wait_class,
-       nvl(s.seconds_in_wait, 0) as blocker_seconds_in_wait,
-       s.blocking_session as blocker_blocking_session,
-       s.blocking_instance as blocker_blocking_instance,
-       cast(null as number) as blocker_final_blocking_session,
-       cast(null as number) as blocker_final_blocking_instance,
-       nvl(s.program, '-') as blocker_program,
-       nvl(s.module, '-') as blocker_module,
-       nvl(s.machine, '-') as blocker_machine,
-       nvl(s.osuser, '-') as blocker_osuser,
-       to_char(s.logon_time, 'YYYY-MM-DD HH24:MI:SS') as blocker_logon_time,
-       nvl(s.last_call_et, 0) as blocker_last_call_et,
-       s.row_wait_obj# as blocker_row_wait_obj,
-       s.row_wait_file# as blocker_row_wait_file,
-       s.row_wait_block# as blocker_row_wait_block,
-       s.row_wait_row# as blocker_row_wait_row,
-       cast(null as varchar2(20)) as blocker_spid,
-       cast(null as number) as blocker_has_transaction,
-       cast(null as number) as blocker_idle_in_transaction,
-       cast(null as varchar2(4)) as held_lock_type,
-       cast(null as number) as held_lock_mode,
-       cast(null as varchar2(4)) as requested_lock_type,
-       cast(null as number) as requested_lock_mode,
-       count(*) over (partition by s.inst_id, s.sid, s.serial#) as blocked_session_count,
-       max(nvl(b.seconds_in_wait, 0)) over (partition by s.inst_id, s.sid, s.serial#) as max_blocked_wait_seconds,
-       cast(null as varchar2(128)) as object_owner,
-       cast(null as varchar2(128)) as object_name,
-       cast(null as varchar2(23)) as object_type
-from gv$session b
-join gv$session s
-  on s.inst_id = b.blocking_instance
- and s.sid = b.blocking_session
-where b.blocking_session is not null
-order by nvl(b.seconds_in_wait, 0) desc
+       on o.object_id = b.row_wait_obj#
+order by
+       case
+           when b.blocked_seconds_in_wait >= 60 then 1
+           when b.blocked_seconds_in_wait >= 10 then 2
+           else 3
+       end,
+       b.blocked_seconds_in_wait desc
 """
 
 SPID_TO_SESSION_SQL = """
@@ -239,29 +235,6 @@ left join gv$session s
 left join temp_usage tu
   on tu.inst_id = s.inst_id
  and tu.session_addr = s.saddr
-where p.spid = :spid
-"""
-
-SPID_TO_SESSION_SQL_FALLBACK = """
-select p.spid,
-       p.spid as os_pid,
-       s.inst_id,
-       s.sid,
-       s.serial# as serial_num,
-       s.username,
-       s.status,
-       s.sql_id,
-       s.event,
-       s.wait_class,
-       s.module,
-       s.program,
-       s.machine,
-       s.osuser,
-       to_char(s.logon_time, 'YYYY-MM-DD HH24:MI:SS') as logon_time
-from gv$process p
-left join gv$session s
-  on s.inst_id = p.inst_id
- and s.paddr = p.addr
 where p.spid = :spid
 """
 
@@ -303,8 +276,9 @@ select * from (
     left join gv$sesstat ss
       on ss.inst_id = s.inst_id
      and ss.sid = s.sid
-    left join v$statname sn
-      on sn.statistic# = ss.statistic#
+    left join gv$statname sn
+      on sn.inst_id = ss.inst_id
+     and sn.statistic# = ss.statistic#
     where s.type = 'USER'
       and s.username is not null
       and (sn.name = 'CPU used by this session' or sn.name is null)
@@ -318,14 +292,23 @@ def get_running_sessions_inventory() -> list[SessionRow]:
     return [SessionRow(**row) for row in fetch_all(ACTIVE_SESSIONS_SQL)]
 
 
+def get_active_session_summary() -> dict[str, int]:
+    row = fetch_one(ACTIVE_SESSION_SUMMARY_SQL) or {}
+    return {
+        "active_total": _as_int(row.get("active_total")) or 0,
+        "true_active_non_idle": _as_int(row.get("true_active_non_idle")) or 0,
+        "active_idle_waiting": _as_int(row.get("active_idle_waiting")) or 0,
+        "blocked_sessions": _as_int(row.get("blocked_sessions")) or 0,
+        "on_cpu_sessions": _as_int(row.get("on_cpu_sessions")) or 0,
+    }
+
+
 def get_blocking_chains() -> list[BlockingChain]:
     rows = _fetch_blocking_rows()
     chains: list[BlockingChain] = []
     for row in rows:
         out = dict(row)
-        out["blocker_has_transaction"] = _as_bool(out.get("blocker_has_transaction"))
-        out["blocker_idle_in_transaction"] = _as_bool(out.get("blocker_idle_in_transaction"))
-        out["blocker_classification"] = _classify_blocker_session(out)
+        out["blocker_classification"] = _normalize_blocker_classification(out.get("blocker_classification"))
         out["evidence_complete"] = _is_evidence_complete(out)
         chains.append(BlockingChain(**out))
     return chains
@@ -337,10 +320,7 @@ def map_spid_to_session(spid: str | int | None) -> list[SessionProcessCorrelatio
     try:
         rows = fetch_all(SPID_TO_SESSION_SQL, {"spid": str(spid).strip()})
     except Exception:
-        try:
-            rows = fetch_all(SPID_TO_SESSION_SQL_FALLBACK, {"spid": str(spid).strip()})
-        except Exception:
-            return []
+        return []
     correlations: list[SessionProcessCorrelationRow] = []
     for row in rows:
         if row.get("sid") is None:
@@ -382,10 +362,7 @@ def _fetch_blocking_rows() -> list[dict[str, Any]]:
     try:
         return fetch_all(BLOCKING_SQL)
     except Exception:
-        try:
-            return fetch_all(BLOCKING_SQL_FALLBACK)
-        except Exception:
-            return []
+        return []
 
 
 def _is_evidence_complete(row: dict[str, Any]) -> bool:
@@ -396,43 +373,31 @@ def _is_evidence_complete(row: dict[str, Any]) -> bool:
         row.get("blocker_user"),
         row.get("blocker_program"),
         row.get("blocker_module"),
-        row.get("blocker_machine"),
         row.get("blocked_session_count"),
         row.get("max_blocked_wait_seconds"),
+        row.get("blocking_severity"),
+        row.get("blocking_reason"),
     )
     return all(value not in (None, "") for value in required)
 
 
-def _classify_blocker_session(row: dict[str, Any]) -> str:
-    user = str(row.get("blocker_user") or "").upper()
-    program = str(row.get("blocker_program") or "").lower()
-    module = str(row.get("blocker_module") or "").lower()
-    sql_text = str(row.get("blocker_sql_text") or "").lower()
-    combined = f"{program} {module} {sql_text}"
-    has_tx = bool(row.get("blocker_has_transaction"))
-    idle_in_tx = bool(row.get("blocker_idle_in_transaction"))
-
-    if user in {"SYS", "SYSTEM"} or any(token in combined for token in ("pmon", "smon", "dbw", "lgwr", "ckpt", "mmon", "reco")):
-        return "sys_or_background"
-    if any(token in combined for token in ("dbms_scheduler", "jobq", "cjq")):
-        return "dbms_scheduler"
-    if any(token in combined for token in ("rman", "dbms_stats", "datapump", "expdp", "impdp", "auto stats")):
-        return "maintenance_session"
-    if idle_in_tx and has_tx:
+def _normalize_blocker_classification(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text == "FOREGROUND_SESSION":
+        return "foreground_session"
+    if text == "IDLE_IN_TRANSACTION_BLOCKER":
         return "idle_in_transaction_blocker"
-    if any(token in combined for token in ("batch", "etl", "loader", "job")):
-        return "batch_job"
-    if user and user not in {"-", "UNKNOWN"}:
-        return "application_session"
+    if text == "BACKGROUND_PROCESS":
+        return "background_process"
+    if text == "UNKNOWN_OR_BACKGROUND":
+        return "unknown_or_background"
     return "unknown"
 
 
-def _as_bool(value: Any) -> bool | None:
+def _as_int(value: Any) -> int | None:
     if value is None:
         return None
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y"}:
-        return True
-    if text in {"0", "false", "no", "n"}:
-        return False
-    return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None

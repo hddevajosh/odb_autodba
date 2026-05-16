@@ -11,6 +11,7 @@ from odb_autodba.db.log_checks import collect_alert_error_summary, collect_liste
 from odb_autodba.db.module_health import summarize_modules
 from odb_autodba.db.plan_checks import collect_plan_evidence_for_top_sql
 from odb_autodba.db.running_sessions import (
+    get_active_session_summary,
     get_blocking_chains,
     get_running_sessions_inventory,
     get_top_session_resource_candidates,
@@ -42,21 +43,37 @@ from odb_autodba.models.schemas import (
 
 
 INSTANCE_SQL = """
-select i.instance_name, i.host_name, i.version,
+select i.inst_id,
+       d.name as db_name,
+       d.db_unique_name,
+       d.open_mode,
+       d.database_role,
+       d.log_mode,
+       d.platform_name,
+       i.instance_name,
+       i.host_name,
+       i.status as instance_status,
+       i.thread# as thread,
+       i.parallel,
+       i.version,
        to_char(i.startup_time, 'YYYY-MM-DD HH24:MI:SS') as startup_time,
-       d.name as db_name, d.db_unique_name, d.open_mode, d.database_role, d.platform_name,
        case when exists (select 1 from gv$instance having count(*) > 1) then 1 else 0 end as rac_enabled,
        d.cdb
-from v$instance i cross join v$database d
+from v$database d
+cross join gv$instance i
+order by i.inst_id
 """
 
 SESSION_SUMMARY_SQL = """
 select count(*) as total_sessions,
-       sum(case when status = 'ACTIVE' then 1 else 0 end) as active_sessions,
+       sum(case when status = 'ACTIVE' then 1 else 0 end) as active_total,
        sum(case when status = 'INACTIVE' then 1 else 0 end) as inactive_sessions,
        sum(case when username is not null then 1 else 0 end) as user_sessions,
-       sum(case when blocking_session is not null then 1 else 0 end) as blocked_sessions,
-       count(distinct case when blocking_session is not null then blocking_session end) as blocking_sessions,
+       sum(case when status='ACTIVE' and nvl(wait_class,'?') <> 'Idle' then 1 else 0 end) as true_active_non_idle,
+       sum(case when status='ACTIVE' and nvl(wait_class,'?') = 'Idle' then 1 else 0 end) as active_idle_waiting,
+       sum(case when blocking_session is not null or final_blocking_session is not null then 1 else 0 end) as blocked_sessions,
+       count(distinct case when blocking_session is not null or final_blocking_session is not null then nvl(blocking_session, final_blocking_session) end) as blocking_sessions,
+       sum(case when state = 'ON CPU' then 1 else 0 end) as on_cpu_sessions,
        sum(case when status='ACTIVE' and last_call_et > 3600 then 1 else 0 end) as long_running_sessions
 from gv$session
 where type='USER'
@@ -72,8 +89,8 @@ fetch first 10 rows only
 """
 
 TOP_WAITS_SQL = """
-select event, total_waits, round(time_waited_micro/1e6,3) as time_waited_s, wait_class
-from v$system_event
+select inst_id, event, total_waits, round(time_waited_micro/1e6,3) as time_waited_s, wait_class
+from gv$system_event
 where wait_class <> 'Idle'
 order by time_waited_micro desc
 fetch first 10 rows only
@@ -101,15 +118,16 @@ from (
            s.rows_processed,
            round(s.rows_processed/nullif(s.executions,0),3) as rows_processed_per_exec,
            to_char(v.last_active_time, 'YYYY-MM-DD HH24:MI:SS') as last_active_time
-    from v$sqlstats s
+    from gv$sqlstats s
     left join (
-        select sql_id,
+        select inst_id,
+               sql_id,
                max(parsing_schema_name) as parsing_schema_name,
                max(module) as module,
                max(last_active_time) as last_active_time
-        from v$sql
-        group by sql_id
-    ) v on v.sql_id = s.sql_id
+        from gv$sql
+        group by inst_id, sql_id
+    ) v on v.sql_id = s.sql_id and v.inst_id = s.inst_id
     left join (
         select sql_id,
                max(username) as username,
@@ -148,15 +166,16 @@ from (
            s.rows_processed,
            round(s.rows_processed/nullif(s.executions,0),3) as rows_processed_per_exec,
            to_char(v.last_active_time, 'YYYY-MM-DD HH24:MI:SS') as last_active_time
-    from v$sqlstats s
+    from gv$sqlstats s
     left join (
-        select sql_id,
+        select inst_id,
+               sql_id,
                max(parsing_schema_name) as parsing_schema_name,
                max(module) as module,
                max(last_active_time) as last_active_time
-        from v$sql
-        group by sql_id
-    ) v on v.sql_id = s.sql_id
+        from gv$sql
+        group by inst_id, sql_id
+    ) v on v.sql_id = s.sql_id and v.inst_id = s.inst_id
     left join (
         select sql_id,
                max(username) as username,
@@ -177,15 +196,15 @@ LEGACY_TOP_SQL_ELAPSED_SQL = """
 select * from (
   select s.sql_id, s.plan_hash_value,
          (select max(q.parsing_schema_name)
-          from v$sql q
+          from gv$sql q
           where q.sql_id = s.sql_id) as parsing_schema_name,
          (select max(q.module)
-          from v$sql q
+          from gv$sql q
           where q.sql_id = s.sql_id) as module,
          round(s.elapsed_time/1e6,3) as elapsed_s,
          round(s.cpu_time/1e6,3) as cpu_s,
          s.buffer_gets, s.disk_reads, s.executions, s.rows_processed
-  from v$sqlstats s
+  from gv$sqlstats s
   where s.sql_id is not null
   order by s.elapsed_time desc
 ) where rownum <= :lim
@@ -195,68 +214,47 @@ LEGACY_TOP_SQL_CPU_SQL = """
 select * from (
   select s.sql_id, s.plan_hash_value,
          (select max(q.parsing_schema_name)
-          from v$sql q
+          from gv$sql q
           where q.sql_id = s.sql_id) as parsing_schema_name,
          (select max(q.module)
-          from v$sql q
+          from gv$sql q
           where q.sql_id = s.sql_id) as module,
          round(s.elapsed_time/1e6,3) as elapsed_s,
          round(s.cpu_time/1e6,3) as cpu_s,
          s.buffer_gets, s.disk_reads, s.executions, s.rows_processed
-  from v$sqlstats s
+  from gv$sqlstats s
   where s.sql_id is not null
   order by s.cpu_time desc
 ) where rownum <= :lim
 """
 
 TABLESPACE_SQL = """
-with file_alloc as (
-    select tablespace_name,
-           round(sum(bytes) / 1024 / 1024, 2) as allocated_mb,
-           round(sum(case when autoextensible = 'YES' and maxbytes > bytes then maxbytes else bytes end) / 1024 / 1024, 2) as max_mb,
-           sum(case when autoextensible = 'YES' then 1 else 0 end) as autoext_count
-    from dba_data_files
-    group by tablespace_name
-),
-usage_metrics as (
-    select tablespace_name,
-           round(used_percent, 2) as allocated_used_pct,
-           round(used_space * 8, 2) as used_mb
-    from dba_tablespace_usage_metrics
-)
-select t.tablespace_name,
-       nvl(u.allocated_used_pct, 0) as used_pct,
-       a.allocated_mb as allocated_mb,
-       nvl(u.used_mb, round(nvl(a.allocated_mb, 0) * (nvl(u.allocated_used_pct, 0) / 100), 2)) as used_mb,
-       round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_allocated_mb,
-       nvl(u.allocated_used_pct, 0) as allocated_used_pct,
-       a.max_mb as max_mb,
-       round(greatest(nvl(a.max_mb, nvl(a.allocated_mb, 0)) - nvl(u.used_mb, 0), 0), 2) as max_free_mb,
-       case
-           when nvl(a.max_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.max_mb) * 100, 2)
-           when nvl(a.allocated_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.allocated_mb) * 100, 2)
-           else null
-       end as max_used_pct,
-       case when nvl(a.autoext_count, 0) > 0 then 'YES' else 'NO' end as autoextensible,
-       round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_mb,
-       a.allocated_mb as total_mb,
-       t.contents,
-       t.bigfile
-from dba_tablespaces t
-left join file_alloc a on a.tablespace_name = t.tablespace_name
-left join usage_metrics u on u.tablespace_name = t.tablespace_name
-where t.contents <> 'TEMPORARY'
-order by nvl(u.allocated_used_pct, 0) desc, t.tablespace_name
+select tablespace_name,
+       round(used_space * 100 / nullif(tablespace_size, 0), 2) as pct_used,
+       round((tablespace_size - used_space) * 100 / nullif(tablespace_size, 0), 2) as pct_free,
+       round(used_space * 100 / nullif(tablespace_size, 0), 2) as used_pct
+from dba_tablespace_usage_metrics
+order by pct_used desc
 """
 
 TEMP_SQL = """
-select s.username, u.sql_id, u.segtype, round(u.blocks * ts.block_size / 1024 / 1024, 2) as mb_used,
-       u.tablespace as tablespace
-from v$tempseg_usage u
-join v$session s on s.saddr = u.session_addr
-join dba_tablespaces ts on ts.tablespace_name = u.tablespace
-order by mb_used desc
-fetch first 10 rows only
+select u.inst_id,
+       s.sid,
+       s.serial# as serial_num,
+       s.username,
+       s.sql_id,
+       s.module,
+       u.tablespace,
+       round(sum(u.blocks * ts.block_size)/1024/1024,2) as temp_used_mb
+from gv$tempseg_usage u
+join gv$session s
+  on s.inst_id = u.inst_id
+ and s.saddr = u.session_addr
+join dba_tablespaces ts
+  on ts.tablespace_name = u.tablespace
+group by u.inst_id, s.sid, s.serial#, s.username, s.sql_id, s.module, u.tablespace
+order by temp_used_mb desc
+fetch first 20 rows only
 """
 
 INIT_PARAM_SQL = """
@@ -282,24 +280,46 @@ def collect_health_snapshot(db_key: str | None = None) -> HealthSnapshot:
         window_hours = _health_window_hours()
 
         instance_row = fetch_one(INSTANCE_SQL) or {}
+        mounted_physical_standby = _is_mounted_physical_standby(instance_row)
+        if mounted_physical_standby:
+            notes.append("Physical standby is mounted; primary-style SQL/cache/active-session RCA checks are skipped.")
         summary_row = fetch_one(SESSION_SUMMARY_SQL) or {}
+        active_split = get_active_session_summary()
+        summary_row["active_total"] = active_split.get("active_total", _as_int(summary_row.get("active_total")) or 0)
+        summary_row["active_sessions"] = active_split.get("active_total", _as_int(summary_row.get("active_total")) or 0)
+        summary_row["true_active_non_idle"] = active_split.get("true_active_non_idle", 0)
+        summary_row["active_idle_waiting"] = active_split.get("active_idle_waiting", 0)
+        summary_row["blocked_sessions"] = active_split.get("blocked_sessions", _as_int(summary_row.get("blocked_sessions")) or 0)
+        summary_row["on_cpu_sessions"] = active_split.get("on_cpu_sessions", 0)
+        active_total = _as_int(summary_row.get("active_total")) or 0
+        idle_active = _as_int(summary_row.get("active_idle_waiting")) or 0
+        if active_total > 0 and idle_active >= int(round(active_total * 0.6)):
+            notes.append("Most ACTIVE sessions are idle/think-time waits; this is not database pressure.")
         wait_classes = [WaitClassSummary(**row) for row in fetch_all(WAIT_CLASS_SQL)]
         top_waits = [WaitEventRow(**row) for row in fetch_all(TOP_WAITS_SQL)]
 
-        top_elapsed = _collect_top_sql_rows(limit=10, order="elapsed", notes=notes)
-        top_cpu = _collect_top_sql_rows(limit=10, order="cpu", notes=notes)
+        if mounted_physical_standby:
+            top_elapsed = []
+            top_cpu = []
+        else:
+            top_elapsed = _collect_top_sql_rows(limit=10, order="elapsed", notes=notes)
+            top_cpu = _collect_top_sql_rows(limit=10, order="cpu", notes=notes)
 
         tablespaces = [TablespaceUsageRow(**row) for row in fetch_all(TABLESPACE_SQL)]
         temp_usage = [TempUsageRow(**row) for row in fetch_all(TEMP_SQL)]
-        active_sessions = get_running_sessions_inventory()
-        blocking = get_blocking_chains()
+        active_sessions = [] if mounted_physical_standby else get_running_sessions_inventory()
+        blocking = [] if mounted_physical_standby else get_blocking_chains()
         ora_errors = collect_alert_error_summary()
         listener_errors = collect_listener_error_summary()
-        top_session_candidates = get_top_session_resource_candidates(limit=10)
-        try:
-            current_sql_candidates = summarize_current_sql(limit=10)
-        except Exception:
+        if mounted_physical_standby:
+            top_session_candidates = []
             current_sql_candidates = []
+        else:
+            top_session_candidates = get_top_session_resource_candidates(limit=10)
+            try:
+                current_sql_candidates = summarize_current_sql(limit=10)
+            except Exception:
+                current_sql_candidates = []
 
         plan_evidence = collect_plan_evidence_for_top_sql([row.sql_id for row in top_elapsed[:5]])
         extended_sections, actionable_items, raw_evidence = collect_extended_health(window_hours=window_hours)
@@ -310,6 +330,8 @@ def collect_health_snapshot(db_key: str | None = None) -> HealthSnapshot:
             notes.append(str(host_check.get("host_check_warning")))
         raw_evidence["top_session_resource_candidates"] = top_session_candidates
         raw_evidence["current_sql_candidates"] = current_sql_candidates
+        raw_evidence["standby_mode_detected"] = mounted_physical_standby
+        raw_evidence["primary_style_checks_skipped_for_mounted_standby"] = mounted_physical_standby
 
         if host_snapshot is not None:
             host_snapshot = _correlate_host_hotspots_with_db(
@@ -463,26 +485,37 @@ def _derive_issues(snapshot: HealthSnapshot) -> list[HealthIssue]:
         )
 
     if snapshot.blocking_chains:
-        issues.append(
-            HealthIssue(
-                category="blocking",
-                title="Blocking sessions detected",
-                severity="CRITICAL",
-                description=f"Detected {len(snapshot.blocking_chains)} blocking chain(s).",
-                evidence=[f"Blocker SID {c.blocker_sid} blocking SID {c.blocked_sid}" for c in snapshot.blocking_chains[:3]],
-                recommendation="Review the blocker SQL_ID and kill only after operator confirmation.",
+        severities = [str(chain.blocking_severity or "INFO").upper() for chain in snapshot.blocking_chains]
+        issue_severity = _worst_status(severities)
+        if issue_severity in {"CRITICAL", "WARNING"}:
+            issues.append(
+                HealthIssue(
+                    category="blocking",
+                    title="Blocking sessions detected",
+                    severity=issue_severity,
+                    description=f"Detected {len(snapshot.blocking_chains)} blocking chain(s).",
+                    evidence=[
+                        f"Blocker {c.blocker_inst_id}/{c.blocker_sid} -> blocked {c.blocked_inst_id}/{c.blocked_sid}, "
+                        f"wait={c.seconds_in_wait}s, severity={c.blocking_severity}, reason={c.blocking_reason}"
+                        for c in snapshot.blocking_chains[:3]
+                    ],
+                    recommendation="Review the blocker SQL_ID and kill only after operator confirmation.",
+                )
             )
-        )
 
-    if snapshot.tablespaces and snapshot.tablespaces[0].used_pct >= 90:
+    if snapshot.tablespaces and _tablespace_pct(snapshot.tablespaces[0]) >= 85:
         ts = snapshot.tablespaces[0]
+        used_pct = _tablespace_pct(ts)
         issues.append(
             HealthIssue(
                 category="tablespace",
                 title=f"Tablespace {ts.tablespace_name} is nearly full",
-                severity="CRITICAL" if ts.used_pct >= 95 else "WARNING",
-                description=f"Tablespace usage is {ts.used_pct:.1f}%.",
-                evidence=[f"Used {ts.used_mb} MB of {ts.total_mb} MB"],
+                severity="CRITICAL" if used_pct >= 97 else "WARNING",
+                description=f"Tablespace usage is {used_pct:.2f}% (DBA_TABLESPACE_USAGE_METRICS).",
+                evidence=[
+                    f"pct_used={used_pct:.2f}",
+                    f"pct_free={_as_float(ts.pct_free) if ts.pct_free is not None else 'n/a'}",
+                ],
                 recommendation="Review growth pattern and extend storage if appropriate.",
             )
         )
@@ -524,6 +557,10 @@ def _reconcile_lock_section(snapshot: HealthSnapshot) -> None:
     blocking = snapshot.blocking_chains or []
     if not blocking:
         return
+    severities = [str(chain.blocking_severity or "INFO").upper() for chain in blocking]
+    status = _worst_status(severities)
+    if status not in {"CRITICAL", "WARNING"}:
+        status = "INFO"
     lock_section: HealthCheckSection | None = None
     for section in snapshot.health_sections:
         if section.name == "Locks And Blocking":
@@ -533,14 +570,14 @@ def _reconcile_lock_section(snapshot: HealthSnapshot) -> None:
         snapshot.health_sections.append(
             HealthCheckSection(
                 name="Locks And Blocking",
-                status="CRITICAL",
+                status=status,
                 summary=f"{len(blocking)} blocked session(s) detected.",
                 rows=[_blocking_chain_row(chain) for chain in blocking[:10]],
             )
         )
         return
-    if lock_section.status != "CRITICAL":
-        lock_section.status = "CRITICAL"
+    if lock_section.status != status:
+        lock_section.status = status
     lock_section.summary = f"{len(blocking)} blocked session(s) detected."
     if not lock_section.rows:
         lock_section.rows = [_blocking_chain_row(chain) for chain in blocking[:10]]
@@ -551,12 +588,15 @@ def _reconcile_lock_section(snapshot: HealthSnapshot) -> None:
 
 def _blocking_chain_row(chain) -> dict[str, Any]:
     return {
+        "blocked_inst_id": chain.blocked_inst_id,
         "waiter_sid": chain.blocked_sid,
         "waiter_serial": chain.blocked_serial,
         "waiter_user": chain.blocked_user,
         "waiter_sql_id": chain.blocked_sql_id,
         "waiter_event": chain.event,
+        "wait_class": chain.wait_class,
         "seconds_in_wait": chain.seconds_in_wait,
+        "blocker_inst_id": chain.blocker_inst_id,
         "blocker_sid": chain.blocker_sid,
         "blocker_serial": chain.blocker_serial,
         "blocker_user": chain.blocker_user,
@@ -565,6 +605,9 @@ def _blocking_chain_row(chain) -> dict[str, Any]:
         "blocker_module": chain.blocker_module,
         "blocker_machine": chain.blocker_machine,
         "blocker_classification": chain.blocker_classification,
+        "blocking_severity": chain.blocking_severity,
+        "blocking_reason": chain.blocking_reason,
+        "blocker_txn_age_min": chain.blocker_txn_age_min,
         "blocked_session_count": chain.blocked_session_count,
         "max_blocked_wait_seconds": chain.max_blocked_wait_seconds,
         "object_owner": chain.object_owner,
@@ -578,6 +621,12 @@ def _health_window_hours() -> int:
         return max(int(os.getenv("ODB_AUTODBA_HEALTH_WINDOW_HOURS", "24")), 1)
     except Exception:
         return 24
+
+
+def _is_mounted_physical_standby(instance_row: dict[str, Any]) -> bool:
+    role = str(instance_row.get("database_role") or "").strip().upper()
+    open_mode = str(instance_row.get("open_mode") or "").strip().upper()
+    return role == "PHYSICAL STANDBY" and open_mode == "MOUNTED"
 
 
 def _correlate_host_hotspots_with_db(
@@ -1291,6 +1340,13 @@ def _extract_tablespace_name_from_ora_1653(message: str) -> str | None:
     if not match:
         return None
     return match.group(1).upper()
+
+
+def _tablespace_pct(row: TablespaceUsageRow) -> float:
+    pct = _as_float(row.pct_used)
+    if pct is None:
+        pct = _as_float(row.used_pct)
+    return pct or 0.0
 
 
 def _apply_lock_wait_interpretation(snapshot: HealthSnapshot) -> None:

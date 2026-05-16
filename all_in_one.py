@@ -58,6 +58,13 @@ def wait_for_mcp_ready(base_url: str, timeout_seconds: float = 30.0) -> bool:
 def start_mcp_subprocess(*, python_executable: str | None = None) -> subprocess.Popen:
     exe = python_executable or sys.executable
     env = os.environ.copy()
+    LOGGER.info(
+        "mcp_subprocess_env openai_api_key_present=%s reviewer_provider=%s reviewer_model=%s reviewer_timeout_sec=%s",
+        str(bool((env.get("OPENAI_API_KEY") or "").strip())).lower(),
+        str(env.get("ODB_AUTODBA_ACTION_REVIEWER_PROVIDER") or env.get("ODB_AUTODBA_REVIEWER_PROVIDER") or "auto"),
+        str(env.get("ODB_AUTODBA_OPENAI_REVIEW_MODEL") or env.get("OPENAI_MODEL") or "gpt-5.5"),
+        str(env.get("ODB_AUTODBA_OPENAI_REVIEW_TIMEOUT_SEC") or "30"),
+    )
     return subprocess.Popen([exe, "-m", "odb_autodba.mcp.server"], env=env)
 
 
@@ -106,6 +113,13 @@ def run_all_in_one(*, launch_gradio_fn: Callable[[], None] | None = None, readin
     base_url = resolve_mcp_base_url(host, port)
     gradio_host, gradio_port = resolve_gradio_host_port()
     launch_fn = launch_gradio_fn or launch_gradio
+    LOGGER.info(
+        "all_in_one_env openai_api_key_present=%s reviewer_provider=%s reviewer_model=%s reviewer_timeout_sec=%s",
+        str(bool((os.getenv("OPENAI_API_KEY") or "").strip())).lower(),
+        str(os.getenv("ODB_AUTODBA_ACTION_REVIEWER_PROVIDER") or os.getenv("ODB_AUTODBA_REVIEWER_PROVIDER") or "auto"),
+        str(os.getenv("ODB_AUTODBA_OPENAI_REVIEW_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5.5"),
+        str(os.getenv("ODB_AUTODBA_OPENAI_REVIEW_TIMEOUT_SEC") or "30"),
+    )
 
     owned_proc: subprocess.Popen | None = None
     started_here = False

@@ -39,6 +39,12 @@ def get_exports_dir(db_key: str | None = None) -> Path:
     return path
 
 
+def get_investigations_dir(db_key: str | None = None) -> Path:
+    path = get_database_runtime_dir(db_key=db_key) / "investigations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_locks_dir(db_key: str | None = None) -> Path:
     path = get_database_runtime_dir(db_key=db_key) / "locks"
     path.mkdir(parents=True, exist_ok=True)

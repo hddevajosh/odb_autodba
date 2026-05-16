@@ -166,9 +166,11 @@ class ServiceLayerTests(unittest.TestCase):
         self.assertEqual(payload.get("actions"), ["Collect ASH deep dive", "Review blocking graph"])
         self.assertTrue(payload.get("ok"))
         rendered = payload.get("rendered_report") or ""
-        self.assertIn("# AI Investigation Report", rendered)
-        self.assertIn("## Likely Cause", rendered)
-        self.assertIn("### Step 1: Find blockers", rendered)
+        self.assertIn("# AI Investigation Result", rendered)
+        self.assertIn("## Question", rendered)
+        self.assertIn("## Summary", rendered)
+        self.assertIn("## Result", rendered)
+        self.assertIn("## Observation", rendered)
         self.assertIn("## 🔴 Root Cause Analysis", rendered)
         self.assertIn("## 🔴 Root Cause Correlation", rendered)
         self._assert_root_cause_shape(payload)
@@ -216,11 +218,79 @@ class ServiceLayerTests(unittest.TestCase):
         ), patch(
             "odb_autodba.services.autodba_service.InvestigationAgent.investigate",
         ) as investigate:
-            payload = run_ai_investigation("What is average CPU consumption on this database?", db_key="demo")
+            payload = run_ai_investigation("What is average CPU consumption history on this database over time?", db_key="demo")
         history_answer.assert_called_once()
         investigate.assert_not_called()
         self.assertEqual(payload.get("source"), "index")
         self.assertIn("Historical CPU Consumption", payload.get("rendered_report") or "")
+
+    def test_sql_id_metadata_question_does_not_route_to_history_metric_service(self) -> None:
+        report = InvestigationReport(
+            problem_statement="For SQL_ID 0m92022d1yzhs, find whether it exists in memory or AWR history, identify all tables/indexes used by the plan, show when table stats were last analyzed, and tell me if any stats look stale or missing.",
+            summary="Ran 1 logical investigation step(s) with 1 SQL execution(s).",
+            likely_cause="Collected SQL_ID metadata evidence.",
+            plan_type="inventory_read_only_lookup",
+            steps=[
+                InvestigationStep(
+                    step_number=1,
+                    goal="Check SQL_ID metadata",
+                    sql="select sql_id from v$sql where sql_id='0m92022d1yzhs'",
+                    result_preview="Returned 0 row(s).",
+                    row_count=0,
+                    status="success",
+                    result_columns=["sql_id"],
+                    result_rows=[],
+                )
+            ],
+        )
+        with patch(
+            "odb_autodba.services.autodba_service.answer_history_metric_question",
+        ) as history_answer, patch(
+            "odb_autodba.services.autodba_service.get_oracle_target",
+            return_value=self._Target("demo"),
+        ), patch(
+            "odb_autodba.services.autodba_service.InvestigationAgent.investigate",
+            return_value=report,
+        ) as investigate:
+            payload = run_ai_investigation(
+                "For SQL_ID 0m92022d1yzhs, find whether it exists in memory or AWR history, identify all tables/indexes used by the plan, show when table stats were last analyzed, and tell me if any stats look stale or missing.",
+                db_key="demo",
+            )
+        history_answer.assert_not_called()
+        investigate.assert_called_once()
+        self.assertTrue(payload.get("ok"))
+
+    def test_investigation_thread_memory_runtime_is_disabled(self) -> None:
+        report = InvestigationReport(
+            problem_statement="List all schemas and tables",
+            summary="Ran 1 logical investigation step(s) with 1 SQL execution(s).",
+            likely_cause="Collected schema/table inventory.",
+            steps=[
+                InvestigationStep(
+                    step_number=1,
+                    goal="List schemas and tables",
+                    sql="select owner, table_name from dba_tables fetch first 10 rows only",
+                    result_preview="Returned 1 row(s).",
+                    row_count=1,
+                    status="success",
+                    result_columns=["owner", "table_name"],
+                    result_rows=[{"owner": "APP", "table_name": "ORDERS"}],
+                )
+            ],
+        )
+        with patch("odb_autodba.services.autodba_service.InvestigationAgent.investigate", return_value=report), patch(
+            "odb_autodba.services.autodba_service.get_oracle_target",
+            return_value=self._Target("demo"),
+        ):
+            payload = run_ai_investigation(
+                "List all schemas and tables",
+                db_key="demo",
+                thread_id="invth_legacy",
+                continue_context=True,
+            )
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("thread_memory_enabled"), False)
+        self.assertEqual(((payload.get("supporting_data") or {}).get("thread_memory_enabled")), False)
 
     def test_run_health_check_trace_path_isolated_by_db_key(self) -> None:
         def _fake_handle(*_args, **kwargs):

@@ -59,6 +59,487 @@ INTERNAL_MARKERS = (
     "sys_context",
 )
 
+WRAPPER_PREFIX_RE = re.compile(r"^\s*(begin|declare|call)\b", flags=re.IGNORECASE)
+
+PLAN_ADVISOR_CTE_SQL = """
+with
+input_params as (
+    select
+        trim(lower(:sql_id)) as sql_id,
+        nvl(:lookback_days, 30) as lookback_days
+    from dual
+),
+hist_plan_stats as (
+    select
+        q.dbid,
+        q.instance_number,
+        q.sql_id,
+        q.plan_hash_value,
+        s.snap_id,
+        s.begin_interval_time,
+        s.end_interval_time,
+        q.executions_delta,
+        q.elapsed_time_delta,
+        q.cpu_time_delta,
+        q.buffer_gets_delta,
+        q.disk_reads_delta,
+        q.rows_processed_delta,
+        q.invalidations_delta,
+        q.version_count
+    from dba_hist_sqlstat q
+    join dba_hist_snapshot s
+      on s.snap_id = q.snap_id
+     and s.dbid = q.dbid
+     and s.instance_number = q.instance_number
+    join input_params p
+      on p.sql_id = q.sql_id
+    where q.executions_delta > 0
+      and q.plan_hash_value > 0
+      and s.begin_interval_time >= sysdate - p.lookback_days
+),
+plan_agg as (
+    select
+        sql_id,
+        plan_hash_value,
+        sum(executions_delta) as execs,
+        sum(elapsed_time_delta) as elapsed_us,
+        sum(cpu_time_delta) as cpu_us,
+        sum(buffer_gets_delta) as lio,
+        sum(disk_reads_delta) as pio,
+        sum(rows_processed_delta) as rows_processed,
+        sum(invalidations_delta) as invalidations,
+        max(version_count) as version_count_max,
+        count(distinct snap_id) as snap_count,
+        count(distinct instance_number) as inst_count,
+        min(begin_interval_time) as first_seen,
+        max(end_interval_time) as last_seen
+    from hist_plan_stats
+    group by sql_id, plan_hash_value
+),
+plan_efficiency as (
+    select
+        a.sql_id,
+        a.plan_hash_value,
+        a.execs,
+        a.elapsed_us,
+        a.cpu_us,
+        a.lio,
+        a.pio,
+        a.rows_processed,
+        a.invalidations,
+        a.version_count_max,
+        a.snap_count,
+        a.inst_count,
+        to_char(a.first_seen, 'DD-MON-YYYY HH24:MI') as first_seen,
+        to_char(a.last_seen, 'DD-MON-YYYY HH24:MI') as last_seen,
+        round(a.elapsed_us / 1000000 / nullif(a.execs, 0), 6) as avg_elapsed_s,
+        round(a.cpu_us / 1000000 / nullif(a.execs, 0), 6) as avg_cpu_s,
+        round(a.lio / nullif(a.execs, 0), 2) as avg_lio,
+        round(a.pio / nullif(a.execs, 0), 2) as avg_pio,
+        round(a.rows_processed / nullif(a.execs, 0), 2) as avg_rows,
+        round(
+            (a.cpu_us / 1000000 / nullif(a.execs, 0)) /
+            nullif((a.elapsed_us / 1000000 / nullif(a.execs, 0)), 0),
+            4
+        ) as cpu_to_elapsed_ratio
+    from plan_agg a
+),
+plan_hist_dedup as (
+    select distinct
+        p.sql_id,
+        p.plan_hash_value,
+        p.id,
+        upper(nvl(p.operation, '?')) as operation,
+        upper(nvl(p.options, '?')) as options,
+        nvl(p.cost, 0) as cost,
+        nvl(p.cardinality, 0) as cardinality,
+        nvl(p.bytes, 0) as bytes,
+        nvl(p.temp_space, 0) as temp_space
+    from dba_hist_sql_plan p
+    join input_params i
+      on i.sql_id = p.sql_id
+    where p.plan_hash_value > 0
+),
+plan_memory_risk as (
+    select
+        d.sql_id,
+        d.plan_hash_value,
+        case
+            when sum(case when d.operation like 'HASH JOIN%' then 1 else 0 end) >= 2
+              or sum(case when d.operation like 'SORT%' or d.operation like 'WINDOW%' then 1 else 0 end) >= 2
+              or sum(case when d.operation like 'TEMP TABLE TRANSFORMATION%' then 1 else 0 end) >= 1
+            then 'HIGH'
+            when sum(case when d.operation like 'HASH JOIN%' then 1 else 0 end) = 1
+              or sum(case when d.operation like 'SORT%' or d.operation like 'WINDOW%' then 1 else 0 end) = 1
+            then 'MEDIUM'
+            else 'LOW'
+        end as mem_risk,
+        'NO' as spill_risk
+    from plan_hist_dedup d
+    group by d.sql_id, d.plan_hash_value
+),
+plan_optimizer_cost as (
+    select
+        d.sql_id,
+        d.plan_hash_value,
+        max(case when d.id = 0 then d.cost end) as opt_est_cost,
+        max(case when d.id = 0 then d.cardinality end) as opt_est_cardinality,
+        max(case when d.id = 0 then d.bytes end) as opt_est_bytes,
+        max(d.temp_space) as opt_est_temp_space,
+        max(case when d.id = 0 then d.operation || nvl2(nullif(d.options, '?'), ' ' || d.options, '') end) as plan_shape
+    from plan_hist_dedup d
+    group by d.sql_id, d.plan_hash_value
+),
+eligible_plans as (
+    select
+        e.*,
+        nvl(m.mem_risk, 'MEDIUM') as mem_risk,
+        nvl(m.spill_risk, 'NO') as spill_risk,
+        nvl(c.opt_est_cost, 0) as opt_est_cost,
+        nvl(c.opt_est_cardinality, 0) as opt_est_cardinality,
+        nvl(c.opt_est_bytes, 0) as opt_est_bytes,
+        nvl(c.opt_est_temp_space, 0) as opt_est_temp_space,
+        nvl(c.plan_shape, 'UNKNOWN') as plan_shape,
+        case
+            when e.execs >= 5 and e.snap_count >= 2 then 'Y'
+            else 'N'
+        end as primary_eligible_flag,
+        case
+            when e.execs >= 2 and e.snap_count >= 1 then 'Y'
+            else 'N'
+        end as fallback_eligible_flag,
+        case
+            when e.execs < 20 or e.snap_count < 3 then 'LOW_CONFIDENCE'
+            else 'HIGH_CONFIDENCE'
+        end as confidence_level
+    from plan_efficiency e
+    left join plan_memory_risk m
+      on m.sql_id = e.sql_id
+     and m.plan_hash_value = e.plan_hash_value
+    left join plan_optimizer_cost c
+      on c.sql_id = e.sql_id
+     and c.plan_hash_value = e.plan_hash_value
+),
+baseline_elapsed_plan as (
+    select *
+    from (
+        select
+            p.*,
+            case
+                when p.primary_eligible_flag = 'Y' then 1
+                when p.fallback_eligible_flag = 'Y' then 2
+                else 9
+            end as eligibility_rank,
+            row_number() over (
+                order by
+                    case
+                        when p.primary_eligible_flag = 'Y' then 1
+                        when p.fallback_eligible_flag = 'Y' then 2
+                        else 9
+                    end,
+                    p.avg_elapsed_s asc,
+                    p.avg_cpu_s asc,
+                    p.avg_lio asc,
+                    p.avg_pio asc,
+                    p.execs desc,
+                    p.opt_est_cost asc
+            ) as rn
+        from eligible_plans p
+        where p.fallback_eligible_flag = 'Y'
+    )
+    where rn = 1
+),
+compared_to_baseline as (
+    select
+        p.sql_id,
+        p.plan_hash_value,
+        p.execs,
+        p.snap_count,
+        p.inst_count,
+        p.invalidations,
+        p.version_count_max,
+        p.avg_elapsed_s,
+        p.avg_cpu_s,
+        p.avg_lio,
+        p.avg_pio,
+        p.avg_rows,
+        p.cpu_to_elapsed_ratio,
+        p.mem_risk,
+        p.spill_risk,
+        p.opt_est_cost,
+        p.opt_est_cardinality,
+        p.opt_est_bytes,
+        p.opt_est_temp_space,
+        p.plan_shape,
+        p.confidence_level,
+        p.primary_eligible_flag,
+        p.fallback_eligible_flag,
+        p.first_seen,
+        p.last_seen,
+        b.plan_hash_value as baseline_plan_hash_value,
+        b.avg_elapsed_s as baseline_elapsed_s,
+        b.avg_cpu_s as baseline_cpu_s,
+        b.avg_lio as baseline_lio,
+        b.avg_pio as baseline_pio,
+        b.opt_est_cost as baseline_opt_est_cost,
+        b.eligibility_rank as baseline_eligibility_rank,
+        round(((p.avg_elapsed_s - b.avg_elapsed_s) / nullif(b.avg_elapsed_s, 0)) * 100, 2) as elapsed_penalty_pct,
+        round(((p.avg_cpu_s - b.avg_cpu_s) / nullif(b.avg_cpu_s, 0)) * 100, 2) as cpu_penalty_pct,
+        round(((p.avg_lio - b.avg_lio) / nullif(b.avg_lio, 0)) * 100, 2) as lio_penalty_pct,
+        round(((p.avg_pio - b.avg_pio) / nullif(b.avg_pio, 0)) * 100, 2) as pio_penalty_pct,
+        round(((p.opt_est_cost - b.opt_est_cost) / nullif(b.opt_est_cost, 0)) * 100, 2) as opt_cost_penalty_pct,
+        round(((b.avg_cpu_s - p.avg_cpu_s) / nullif(b.avg_cpu_s, 0)) * 100, 2) as cpu_saving_pct,
+        round(((b.avg_lio - p.avg_lio) / nullif(b.avg_lio, 0)) * 100, 2) as lio_saving_pct,
+        round(((b.avg_pio - p.avg_pio) / nullif(b.avg_pio, 0)) * 100, 2) as pio_saving_pct,
+        case
+            when round(((p.avg_elapsed_s - b.avg_elapsed_s) / nullif(b.avg_elapsed_s, 0)) * 100, 2) < 5 then 'BAND_0_LT5'
+            when round(((p.avg_elapsed_s - b.avg_elapsed_s) / nullif(b.avg_elapsed_s, 0)) * 100, 2) < 10 then 'BAND_1_5TO10'
+            when round(((p.avg_elapsed_s - b.avg_elapsed_s) / nullif(b.avg_elapsed_s, 0)) * 100, 2) < 20 then 'BAND_2_10TO20'
+            else 'BAND_3_GE20'
+        end as elapsed_band
+    from eligible_plans p
+    cross join baseline_elapsed_plan b
+    where p.fallback_eligible_flag = 'Y'
+),
+threshold_rules as (
+    select
+        c.*,
+        case
+            when c.plan_hash_value = c.baseline_plan_hash_value
+                then 'FASTEST_CANDIDATE'
+            when c.baseline_eligibility_rank = 2
+                then 'REJECTED_BY_THRESHOLD'
+            when c.elapsed_band = 'BAND_0_LT5'
+             and c.cpu_saving_pct >= 20
+             and (c.lio_saving_pct >= 20 or c.pio_saving_pct >= 10)
+             and c.mem_risk <> 'HIGH'
+             and c.spill_risk = 'NO'
+                then 'BALANCED_CANDIDATE'
+            when c.elapsed_band = 'BAND_1_5TO10'
+             and c.cpu_saving_pct >= 30
+             and (c.lio_saving_pct >= 25 or c.pio_saving_pct >= 20)
+             and c.mem_risk = 'LOW'
+             and c.spill_risk = 'NO'
+                then 'BALANCED_CANDIDATE'
+            when c.elapsed_band = 'BAND_2_10TO20'
+             and c.cpu_saving_pct >= 40
+             and (c.lio_saving_pct >= 35 or c.pio_saving_pct >= 30)
+             and c.mem_risk = 'LOW'
+             and c.spill_risk = 'NO'
+             and c.invalidations = 0
+                then 'BALANCED_CANDIDATE'
+            else 'REJECTED_BY_THRESHOLD'
+        end as threshold_status,
+        case
+            when c.plan_hash_value = c.baseline_plan_hash_value
+             and c.baseline_eligibility_rank = 2
+                then 'Fastest fallback-eligible plan selected because no primary-eligible plan exists'
+            when c.plan_hash_value = c.baseline_plan_hash_value
+                then 'Fastest primary-eligible plan'
+            when c.baseline_eligibility_rank = 2
+                then 'Balanced comparison skipped because only fallback eligibility exists'
+            when c.elapsed_band = 'BAND_0_LT5'
+             and c.cpu_saving_pct >= 20
+             and (c.lio_saving_pct >= 20 or c.pio_saving_pct >= 10)
+                then 'Slightly slower but materially cheaper on CPU/IO'
+            when c.elapsed_band = 'BAND_1_5TO10'
+             and c.cpu_saving_pct >= 30
+             and (c.lio_saving_pct >= 25 or c.pio_saving_pct >= 20)
+                then 'Moderately slower but substantially cheaper on CPU/IO'
+            when c.elapsed_band = 'BAND_2_10TO20'
+             and c.cpu_saving_pct >= 40
+             and (c.lio_saving_pct >= 35 or c.pio_saving_pct >= 30)
+                then 'Noticeably slower but strongly reduces system resource usage'
+            else 'Did not meet threshold rules'
+        end as threshold_reason
+    from compared_to_baseline c
+),
+ranked_candidates as (
+    select
+        t.*,
+        row_number() over (
+            order by
+                case t.threshold_status
+                    when 'BALANCED_CANDIDATE' then 1
+                    when 'FASTEST_CANDIDATE' then 2
+                    when 'REJECTED_BY_THRESHOLD' then 9
+                    else 99
+                end,
+                t.avg_elapsed_s asc,
+                t.avg_cpu_s asc,
+                t.avg_lio asc,
+                t.avg_pio asc,
+                t.execs desc,
+                t.snap_count desc,
+                t.invalidations asc,
+                t.version_count_max asc,
+                t.opt_est_cost asc,
+                case t.confidence_level
+                    when 'HIGH_CONFIDENCE' then 1
+                    else 2
+                end asc
+        ) as final_rank
+    from threshold_rules t
+)
+"""
+
+PLAN_ADVISOR_FINAL_RECOMMENDATION_SQL = PLAN_ADVISOR_CTE_SQL + """
+select
+    sql_id,
+    plan_hash_value as recommended_plan,
+    baseline_plan_hash_value as baseline_plan,
+    avg_elapsed_s,
+    avg_cpu_s,
+    avg_lio,
+    avg_pio,
+    avg_rows,
+    cpu_to_elapsed_ratio,
+    execs,
+    snap_count,
+    inst_count,
+    invalidations,
+    version_count_max,
+    mem_risk,
+    spill_risk,
+    opt_est_cost,
+    opt_est_cardinality,
+    opt_est_bytes,
+    opt_est_temp_space,
+    plan_shape,
+    confidence_level,
+    elapsed_penalty_pct,
+    cpu_penalty_pct,
+    lio_penalty_pct,
+    pio_penalty_pct,
+    cpu_saving_pct,
+    lio_saving_pct,
+    pio_saving_pct,
+    first_seen,
+    last_seen,
+    case
+        when baseline_eligibility_rank = 2
+             and plan_hash_value = baseline_plan_hash_value
+        then 'LOW_SAMPLE_FALLBACK'
+        when threshold_status = 'REJECTED_BY_THRESHOLD'
+             and plan_hash_value = baseline_plan_hash_value
+        then 'FASTEST_FALLBACK'
+        else threshold_status
+    end as threshold_status,
+    case
+        when baseline_eligibility_rank = 2
+             and plan_hash_value = baseline_plan_hash_value
+        then 'Recommendation based on fallback eligibility only (execs >= 2 and snapshots >= 1)'
+        when threshold_status = 'REJECTED_BY_THRESHOLD'
+             and plan_hash_value = baseline_plan_hash_value
+        then 'No plan satisfied balanced threshold rules; returning fastest eligible plan'
+        else threshold_reason
+    end as threshold_reason,
+    case
+        when baseline_eligibility_rank = 2
+             and plan_hash_value = baseline_plan_hash_value
+        then 'Low-sample fallback recommendation'
+        when threshold_status = 'BALANCED_CANDIDATE'
+            then 'Recommended balanced plan'
+        when threshold_status = 'FASTEST_CANDIDATE'
+            then 'Recommended fastest safe plan'
+        when threshold_status = 'REJECTED_BY_THRESHOLD'
+             and plan_hash_value = baseline_plan_hash_value
+            then 'Fallback fastest eligible plan'
+        else 'Fallback plan'
+    end as recommendation_summary
+from ranked_candidates
+where final_rank = 1
+"""
+
+PLAN_ADVISOR_PLAN_COMPARISON_SQL = PLAN_ADVISOR_CTE_SQL + """
+select
+    sql_id,
+    plan_hash_value,
+    execs,
+    snap_count,
+    inst_count,
+    avg_elapsed_s,
+    avg_cpu_s,
+    avg_lio,
+    avg_pio,
+    avg_rows,
+    cpu_to_elapsed_ratio,
+    opt_est_cost,
+    opt_est_cardinality,
+    opt_est_bytes,
+    opt_est_temp_space,
+    plan_shape,
+    elapsed_penalty_pct,
+    cpu_penalty_pct,
+    lio_penalty_pct,
+    pio_penalty_pct,
+    opt_cost_penalty_pct,
+    cpu_saving_pct,
+    lio_saving_pct,
+    pio_saving_pct,
+    invalidations,
+    version_count_max,
+    mem_risk,
+    spill_risk,
+    confidence_level,
+    primary_eligible_flag,
+    fallback_eligible_flag,
+    elapsed_band,
+    first_seen,
+    last_seen,
+    threshold_status,
+    threshold_reason
+from threshold_rules
+order by
+    case threshold_status
+        when 'BALANCED_CANDIDATE' then 1
+        when 'FASTEST_CANDIDATE' then 2
+        else 9
+    end,
+    avg_elapsed_s,
+    avg_cpu_s,
+    avg_lio,
+    avg_pio,
+    opt_est_cost
+"""
+
+PLAN_ADVISOR_RAC_INSTANCE_SUMMARY_SQL = """
+with
+input_params as (
+    select
+        trim(lower(:sql_id)) as sql_id,
+        nvl(:lookback_days, 30) as lookback_days
+    from dual
+)
+select
+    q.sql_id,
+    q.plan_hash_value,
+    q.instance_number,
+    sum(q.executions_delta) as execs,
+    round(sum(q.elapsed_time_delta) / 1000000 / nullif(sum(q.executions_delta), 0), 6) as avg_elapsed_s,
+    round(sum(q.cpu_time_delta) / 1000000 / nullif(sum(q.executions_delta), 0), 6) as avg_cpu_s,
+    round(sum(q.buffer_gets_delta) / nullif(sum(q.executions_delta), 0), 2) as avg_lio,
+    round(sum(q.disk_reads_delta) / nullif(sum(q.executions_delta), 0), 2) as avg_pio,
+    count(distinct q.snap_id) as snap_count
+from dba_hist_sqlstat q
+join dba_hist_snapshot s
+  on s.snap_id = q.snap_id
+ and s.dbid = q.dbid
+ and s.instance_number = q.instance_number
+join input_params p
+  on p.sql_id = q.sql_id
+where q.executions_delta > 0
+  and q.plan_hash_value > 0
+  and s.begin_interval_time >= sysdate - p.lookback_days
+group by
+    q.sql_id,
+    q.plan_hash_value,
+    q.instance_number
+order by
+    q.plan_hash_value,
+    q.instance_number
+"""
+
 
 def extract_queryid_from_text(text: str) -> str | None:
     return extract_sql_id(text)
@@ -74,6 +555,7 @@ def build_sql_id_deep_dive_report(sql_id: str, lookback_days: int = 30) -> SqlId
     plan_lines = _plan_lines(normalized_sql_id, notes)
     ash = _ash_summary(normalized_sql_id, lookback_days, notes)
     awr = _awr_summary(normalized_sql_id, lookback_days, notes)
+    plan_advisor = _plan_advisor_analysis(normalized_sql_id, lookback_days, notes)
 
     active_queries = _active_queries(normalized_sql_id, notes)
     lock_analysis = _lock_analysis(normalized_sql_id, notes)
@@ -89,6 +571,27 @@ def build_sql_id_deep_dive_report(sql_id: str, lookback_days: int = 30) -> SqlId
         current_stats=current,
         active_queries=active_queries,
     )
+    if _is_plsql_wrapper(sql_text):
+        classification = classification.model_copy(
+            update={
+                "classification": "plsql_wrapper",
+                "confidence": "HIGH",
+                "explanation": "PL/SQL wrapper detected; execution plan for wrapper is not meaningful.",
+                "evidence": _dedupe_preserve_order(list(classification.evidence) + ["wrapper_sql_detected"]),
+            }
+        )
+        current["sql_kind"] = "PL_SQL_WRAPPER"
+        current["wrapper_plan_expectation"] = "PLAN_UNAVAILABLE"
+        candidates = _wrapper_underlying_sql_candidates(
+            wrapper_sql_id=normalized_sql_id,
+            module=str(current.get("module") or ""),
+            lookback_minutes=_wrapper_lookback_minutes(),
+            notes=notes,
+        )
+        if candidates:
+            current["underlying_sql_candidates"] = candidates
+        else:
+            notes.append("PL/SQL wrapper detected but no underlying SQL candidates were found in ASH lookback.")
     history_analysis = _history_analysis(normalized_sql_id, notes)
     impact_summary = _impact_summary(
         current_stats=current,
@@ -104,9 +607,11 @@ def build_sql_id_deep_dive_report(sql_id: str, lookback_days: int = 30) -> SqlId
         raw_plan_lines=plan_lines,
     )
     plan_analysis = _plan_analysis(
+        sql_id=normalized_sql_id,
         current=current,
         children=children,
         awr=awr,
+        plan_advisor=plan_advisor,
         lookback_days=lookback_days,
         execution_plan=execution_plan.model_dump(mode="json"),
     )
@@ -143,6 +648,7 @@ def build_sql_id_deep_dive_report(sql_id: str, lookback_days: int = 30) -> SqlId
         execution_plan=execution_plan,
         lock_analysis=lock_analysis,
         plan_analysis=plan_analysis,
+        plan_advisor=plan_advisor,
         history_analysis=history_analysis,
         risk_summary=risk_summary,
         dba_recommendation=dba_recommendation,
@@ -192,7 +698,7 @@ def collect_sql_wait_profile(
         available=False,
         source_used=None,
         interpretation="No wait evidence could be collected (live sessions, ASH, and AWR ASH were unavailable).",
-        notes=["Verify privileges for gv$session, v$active_session_history, and dba_hist_active_sess_history."],
+        notes=["Verify privileges for gv$session, gv$active_session_history, and dba_hist_active_sess_history."],
     )
 
 
@@ -220,6 +726,14 @@ def classify_sql(
             confidence="LOW",
             explanation="SQL text and parsing schema were not available.",
             evidence=evidence,
+        )
+
+    if _is_plsql_wrapper(text):
+        return SqlClassification(
+            classification="plsql_wrapper",
+            confidence="HIGH",
+            explanation="PL/SQL wrapper detected; execution plan for wrapper is not meaningful.",
+            evidence=evidence + ["wrapper_sql_detected"],
         )
 
     has_dictionary_pattern = any(token in lowered for token in DICTIONARY_TOKENS)
@@ -282,16 +796,24 @@ def _current_stats(sql_id: str, notes: list[str]) -> dict[str, Any]:
     try:
         row = fetch_one(
             """
-            select s.sql_id, s.plan_hash_value, s.executions,
-                   round(s.elapsed_time/1e6,3) as elapsed_s,
-                   round(s.cpu_time/1e6,3) as cpu_s,
-                   round((s.elapsed_time/1e6)/nullif(s.executions,0), 6) as ela_per_exec_s,
-                   s.buffer_gets, s.disk_reads, s.rows_processed,
-                   to_char(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS') as last_active_time,
-                   (select max(q.parsing_schema_name) from v$sql q where q.sql_id = s.sql_id) as parsing_schema_name,
-                   (select max(q.module) from v$sql q where q.sql_id = s.sql_id) as module
-            from v$sqlstats s
-            where s.sql_id = :sql_id
+            select inst_id,
+                   sql_id,
+                   child_number,
+                   plan_hash_value,
+                   parsing_schema_name,
+                   module,
+                   action,
+                   executions,
+                   elapsed_time/1000000 as elapsed_s,
+                   cpu_time/1000000 as cpu_s,
+                   buffer_gets,
+                   disk_reads,
+                   rows_processed,
+                   to_char(last_active_time, 'YYYY-MM-DD HH24:MI:SS') as last_active_time,
+                   sql_fulltext
+            from gv$sql
+            where sql_id = :sql_id
+            order by elapsed_time desc
             fetch first 1 rows only
             """,
             {"sql_id": sql_id},
@@ -312,7 +834,7 @@ def _child_cursors(sql_id: str, notes: list[str]) -> list[dict[str, Any]]:
                    round((elapsed_time/1e6)/nullif(executions,0), 6) as ela_per_exec_s,
                    buffer_gets, disk_reads,
                    to_char(last_active_time, 'YYYY-MM-DD HH24:MI:SS') as last_active
-            from v$sql
+            from gv$sql
             where sql_id = :sql_id
             order by elapsed_time desc
             fetch first 20 rows only
@@ -331,7 +853,7 @@ def _plan_lines(sql_id: str, notes: list[str]) -> list[dict[str, Any]]:
             select id, parent_id, lpad(' ', depth*2) || operation as operation,
                    options, object_owner, object_name, object_type,
                    cardinality, cost, bytes
-            from v$sql_plan
+            from gv$sql_plan
             where sql_id = :sql_id
             order by id
             """,
@@ -349,7 +871,7 @@ def _ash_summary(sql_id: str, lookback_days: int, notes: list[str]) -> dict[str,
             """
             select count(*) as samples,
                    round(100 * sum(case when session_state = 'ON CPU' then 1 else 0 end) / nullif(count(*),0), 1) as oncpu_pct
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time > sysdate - (:days)
               and sql_id = :sql_id
             """,
@@ -358,7 +880,7 @@ def _ash_summary(sql_id: str, lookback_days: int, notes: list[str]) -> dict[str,
         waits = fetch_all(
             """
             select nvl(event, 'ON CPU') as event, count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time > sysdate - (:days)
               and sql_id = :sql_id
             group by nvl(event, 'ON CPU')
@@ -453,8 +975,9 @@ def _active_queries(sql_id: str, notes: list[str]) -> list[dict[str, Any]]:
         rows = fetch_all(
             """
             select inst_id, sid, serial# as serial_num, nvl(username,'-') as username,
-                   status, sql_id, state, event, wait_class,
+                   status, sql_id, prev_sql_id, state, event, wait_class,
                    seconds_in_wait, last_call_et, blocking_instance, blocking_session,
+                   final_blocking_instance, final_blocking_session,
                    nvl(module,'-') as module, nvl(program,'-') as program, nvl(machine,'-') as machine
             from gv$session
             where type = 'USER'
@@ -476,6 +999,15 @@ def _active_queries(sql_id: str, notes: list[str]) -> list[dict[str, Any]]:
         enriched.append(
             {
                 **row,
+                "activity_class": (
+                    "TRUE_ACTIVE_NON_IDLE"
+                    if str(row.get("status") or "").upper() == "ACTIVE" and str(row.get("wait_class") or "") != "Idle"
+                    else "ACTIVE_IDLE_WAITING"
+                    if str(row.get("status") or "").upper() == "ACTIVE"
+                    else "BLOCKED"
+                    if row.get("blocking_session") is not None or row.get("final_blocking_session") is not None
+                    else "OTHER"
+                ),
                 "runtime_seconds": runtime_s,
                 "runtime_minutes": round(runtime_s / 60.0, 2),
                 "long_running": runtime_s >= warn_seconds,
@@ -522,7 +1054,7 @@ def _ash_wait_profile(sql_id: str, lookback_days: int, notes: list[str]) -> SqlW
                    sum(case when wait_class = 'Configuration' then 1 else 0 end) as configuration_samples,
                    sum(case when wait_class = 'Application' then 1 else 0 end) as application_samples,
                    sum(case when wait_class = 'Network' then 1 else 0 end) as network_samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time > sysdate - (:days)
               and sql_id = :sql_id
             """,
@@ -533,7 +1065,7 @@ def _ash_wait_profile(sql_id: str, lookback_days: int, notes: list[str]) -> SqlW
             select nvl(event, 'ON CPU') as event,
                    case when session_state = 'ON CPU' then 'ON CPU' else nvl(wait_class, 'Other') end as wait_class,
                    count(*) as samples
-            from v$active_session_history
+            from gv$active_session_history
             where sample_time > sysdate - (:days)
               and sql_id = :sql_id
             group by nvl(event, 'ON CPU'),
@@ -545,10 +1077,10 @@ def _ash_wait_profile(sql_id: str, lookback_days: int, notes: list[str]) -> SqlW
         )
     except Exception as exc:
         notes.append(f"ASH wait profile unavailable: {exc}")
-        return SqlWaitProfile(available=False, source_used="v$active_session_history", notes=[str(exc)])
+        return SqlWaitProfile(available=False, source_used="gv$active_session_history", notes=[str(exc)])
 
     return _build_wait_profile_from_summary(
-        source="v$active_session_history",
+        source="gv$active_session_history",
         summary=summary,
         breakdown_rows=rows,
         lookback_days=lookback_days,
@@ -816,20 +1348,45 @@ def _lock_analysis(sql_id: str, notes: list[str]) -> dict[str, Any]:
 
 def _plan_analysis(
     *,
+    sql_id: str,
     current: dict[str, Any],
     children: list[dict[str, Any]],
     awr: dict[str, Any],
+    plan_advisor: dict[str, Any],
     lookback_days: int,
     execution_plan: dict[str, Any],
 ) -> dict[str, Any]:
+    if str(current.get("sql_kind") or "").upper() == "PL_SQL_WRAPPER":
+        return {
+            "status": "PLAN_UNAVAILABLE",
+            "stability": "wrapper_not_applicable",
+            "summary": "PL/SQL wrapper detected; execution plan for wrapper is not meaningful.",
+            "current_plan_hash": _as_int(current.get("plan_hash_value")),
+            "distinct_plan_hashes": [],
+            "distinct_plan_count": 0,
+            "churn_detected": False,
+            "dominant_plan_hash": None,
+            "dominant_plan_elapsed_s": None,
+            "active_child_cursor_count": len(children),
+            "awr_plan_count": len((awr.get("plan_changes") if isinstance(awr, dict) else []) or []),
+            "plan_source_used": execution_plan.get("source_used"),
+            "lookback_days": lookback_days,
+            "recommended_plan_decision": _recommended_plan_decision(
+                sql_id=sql_id,
+                current_plan_hash=_as_int(current.get("plan_hash_value")),
+                dominant_plan_hash=None,
+                plan_advisor=plan_advisor,
+            ),
+        }
+
     plan_hashes: set[int] = set()
     current_plan_hash = _as_int(current.get("plan_hash_value"))
-    if current_plan_hash is not None:
+    if current_plan_hash is not None and current_plan_hash != 0:
         plan_hashes.add(current_plan_hash)
 
     for row in children:
         value = _as_int(row.get("plan_hash_value"))
-        if value is not None:
+        if value is not None and value != 0:
             plan_hashes.add(value)
 
     awr_rows = awr.get("plan_changes") if isinstance(awr, dict) else []
@@ -838,7 +1395,7 @@ def _plan_analysis(
             if not isinstance(row, dict):
                 continue
             value = _as_int(row.get("plan_hash_value"))
-            if value is not None:
+            if value is not None and value != 0:
                 plan_hashes.add(value)
 
     distinct_plans = sorted(plan_hashes)
@@ -851,9 +1408,31 @@ def _plan_analysis(
             dominant_elapsed_s = _as_float(top.get("elapsed_s"))
 
     churn = len(distinct_plans) > 1
+    if not distinct_plans:
+        return {
+            "status": "PLAN_UNAVAILABLE",
+            "stability": "plan_unavailable",
+            "summary": "Execution plan could not be captured (PLAN_UNAVAILABLE).",
+            "current_plan_hash": current_plan_hash,
+            "distinct_plan_hashes": [],
+            "distinct_plan_count": 0,
+            "churn_detected": False,
+            "dominant_plan_hash": dominant_plan_hash,
+            "dominant_plan_elapsed_s": dominant_elapsed_s,
+            "active_child_cursor_count": len(children),
+            "awr_plan_count": len(awr_rows) if isinstance(awr_rows, list) else 0,
+            "plan_source_used": execution_plan.get("source_used"),
+            "lookback_days": lookback_days,
+            "recommended_plan_decision": _recommended_plan_decision(
+                sql_id=sql_id,
+                current_plan_hash=current_plan_hash,
+                dominant_plan_hash=dominant_plan_hash,
+                plan_advisor=plan_advisor,
+            ),
+        }
     if len(distinct_plans) >= 4:
         stability = "high_churn"
-        severity = "CRITICAL"
+        severity = "WARNING"
     elif len(distinct_plans) >= 2:
         stability = "churn"
         severity = "WARNING"
@@ -882,7 +1461,230 @@ def _plan_analysis(
         "awr_plan_count": len(awr_rows) if isinstance(awr_rows, list) else 0,
         "plan_source_used": execution_plan.get("source_used"),
         "lookback_days": lookback_days,
+        "recommended_plan_decision": _recommended_plan_decision(
+            sql_id=sql_id,
+            current_plan_hash=current_plan_hash,
+            dominant_plan_hash=dominant_plan_hash,
+            plan_advisor=plan_advisor,
+        ),
     }
+
+
+def _plan_advisor_analysis(sql_id: str, lookback_days: int, notes: list[str]) -> dict[str, Any]:
+    binds = {"sql_id": sql_id, "lookback_days": int(lookback_days)}
+    data: dict[str, Any] = {
+        "final_recommendation": [],
+        "plan_comparison": [],
+        "rac_instance_summary": [],
+    }
+    try:
+        data["final_recommendation"] = fetch_all(PLAN_ADVISOR_FINAL_RECOMMENDATION_SQL, binds)
+    except Exception as exc:
+        notes.append(f"plan_advisor final_recommendation unavailable: {exc}")
+    try:
+        data["plan_comparison"] = fetch_all(PLAN_ADVISOR_PLAN_COMPARISON_SQL, binds)
+    except Exception as exc:
+        notes.append(f"plan_advisor plan_comparison unavailable: {exc}")
+    try:
+        data["rac_instance_summary"] = fetch_all(PLAN_ADVISOR_RAC_INSTANCE_SUMMARY_SQL, binds)
+    except Exception as exc:
+        notes.append(f"plan_advisor rac_instance_summary unavailable: {exc}")
+    return data
+
+
+def _recommended_plan_decision(
+    *,
+    sql_id: str,
+    current_plan_hash: int | None,
+    dominant_plan_hash: int | None,
+    plan_advisor: dict[str, Any],
+) -> dict[str, Any]:
+    final_rows = plan_advisor.get("final_recommendation") if isinstance(plan_advisor.get("final_recommendation"), list) else []
+    comparison_rows = plan_advisor.get("plan_comparison") if isinstance(plan_advisor.get("plan_comparison"), list) else []
+    top = final_rows[0] if final_rows and isinstance(final_rows[0], dict) else {}
+    recommended_plan = _as_int(top.get("recommended_plan"))
+    if recommended_plan is None:
+        recommended_plan = _as_int(top.get("plan_hash_value"))
+    baseline_plan = _as_int(top.get("baseline_plan"))
+    if baseline_plan is None:
+        baseline_plan = _as_int(top.get("baseline_plan_hash_value"))
+
+    confidence = str(top.get("confidence_level") or "").strip().upper() or "LOW_CONFIDENCE"
+    observed_plans = sorted(
+        {
+            value
+            for value in (_as_int((row or {}).get("plan_hash_value")) for row in comparison_rows if isinstance(row, dict))
+            if value is not None and value > 0
+        }
+    )
+    baseline_row = _find_plan_row(comparison_rows, baseline_plan)
+    recommended_row = _find_plan_row(comparison_rows, recommended_plan) or top
+
+    why_lines: list[str] = []
+    sample_execs = _as_int(recommended_row.get("execs")) or 0
+    sample_snaps = _as_int(recommended_row.get("snap_count")) or 0
+    low_sample = sample_execs < 20 or sample_snaps < 3
+    if low_sample:
+        confidence = "LOW_CONFIDENCE"
+
+    if not comparison_rows:
+        decision = "No plan recommendation possible from AWR for this SQL_ID/lookback window."
+        dba_reco = "Collect additional AWR SQLSTAT evidence before making any plan-baseline decision."
+        return {
+            "sql_id": sql_id,
+            "recommended_plan": recommended_plan,
+            "current_live_plan": current_plan_hash,
+            "dominant_historical_plan": dominant_plan_hash,
+            "baseline_fastest_eligible_plan": baseline_plan,
+            "decision": decision,
+            "confidence": confidence,
+            "why": ["No AWR SQLSTAT plan rows were available in the lookback window."],
+            "dba_recommendation": dba_reco,
+        }
+
+    if len(observed_plans) <= 1:
+        decision = "Only one plan observed; no alternative plan comparison possible."
+        dba_reco = "Stay with current plan and keep monitoring for additional plan diversity."
+        return {
+            "sql_id": sql_id,
+            "recommended_plan": recommended_plan,
+            "current_live_plan": current_plan_hash,
+            "dominant_historical_plan": dominant_plan_hash,
+            "baseline_fastest_eligible_plan": baseline_plan,
+            "decision": decision,
+            "confidence": confidence,
+            "why": [f"Observed plan count: {len(observed_plans)}."],
+            "dba_recommendation": dba_reco,
+        }
+
+    if recommended_plan is not None and baseline_row and recommended_row:
+        elapsed_line = _metric_comparison_line(
+            label="Avg elapsed per exec",
+            recommended_value=_as_float(recommended_row.get("avg_elapsed_s")),
+            baseline_value=_as_float(baseline_row.get("avg_elapsed_s")),
+            faster_slower_hint=True,
+        )
+        cpu_line = _metric_comparison_line(
+            label="Avg CPU per exec",
+            recommended_value=_as_float(recommended_row.get("avg_cpu_s")),
+            baseline_value=_as_float(baseline_row.get("avg_cpu_s")),
+        )
+        lio_line = _metric_comparison_line(
+            label="Avg logical I/O per exec",
+            recommended_value=_as_float(recommended_row.get("avg_lio")),
+            baseline_value=_as_float(baseline_row.get("avg_lio")),
+        )
+        pio_line = _metric_comparison_line(
+            label="Avg physical I/O per exec",
+            recommended_value=_as_float(recommended_row.get("avg_pio")),
+            baseline_value=_as_float(baseline_row.get("avg_pio")),
+        )
+        if elapsed_line:
+            why_lines.append(elapsed_line)
+        if cpu_line:
+            why_lines.append(cpu_line)
+        if lio_line:
+            why_lines.append(lio_line)
+        if pio_line:
+            why_lines.append(pio_line)
+        elapsed = _as_float(recommended_row.get("avg_elapsed_s"))
+        base_elapsed = _as_float(baseline_row.get("avg_elapsed_s"))
+        cpu = _as_float(recommended_row.get("avg_cpu_s"))
+        base_cpu = _as_float(baseline_row.get("avg_cpu_s"))
+        lio = _as_float(recommended_row.get("avg_lio"))
+        base_lio = _as_float(baseline_row.get("avg_lio"))
+        pio = _as_float(recommended_row.get("avg_pio"))
+        base_pio = _as_float(baseline_row.get("avg_pio"))
+        if all(v is not None for v in (elapsed, base_elapsed, cpu, base_cpu, lio, base_lio, pio, base_pio)):
+            if elapsed < base_elapsed and cpu < base_cpu and lio < base_lio and pio < base_pio:
+                why_lines.insert(0, "Recommended plan is faster and cheaper across elapsed, CPU, logical I/O, and physical I/O.")
+        elapsed_penalty_pct = _as_float(recommended_row.get("elapsed_penalty_pct"))
+        if elapsed_penalty_pct is not None:
+            if elapsed_penalty_pct < 0:
+                why_lines.append(f"Elapsed delta vs baseline: {abs(elapsed_penalty_pct):.2f}% faster.")
+            elif elapsed_penalty_pct > 0:
+                why_lines.append(f"Elapsed delta vs baseline: {elapsed_penalty_pct:.2f}% slower.")
+            else:
+                why_lines.append("Elapsed delta vs baseline: no material difference.")
+
+    if low_sample:
+        why_lines.append(f"Sample count is limited: {sample_execs} executions across {sample_snaps} snapshots.")
+
+    same_as_any = False
+    if recommended_plan is not None:
+        compare_targets = {value for value in (current_plan_hash, dominant_plan_hash, baseline_plan) if value is not None}
+        same_as_any = recommended_plan in compare_targets
+
+    if same_as_any:
+        decision = "Stay with current/baseline plan."
+        dba_reco = "Recommended plan already aligns with current/dominant baseline; keep monitoring."
+    elif confidence == "HIGH_CONFIDENCE":
+        decision = f"Prefer recommended plan {recommended_plan}."
+        dba_reco = f"Prefer plan {recommended_plan} after controlled validation using SQL Monitor/AWR evidence."
+    else:
+        decision = f"Candidate better plan is {recommended_plan}, but confidence is LOW."
+        dba_reco = (
+            f"Validate plan {recommended_plan} with more executions / SQL Monitor / AWR "
+            "before forcing or creating SQL Plan Baseline."
+        )
+
+    if not why_lines:
+        threshold_reason = str(top.get("threshold_reason") or "").strip()
+        if threshold_reason:
+            why_lines.append(threshold_reason)
+        else:
+            why_lines.append("Plan advisor recommendation derived from historical per-plan efficiency comparison.")
+
+    return {
+        "sql_id": sql_id,
+        "recommended_plan": recommended_plan,
+        "current_live_plan": current_plan_hash,
+        "dominant_historical_plan": dominant_plan_hash,
+        "baseline_fastest_eligible_plan": baseline_plan,
+        "decision": decision,
+        "confidence": confidence,
+        "why": why_lines[:8],
+        "dba_recommendation": dba_reco,
+    }
+
+
+def _find_plan_row(rows: list[dict[str, Any]], plan_hash_value: int | None) -> dict[str, Any]:
+    if plan_hash_value is None:
+        return {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if _as_int(row.get("plan_hash_value")) == plan_hash_value:
+            return row
+    return {}
+
+
+def _metric_comparison_line(
+    *,
+    label: str,
+    recommended_value: float | None,
+    baseline_value: float | None,
+    faster_slower_hint: bool = False,
+) -> str:
+    if recommended_value is None or baseline_value is None:
+        return ""
+    if recommended_value < baseline_value:
+        relation = "lower"
+    elif recommended_value > baseline_value:
+        relation = "higher"
+    else:
+        relation = "equal"
+    if faster_slower_hint:
+        if relation == "lower":
+            return f"{label} is lower (faster): {recommended_value:.6f} vs {baseline_value:.6f}."
+        if relation == "higher":
+            return f"{label} is higher (slower): {recommended_value:.6f} vs {baseline_value:.6f}."
+        return f"{label} is equal: {recommended_value:.6f} vs {baseline_value:.6f}."
+    if relation == "lower":
+        return f"{label} is lower: {recommended_value:.6f} vs {baseline_value:.6f}."
+    if relation == "higher":
+        return f"{label} is higher: {recommended_value:.6f} vs {baseline_value:.6f}."
+    return f"{label} is equal: {recommended_value:.6f} vs {baseline_value:.6f}."
 
 
 def _history_analysis(sql_id: str, notes: list[str]) -> dict[str, Any]:
@@ -1079,6 +1881,15 @@ def _dba_recommendation(
     recommendation = "Monitor only"
 
     blocker_count = _as_int(lock_analysis.get("as_blocker_count")) or 0
+    if classification.classification == "plsql_wrapper":
+        rationale.append("PL/SQL wrapper detected; wrapper-level plan stability is not a meaningful signal.")
+        next_actions.append("Identify underlying SQL from ASH/module context and tune underlying statements instead.")
+        return SqlDbaRecommendation(
+            severity="INFO",
+            recommendation="Analyze underlying SQL, not wrapper block",
+            rationale=_dedupe_preserve_order(rationale),
+            next_actions=_dedupe_preserve_order(next_actions),
+        )
     if blocker_count > 0:
         severity = "CRITICAL"
         recommendation = "Investigate blocking immediately"
@@ -1174,6 +1985,56 @@ def _dba_recommendation(
         rationale=_dedupe_preserve_order(rationale),
         next_actions=_dedupe_preserve_order(next_actions),
     )
+
+
+def _is_plsql_wrapper(sql_text: str | None) -> bool:
+    text = str(sql_text or "")
+    if not text.strip():
+        return False
+    return bool(WRAPPER_PREFIX_RE.search(text))
+
+
+def _wrapper_underlying_sql_candidates(
+    *,
+    wrapper_sql_id: str,
+    module: str,
+    lookback_minutes: int,
+    notes: list[str],
+) -> list[dict[str, Any]]:
+    if not module.strip():
+        return []
+    try:
+        return fetch_all(
+            """
+            select ash.inst_id,
+                   ash.sql_id,
+                   count(*) as samples,
+                   max(ash.module) as module,
+                   max(ash.action) as action,
+                   max(sqls.parsing_schema_name) as parsing_schema_name,
+                   max(sqls.plan_hash_value) keep (dense_rank last order by ash.sample_time) as plan_hash_value,
+                   substr(max(sqls.sql_fulltext),1,1000) as sql_text_sample
+            from gv$active_session_history ash
+            left join gv$sql sqls
+                   on sqls.inst_id = ash.inst_id
+                  and sqls.sql_id = ash.sql_id
+            where ash.sample_time >= sysdate - (:lookback_minutes / 1440)
+              and ash.module = :module
+              and ash.sql_id is not null
+              and ash.sql_id <> :wrapper_sql_id
+            group by ash.inst_id, ash.sql_id
+            order by samples desc
+            fetch first 10 rows only
+            """,
+            {"lookback_minutes": int(lookback_minutes), "module": module, "wrapper_sql_id": wrapper_sql_id},
+        )
+    except Exception as exc:
+        notes.append(f"underlying_sql_candidates unavailable: {exc}")
+        return []
+
+
+def _wrapper_lookback_minutes() -> int:
+    return _env_int("ODB_AUTODBA_WRAPPER_LOOKBACK_MINUTES", 60)
 
 
 def _long_running_thresholds() -> tuple[int, int]:

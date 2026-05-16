@@ -59,7 +59,14 @@ class BlockingAnalyzeRequest(BaseModel):
 class InvestigateRequest(BaseModel):
     db_key: str | None = None
     target: dict[str, Any] | None = None
-    question: str
+    problem_statement: str | None = None
+    question: str | None = None
+    prompt: str | None = None
+    user_question: str | None = None
+    thread_id: str | None = None
+    continue_context: bool | None = None
+    user_id: str | None = None
+    session_id: str | None = None
 
 
 class AwrAnalyzeRequest(BaseModel):
@@ -79,6 +86,13 @@ app = FastAPI(title="odb_autodba_mcp", version="skeleton")
 
 @app.on_event("startup")
 def _startup_cleanup_jobs() -> None:
+    LOGGER.info(
+        "mcp_server_env openai_api_key_present=%s reviewer_provider=%s reviewer_model=%s reviewer_timeout_sec=%s",
+        str(bool((os.getenv("OPENAI_API_KEY") or "").strip())).lower(),
+        str(os.getenv("ODB_AUTODBA_ACTION_REVIEWER_PROVIDER") or os.getenv("ODB_AUTODBA_REVIEWER_PROVIDER") or "auto"),
+        str(os.getenv("ODB_AUTODBA_OPENAI_REVIEW_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5.5"),
+        str(os.getenv("ODB_AUTODBA_OPENAI_REVIEW_TIMEOUT_SEC") or "30"),
+    )
     removed = maybe_cleanup_on_start()
     if removed:
         LOGGER.info("job_cleanup_on_start removed=%s", removed)
@@ -269,19 +283,42 @@ def investigate(req: InvestigateRequest, background_tasks: BackgroundTasks) -> d
     start = perf_counter()
     endpoint = "/investigate"
     db_key = req.db_key
-    question = (req.question or "").strip()
+    problem_statement = _coerce_problem_statement(
+        problem_statement=req.problem_statement,
+        question=req.question,
+        prompt=req.prompt,
+        user_question=req.user_question,
+    )
     try:
-        if not question:
+        LOGGER.info(
+            "investigate_request received_problem_statement_len=%s db_key=%s thread_id=%s continue_context=%s thread_memory_enabled=false",
+            len(problem_statement),
+            str(db_key or ""),
+            str(req.thread_id or ""),
+            str(req.continue_context if req.continue_context is not None else ""),
+        )
+        if not problem_statement:
             _log_request(endpoint=endpoint, db_key=db_key, start=start, ok=False)
             return {
                 "ok": False,
-                "error": "question is required",
+                "error": "problem_statement is required",
                 "error_type": "ValidationError",
                 "endpoint": endpoint,
             }
-        payload: dict[str, Any] = {"question": question}
+        payload: dict[str, Any] = {
+            "problem_statement": problem_statement,
+            "question": problem_statement,  # backward-compatible alias
+        }
         if isinstance(req.target, dict):
             payload["target"] = req.target
+        if (req.thread_id or "").strip():
+            payload["thread_id"] = str(req.thread_id).strip()
+        if req.continue_context is not None:
+            payload["continue_context"] = bool(req.continue_context)
+        if (req.user_id or "").strip():
+            payload["user_id"] = str(req.user_id).strip()
+        if (req.session_id or "").strip():
+            payload["session_id"] = str(req.session_id).strip()
         job = create_job("investigation", db_key=db_key, payload=payload)
         _schedule_job(background_tasks=background_tasks, job_id=job["job_id"])
         payload = {
@@ -290,6 +327,8 @@ def investigate(req: InvestigateRequest, background_tasks: BackgroundTasks) -> d
             "status": job["status"],
             "db_key": job["db_key"],
             "job_type": job["job_type"],
+            "thread_id": payload.get("thread_id"),
+            "thread_memory_enabled": False,
         }
         _log_request(endpoint=endpoint, db_key=job.get("db_key"), start=start, ok=True)
         return payload
@@ -488,16 +527,28 @@ def investigate_sync(req: InvestigateRequest) -> dict[str, Any]:
     start = perf_counter()
     endpoint = "/investigate/sync"
     try:
-        question = (req.question or "").strip()
-        if not question:
+        problem_statement = _coerce_problem_statement(
+            problem_statement=req.problem_statement,
+            question=req.question,
+            prompt=req.prompt,
+            user_question=req.user_question,
+        )
+        if not problem_statement:
             _log_request(endpoint=endpoint, db_key=req.db_key, start=start, ok=False)
             return {
                 "ok": False,
-                "error": "question is required",
+                "error": "problem_statement is required",
                 "error_type": "ValidationError",
                 "endpoint": endpoint,
             }
-        payload = run_ai_investigation(question, db_key=req.db_key)
+        payload = run_ai_investigation(
+            problem_statement,
+            db_key=req.db_key,
+            thread_id=str(req.thread_id or "").strip() or None,
+            continue_context=req.continue_context,
+            user_id=str(req.user_id or "").strip() or None,
+            session_id=str(req.session_id or "").strip() or None,
+        )
         payload.setdefault("ok", True)
         _log_request(endpoint=endpoint, db_key=payload.get("db_key"), start=start, ok=True)
         return payload
@@ -695,6 +746,20 @@ def _log_request(*, endpoint: str, db_key: str | None, start: float, ok: bool) -
         elapsed_ms,
         "ok" if ok else "error",
     )
+
+
+def _coerce_problem_statement(
+    *,
+    problem_statement: str | None = None,
+    question: str | None = None,
+    prompt: str | None = None,
+    user_question: str | None = None,
+) -> str:
+    for value in (problem_statement, question, prompt, user_question):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def create_app() -> FastAPI:

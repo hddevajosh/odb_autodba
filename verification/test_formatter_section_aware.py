@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from odb_autodba.agents.root_cause_engine import rank_root_causes
-from odb_autodba.models.schemas import HealthCheckSection, HealthSnapshot, TopSqlRow
+from odb_autodba.models.schemas import HealthCheckSection, HealthSnapshot, HistoricalRun, HistoryContext, TopSqlRow
 from odb_autodba.utils.formatter import render_health_snapshot_report, render_history_answer
 
 
@@ -36,7 +36,7 @@ class FormatterCleanupTests(unittest.TestCase):
         rendered = render_health_snapshot_report(snapshot)
         self.assertEqual(rendered.count(repeated), 1)
 
-    def test_tablespace_storage_conversion_uses_realistic_units(self) -> None:
+    def test_tablespace_headline_section_shows_pct_only(self) -> None:
         snapshot = HealthSnapshot(
             generated_at="2026-04-23T00:00:00Z",
             health_sections=[
@@ -57,10 +57,10 @@ class FormatterCleanupTests(unittest.TestCase):
             ],
         )
         rendered = render_health_snapshot_report(snapshot)
-        self.assertIn("823.25 MB", rendered)
-        self.assertIn("31.20 GB", rendered)
-        self.assertIn("32.00 GB", rendered)
-        self.assertNotIn("32.00 TB", rendered)
+        self.assertIn("tablespace_name  pct_used  pct_free", rendered)
+        self.assertIn("USERS            2.51%", rendered)
+        self.assertNotIn("used_mb", rendered)
+        self.assertNotIn("total_mb", rendered)
 
     def test_top_sql_tables_remain_tabular_but_narrower(self) -> None:
         snapshot = HealthSnapshot(
@@ -115,8 +115,8 @@ class FormatterCleanupTests(unittest.TestCase):
             },
         }
         rendered = render_history_answer(answer)
-        self.assertIn("AWR workload metrics were unavailable in the mapped comparison window.", rendered)
-        self.assertNotIn("pctdelta", rendered)
+        self.assertIn("AWR Workload Delta", rendered)
+        self.assertIn("AWR workload delta rows were unavailable.", rendered)
 
     def test_wait_and_sql_awr_sections_collapse_when_unavailable(self) -> None:
         answer = {
@@ -137,8 +137,8 @@ class FormatterCleanupTests(unittest.TestCase):
             },
         }
         rendered = render_history_answer(answer)
-        self.assertIn("AWR wait-class shift details were unavailable", rendered)
-        self.assertIn("AWR SQL-change details were unavailable", rendered)
+        self.assertIn("AWR wait class shift rows were unavailable.", rendered)
+        self.assertIn("AWR SQL delta rows were unavailable.", rendered)
 
     def test_awr_text_summary_sections_are_stable_and_no_raw_dump(self) -> None:
         answer = {
@@ -163,12 +163,12 @@ class FormatterCleanupTests(unittest.TestCase):
             },
         }
         rendered = render_history_answer(answer)
-        self.assertIn("AWR Snapshot Window", rendered)
-        self.assertIn("Load Profile Summary", rendered)
-        self.assertIn("Main Bottlenecks", rendered)
-        self.assertIn("SQL Contributors", rendered)
-        self.assertIn("Recommended Follow-up", rendered)
-        self.assertIn("AWR Interpretation Summary", rendered)
+        self.assertIn("AWR Snapshot Chain Diagnostic", rendered)
+        self.assertIn("AWR Snapshot Quality", rendered)
+        self.assertIn("AWR Workload Delta", rendered)
+        self.assertIn("AWR Top Wait Events", rendered)
+        self.assertIn("AWR SQL Delta", rendered)
+        self.assertIn("AWR DBA Recommendations", rendered)
         self.assertNotIn("RAW_AWR_DUMP_THIS_SHOULD_NOT_APPEAR", rendered)
 
     def test_same_window_awr_uses_single_window_mode_not_workload_changes(self) -> None:
@@ -191,10 +191,8 @@ class FormatterCleanupTests(unittest.TestCase):
             },
         }
         rendered = render_history_answer(answer)
-        self.assertIn("AWR Analysis Mode: Single-window interpretation (historical context applied)", rendered)
-        self.assertNotIn("AWR Workload Changes", rendered)
-        self.assertIn("AWR source: single-window analysis with report-text enrichment (comparison not applicable)", rendered)
-        self.assertIn("AWR mode: Single-window interpretation", rendered)
+        self.assertIn("AWR Snapshot Quality", rendered)
+        self.assertIn("context_only", rendered.lower())
         self.assertNotIn("Window-based mapping used", rendered)
 
     def test_awr_sql_contributors_fallback_message_when_empty(self) -> None:
@@ -211,8 +209,69 @@ class FormatterCleanupTests(unittest.TestCase):
             },
         }
         rendered = render_history_answer(answer)
-        self.assertIn("SQL contributor details were not available for this snapshot window.", rendered)
+        self.assertIn("AWR SQL Delta", rendered)
+        self.assertIn("AWR SQL delta rows were unavailable.", rendered)
         self.assertNotIn("SQL ordered by", rendered)
+
+    def test_awr_sections_render_table_style(self) -> None:
+        answer = {
+            "summary_lines": [],
+            "awr_state_diff": {
+                "structured_sections": {
+                    "snapshot_chain_diagnostic": [{"DBID": 1234, "Instance": 1, "Startup Time": "2026-04-22T00:00:00", "Snap Min": 210, "Snap Max": 212, "Begin Time": "2026-04-22T02:00:00", "End Time": "2026-04-22T04:00:00", "Rows": 3, "Selected": "yes"}],
+                    "snapshot_windows": [{"Window": "current", "DBID": 1234, "Instance": 1, "Startup Time": "2026-04-22T00:00:00", "Begin Snap": 211, "End Snap": 212, "Begin Time": "2026-04-22T03:00:00", "End Time": "2026-04-22T04:00:00", "Duration Min": 60, "Quality": "HIGH", "Use": "rca"}],
+                    "workload_delta": [{"Metric": "DB Time", "Previous": 40, "Current": 80, "Delta": 40, "Per Min": 1.33, "Interpretation": "up"}],
+                    "wait_class_shift": [{"Wait Class": "Application", "Previous Wait s": 1, "Current Wait s": 10, "Delta s": 9, "Current % DB Time": 12.5, "Interpretation": "growth"}],
+                    "top_wait_events": [{"Event": "enq: TX - row lock contention", "Wait Class": "Application", "Prev Wait s": 0, "Curr Wait s": 10, "Delta s": 10, "Waits": 100, "Avg Latency": 0.1, "Impact": "negligible", "DBA Interpretation": "watch"}],
+                    "sql_delta": [{"SQL_ID": "abc", "Plan": 123, "Schema": "APP", "Module": "SQL*Plus", "Execs": 1, "Elapsed s": 40, "Elapsed/Exec s": 40, "CPU s": 10, "I/O Wait s": 5, "App Wait s": 3, "Conc Wait s": 2, "Gets/Exec": 1000, "Reads/Exec": 20, "DB Time %": 50, "Classification": "significant_contributor"}],
+                    "plan_stability": [{"SQL_ID": "abc", "Plans": 1, "Previous Plan": 123, "Current Plan": 123, "Plan Changed": False, "Prev Elapsed/Exec": 10, "Curr Elapsed/Exec": 40, "Regression Evidence": "worse"}],
+                    "ash_blocking": [{"Event": "enq: TX - row lock contention", "Wait Class": "Application", "Samples": 12, "Distinct Waiters": 3, "Blocking Inst": 1, "Blocking SID": 218, "Top SQL_ID": "abc", "Object": 12345, "Interpretation": "blocking"}],
+                    "object_hotspots": [{"Object": "DEVA1.LOCK_TEST", "Object Type": "TABLE", "Event": "enq: TX - row lock contention", "Wait Class": "Application", "Samples": 12, "Top SQL_ID": "abc", "Interpretation": "hotspot"}],
+                    "redo_commit_profile": [{"Metric": "redo size", "Previous": 1000, "Current": 1200, "Delta": 200, "Interpretation": "context"}],
+                    "dba_recommendations": [{"Priority": 1, "Recommendation": "Validate blocker ownership", "Reason": "row-lock signal"}],
+                    "confidence_coverage": [{"Item": "AWR mode", "Value": "structured DBA_HIST comparison"}],
+                },
+                "snapshot_quality": {"window_quality": "HIGH", "usage": "rca", "reason": "ok"},
+            },
+        }
+        rendered = render_history_answer(answer)
+        self.assertIn("AWR Snapshot Chain Diagnostic", rendered)
+        self.assertIn("dbid      instance", rendered.lower())
+        self.assertIn("AWR SQL Delta", rendered)
+
+    def test_awr_correlation_uses_historical_transient_wording_when_current_blocking_zero(self) -> None:
+        answer = {
+            "summary_lines": [],
+            "context": HistoryContext(
+                latest_run=HistoricalRun(
+                    run_id="r2",
+                    completed_at="2026-05-08T09:00:00Z",
+                    summary="latest",
+                    metrics={"blocking_count": 0},
+                )
+            ),
+            "awr_state_diff": {
+                "structured_sections": {
+                    "ash_blocking": [
+                        {
+                            "Event": "enq: TX - row lock contention",
+                            "Wait Class": "Application",
+                            "Samples": 467,
+                            "Distinct Waiters": 10,
+                            "Blocking Inst": 1,
+                            "Blocking SID": 218,
+                            "Top SQL_ID": "0m92022d1yzhs",
+                            "Object": "DEVA1.LOCK_TEST",
+                            "Interpretation": "blocking/concurrency sample",
+                        }
+                    ]
+                }
+            },
+        }
+        rendered = render_history_answer(answer)
+        self.assertIn("blocking_count=0 in latest health run", rendered)
+        self.assertIn("historical/transient", rendered)
+        self.assertIn("AWR confirms row-lock contention occurr", rendered)
 
     def test_historical_summary_does_not_repeat_transition_line(self) -> None:
         answer = {

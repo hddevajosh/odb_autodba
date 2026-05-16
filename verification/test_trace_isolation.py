@@ -5,9 +5,11 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
 
 from odb_autodba.rag.indexer import rebuild_planner_memory_artifacts
-from odb_autodba.rag.trace_store import read_health_run_traces, read_trace_evidence_chunks
+from odb_autodba.rag.trace_store import health_run_trace_path, read_health_run_traces, read_trace_evidence_chunks
 from odb_autodba.runtime_paths import get_indexes_dir, get_traces_dir
 
 
@@ -95,6 +97,55 @@ class TraceIsolationTests(unittest.TestCase):
             self.assertTrue(get_traces_dir(db_b).exists())
             self.assertTrue(get_indexes_dir(db_a).exists())
             self.assertTrue(get_indexes_dir(db_b).exists())
+
+    def test_malformed_jsonl_line_does_not_crash_history_reads(self) -> None:
+        db_key = "unit_a__db__1521__freepdb1"
+        with _temp_runtime_env():
+            path = health_run_trace_path(db_key=db_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                '{"run_id":"good","recorded_at":"2026-05-01T00:00:00+00:00","completed_at":"2026-05-01T00:00:00+00:00","database_name":"UNITDB","overall_status":"OK","summary":"ok","metrics":{"active_sessions":1},"issues":[]}\n'
+                'this is not json\n',
+                encoding="utf-8",
+            )
+            traces = read_health_run_traces(db_key=db_key, limit=None)
+        self.assertEqual([trace.run_id for trace in traces], ["good"])
+
+    def test_legacy_trace_read_fallback_is_opt_in(self) -> None:
+        db_key = "unit__db-host__1521__freepdb1"
+        with tempfile.TemporaryDirectory() as td:
+            runtime_root = os.path.join(td, "runtime", "databases")
+            legacy_dir = os.path.join(td, "legacy", "traces")
+            os.makedirs(legacy_dir, exist_ok=True)
+            legacy_file = os.path.join(legacy_dir, "health_runs.jsonl")
+            with open(legacy_file, "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"run_id":"legacy","recorded_at":"2026-05-01T00:00:00+00:00","completed_at":"2026-05-01T00:00:00+00:00","database_name":"UNITDB","overall_status":"OK","summary":"legacy","metrics":{},"issues":[]}\n'
+                )
+            env = {
+                "ODB_AUTODBA_RUNTIME_ROOT": runtime_root,
+                "ODB_AUTODBA_TRACE_DIR": legacy_dir,
+                "ODB_AUTODBA_ENVIRONMENT": "unit",
+                "ORACLE_HOST": "db-host",
+                "ORACLE_PORT": "1521",
+                "ORACLE_SERVICE_NAME": "freepdb1",
+                "ORACLE_USER": "system",
+                "ORACLE_PASSWORD": "unit-secret",
+            }
+            unused_legacy_dir = Path(td) / "unused_legacy"
+            with patch("odb_autodba.rag.trace_store._legacy_trace_dirs", return_value=[unused_legacy_dir]):
+                with patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(read_health_run_traces(db_key=db_key, limit=None), [])
+            with patch("odb_autodba.rag.trace_store._legacy_trace_dirs", return_value=[unused_legacy_dir]):
+                with patch.dict(os.environ, {**env, "ODB_AUTODBA_ALLOW_LEGACY_READ_FALLBACK": "true"}, clear=False):
+                    self.assertEqual(read_health_run_traces(db_key=db_key, limit=None), [])
+            with patch("odb_autodba.rag.trace_store._legacy_trace_dirs", return_value=[Path(legacy_dir)]):
+                with patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(read_health_run_traces(db_key=db_key, limit=None), [])
+            with patch("odb_autodba.rag.trace_store._legacy_trace_dirs", return_value=[Path(legacy_dir)]):
+                with patch.dict(os.environ, {**env, "ODB_AUTODBA_ALLOW_LEGACY_READ_FALLBACK": "true"}, clear=False):
+                    traces = read_health_run_traces(db_key=db_key, limit=None)
+        self.assertEqual([trace.run_id for trace in traces], ["legacy"])
 
 
 if __name__ == "__main__":

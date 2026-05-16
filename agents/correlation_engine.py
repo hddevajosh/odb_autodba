@@ -207,6 +207,13 @@ def correlate_root_cause_from_traces(db_key: str, lookback_runs: int = 30, conte
         run_count=len(runs),
         context=resolved_context,
     )
+    candidate_bundle, gate_contradictions = _apply_hard_gates(
+        candidate_bundle=candidate_bundle,
+        latest_flat=latest_flat,
+        issue_signals=issue_signals,
+        metric_trends=metric_trends,
+        entity_signals=entity_signals,
+    )
 
     contradictions = _detect_contradictions(
         primary_category=candidate_bundle["primary_category"],
@@ -217,6 +224,7 @@ def correlate_root_cause_from_traces(db_key: str, lookback_runs: int = 30, conte
         primary_evidence=candidate_bundle["primary_evidence"],
         history_index_entries=history_index_entries,
     )
+    contradictions = _dedupe_lines(contradictions + gate_contradictions)
 
     primary_score = max(0.0, float(candidate_bundle["scores"].get(candidate_bundle["primary_category"], 0.0)) - _contradiction_penalty(contradictions))
     confidence = _confidence_from_score(primary_score, contradictions)
@@ -228,6 +236,11 @@ def correlate_root_cause_from_traces(db_key: str, lookback_runs: int = 30, conte
         "score": round(primary_score, 4),
         "evidence": candidate_bundle["primary_evidence"][:5],
     }
+    if contradictions:
+        primary_cause["confidence_reason"] = "reduced due to contradictions"
+        primary_cause["evidence"] = _dedupe_lines(
+            list(primary_cause["evidence"]) + ["Confidence reduced due to contradictions."]
+        )[:5]
 
     missing_evidence = _build_missing_evidence(
         runs=runs,
@@ -236,6 +249,17 @@ def correlate_root_cause_from_traces(db_key: str, lookback_runs: int = 30, conte
         entity_signals=entity_signals,
         primary_category=candidate_bundle["primary_category"],
     )
+    if (
+        candidate_bundle["primary_category"] == "io_bottleneck"
+        and "missing_io_wait_or_disk_latency_evidence" in missing_evidence
+        and confidence == "HIGH"
+    ):
+        confidence = "MEDIUM"
+        primary_cause["confidence"] = confidence
+        primary_cause["confidence_reason"] = "reduced due to missing_io_wait_or_disk_latency_evidence"
+        primary_cause["evidence"] = _dedupe_lines(
+            list(primary_cause.get("evidence") or []) + ["missing_io_wait_or_disk_latency_evidence present; HIGH confidence blocked."]
+        )[:5]
 
     recommendations = _build_recommended_steps(
         primary_category=candidate_bundle["primary_category"],
@@ -310,6 +334,7 @@ def render_correlation_section(correlation: dict[str, Any]) -> str:
     category = str(primary.get("category") or "inconclusive")
     label = str(primary.get("label") or _label_for_category(category))
     confidence = str(primary.get("confidence") or "LOW")
+    confidence_reason = str(primary.get("confidence_reason") or "").strip()
     score = float(primary.get("score") or 0.0)
 
     evidence = [str(item) for item in (primary.get("evidence") or []) if str(item).strip()][:5]
@@ -325,14 +350,31 @@ def render_correlation_section(correlation: dict[str, Any]) -> str:
         f"recurring_index={sources.get('recurring_issue_index_count', 0)}",
     ]
 
-    lines = [
-        "## 🔴 Root Cause Correlation",
-        "",
-        f"- Primary cause: {label} (`{category}`)",
-        f"- Confidence/score: {confidence} ({score:.2f})",
-        f"- Corroborating sources: {', '.join(source_parts)}",
-        "- Key evidence:",
-    ]
+    inconclusive_mode = category in {"inconclusive", "unknown_pattern"}
+    lines = ["## 🔴 Root Cause Correlation", ""]
+    if inconclusive_mode:
+        lines.extend(
+            [
+                f"- Historical watch item: {label}",
+                "- Decision: not current RCA",
+                f"- Confidence: {confidence}",
+                f"- raw_score={score:.2f}, decision=historical_watch_item_due_to_no_current_confirmation",
+                f"- Corroborating sources: {', '.join(source_parts)}",
+                "- Key evidence:",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"- Primary cause: {label} (`{category}`)",
+                f"- Confidence/score: {confidence} ({score:.2f})",
+                f"- Corroborating sources: {', '.join(source_parts)}",
+                "- Key evidence:",
+            ]
+        )
+    if confidence_reason:
+        insert_at = 6 if inconclusive_mode else 5
+        lines.insert(insert_at, f"- Confidence note: {confidence_reason}")
     if evidence:
         lines.extend([f"  - {item}" for item in evidence])
     else:
@@ -791,7 +833,197 @@ def _score_candidates(
         "score_components": score_components,
         "primary_evidence": _dedupe_lines(primary_evidence),
         "contributing_factors": _dedupe_lines(contributing),
+        "evidence_by_category": {key: _dedupe_lines(value)[:20] for key, value in evidence.items()},
     }
+
+
+def _apply_hard_gates(
+    *,
+    candidate_bundle: dict[str, Any],
+    latest_flat: dict[str, Any],
+    issue_signals: list[dict[str, Any]],
+    metric_trends: list[dict[str, Any]],
+    entity_signals: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    scores = {key: float(value or 0.0) for key, value in (candidate_bundle.get("scores") or {}).items()}
+    score_components = candidate_bundle.get("score_components") if isinstance(candidate_bundle.get("score_components"), dict) else {}
+    evidence_by_category = candidate_bundle.get("evidence_by_category") if isinstance(candidate_bundle.get("evidence_by_category"), dict) else {}
+    gate_contradictions: list[str] = []
+
+    def _append_evidence(category: str, text: str) -> None:
+        rows = evidence_by_category.get(category)
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(text)
+        evidence_by_category[category] = _dedupe_lines([str(item) for item in rows])[:20]
+
+    blocking_count = _metric_num(latest_flat, "blocking_count")
+    latest_blocking_issue = any(
+        bool(item.get("latest_present")) and _issue_to_candidate(item) == "blocking_lock" and SEVERITY_ORDER.get(str(item.get("severity") or "").upper(), 0) >= 2
+        for item in issue_signals
+    )
+    if blocking_count <= 0.0 and not latest_blocking_issue:
+        if scores.get("blocking_lock", 0.0) > 0:
+            gate_contradictions.append("Current metrics contradict blocking_lock (blocking_count=0 and no current blocking issue rows).")
+        scores["blocking_lock"] = 0.0
+        _append_evidence("blocking_lock", "Current blocking_count=0 with no current blocking rows; historical blocking marked historical_resolved.")
+
+    alert_count = _metric_num(latest_flat, "alert_ora_tns_count", "alert_log_count")
+    listener_error_count = _metric_num(latest_flat, "listener_error_count")
+    archive_error_count = _metric_num(latest_flat, "archive_dest_error_count")
+    hottest_ts_pct = _metric_num(latest_flat, "hottest_tablespace_pct")
+    fra_pct = _metric_num(latest_flat, "fra_pct")
+    current_storage_or_alert = bool(
+        alert_count > 0
+        or listener_error_count > 0
+        or archive_error_count > 0
+        or hottest_ts_pct >= 90.0
+        or fra_pct >= 85.0
+    )
+    if not current_storage_or_alert:
+        if scores.get("storage_or_alert_error", 0.0) > 0:
+            gate_contradictions.append(
+                "Current metrics contradict storage_or_alert_error (ORA/TNS rows=0 and no current alert/storage pressure)."
+            )
+        scores["storage_or_alert_error"] = 0.0
+        _append_evidence("storage_or_alert_error", "No current ORA/TNS/listener/archive/storage pressure rows; historical alerts marked historical_resolved.")
+
+    buffer_hit_pct = _metric_num(latest_flat, "buffer_hit_pct")
+    if buffer_hit_pct >= 90.0:
+        scores["cache_efficiency"] = min(scores.get("cache_efficiency", 0.0), 0.20)
+        _append_evidence("cache_efficiency", "Cache ratios are healthy/context only.")
+
+    memory_indicator_count = 0
+    pga_sga_pct = _metric_num(latest_flat, "pga_sga_pct", "pga_to_sga_pct")
+    pga_mb = _metric_num(latest_flat, "pga_mb")
+    temp_consumers = _metric_num(latest_flat, "temp_consumer_count")
+    temp_usage_pct = _metric_num(latest_flat, "temp_usage_pct")
+    host_mem = _metric_num(latest_flat, "memory_pct", "host_memory_pct")
+    container_mem = _metric_num(latest_flat, "container_memory_pct")
+    memory_hotspot_triggered = _metric_bool(latest_flat, "memory_hotspot_triggered")
+    if pga_sga_pct >= 25.0:
+        memory_indicator_count += 1
+    if pga_mb >= 2048.0:
+        memory_indicator_count += 1
+    if temp_consumers > 0 or temp_usage_pct >= 70.0:
+        memory_indicator_count += 1
+    if max(host_mem, container_mem) >= 85.0:
+        memory_indicator_count += 1
+    if memory_hotspot_triggered:
+        memory_indicator_count += 1
+    if _max_latest_numeric_for_tokens(latest_flat=latest_flat, include_tokens=("top_pga_sessions", "pga_used_mb")) >= 512.0:
+        memory_indicator_count += 1
+    if memory_indicator_count < 2:
+        if scores.get("memory_pressure", 0.0) > 0.49:
+            gate_contradictions.append("Current memory indicators are normal; memory_pressure cannot exceed LOW without at least two current indicators.")
+        scores["memory_pressure"] = min(scores.get("memory_pressure", 0.0), 0.29)
+        _append_evidence("memory_pressure", "Memory indicators are below incident thresholds (historical_not_current).")
+
+    io_wait_material = (
+        _metric_num(latest_flat, "io_wait_ms") >= 1.0
+        or any(
+            bool(item.get("latest_present"))
+            and _issue_to_candidate(item) == "io_bottleneck"
+            and SEVERITY_ORDER.get(str(item.get("severity") or "").upper(), 0) >= 3
+            for item in issue_signals
+        )
+    )
+    io_latency_ms = max(
+        _metric_num(latest_flat, "io_latency_ms"),
+        _metric_num(latest_flat, "avg_wait_ms"),
+        _max_latest_numeric_for_tokens(latest_flat=latest_flat, include_tokens=("latency",)),
+    )
+    io_impact = _metric_num(latest_flat, "db_time_s") >= 60.0 or _metric_num(latest_flat, "top_elapsed_sql_elapsed_s") >= 30.0
+    if not (io_wait_material and io_latency_ms >= 10.0 and io_impact):
+        if scores.get("io_bottleneck", 0.0) > 0.49:
+            gate_contradictions.append(
+                "Current I/O evidence is not material (wait class/latency/impact chain incomplete); io_bottleneck cannot exceed LOW."
+            )
+        scores["io_bottleneck"] = min(scores.get("io_bottleneck", 0.0), 0.49)
+    if io_latency_ms < 1.0:
+        scores["io_bottleneck"] = min(scores.get("io_bottleneck", 0.0), 0.29)
+        _append_evidence("io_bottleneck", "Observed I/O latency is negligible (<1 ms); microsecond waits are not incident-impacting.")
+
+    sql_material = bool(
+        _metric_num(latest_flat, "top_elapsed_sql_elapsed_s") >= 30.0
+        or _metric_num(latest_flat, "db_time_s") >= 60.0
+        or any(
+            bool(item.get("latest_present"))
+            and _issue_to_candidate(item) in {"sql_regression", "sql_performance_pattern"}
+            and (
+                "per_exec" in str(item.get("description") or "").lower()
+                or "per-exec" in str(item.get("description") or "").lower()
+                or "elapsed_per_exec" in " ".join(str(ev) for ev in (item.get("evidence") or [])).lower()
+            )
+            for item in issue_signals
+        )
+    )
+    if not sql_material:
+        if scores.get("sql_regression", 0.0) > 0.49:
+            gate_contradictions.append("Current SQL elapsed/DB time evidence is below materiality; SQL regression cannot exceed LOW.")
+        scores["sql_regression"] = min(scores.get("sql_regression", 0.0), 0.49)
+        _append_evidence("sql_regression", "Minor SQL elapsed movement below incident threshold.")
+
+    latest_issue_presence_by_category = {name: False for name in ALL_CANDIDATES}
+    for issue in issue_signals:
+        if not bool(issue.get("latest_present")):
+            continue
+        latest_issue_presence_by_category[_issue_to_candidate(issue)] = True
+    for entity in entity_signals:
+        if not bool(entity.get("latest_present")):
+            continue
+        for cat in _entity_type_to_candidates(str(entity.get("entity_type") or "")):
+            latest_issue_presence_by_category[cat] = True
+
+    for category in ALL_CANDIDATES:
+        if category in {"historical_recurrence", "unknown_pattern", "inconclusive"}:
+            continue
+        if latest_issue_presence_by_category.get(category):
+            continue
+        if scores.get(category, 0.0) <= 0:
+            continue
+        scores[category] = min(scores[category], 0.35)
+        _append_evidence(category, "Historical recurrence exists but is not present in current evidence (historical_not_current).")
+
+    ranked = sorted(
+        ALL_CANDIDATES,
+        key=lambda category: (scores.get(category, 0.0), -CANDIDATE_PRIORITY.get(category, 999)),
+        reverse=True,
+    )
+    primary = ranked[0] if ranked else "inconclusive"
+    if scores.get(primary, 0.0) < 0.20:
+        primary = "inconclusive"
+    if primary == "historical_recurrence" and not any(latest_issue_presence_by_category.get(cat) for cat in ALL_CANDIDATES if cat not in {"historical_recurrence", "unknown_pattern", "inconclusive"}):
+        primary = "inconclusive"
+        _append_evidence("inconclusive", "Recurring historical patterns are not currently active (historical_not_current).")
+
+    primary_evidence = _dedupe_lines([str(item) for item in (evidence_by_category.get(primary) or [])])[:8]
+    if not primary_evidence:
+        primary_evidence = ["No high-strength corroborated current signal was available."]
+    contributing: list[str] = []
+    for category in ranked:
+        if category == primary:
+            continue
+        score = scores.get(category, 0.0)
+        if score < 0.25:
+            continue
+        contributing.append(f"{_label_for_category(category)} (score={score:.2f})")
+    contributing = _dedupe_lines(contributing)
+
+    for category, components in score_components.items():
+        if isinstance(components, dict):
+            components["weighted_score"] = round(scores.get(category, 0.0), 4)
+
+    updated = {
+        **candidate_bundle,
+        "primary_category": primary,
+        "scores": {key: round(value, 4) for key, value in scores.items()},
+        "score_components": score_components,
+        "primary_evidence": primary_evidence,
+        "contributing_factors": contributing,
+        "evidence_by_category": evidence_by_category,
+    }
+    return updated, _dedupe_lines(gate_contradictions)
 
 
 def _context_factor(*, category: str, context: str) -> float:
@@ -941,6 +1173,10 @@ def _build_recommended_steps(*, primary_category: str, contradictions: list[str]
 
 
 def _confidence_from_score(score: float, contradictions: list[str]) -> str:
+    if any("contradict" in str(item).lower() for item in contradictions):
+        if score < 0.30:
+            return "LOW"
+        return "LOW"
     if score >= 0.75 and not contradictions:
         return "HIGH"
     if score >= 0.45:
@@ -1103,6 +1339,40 @@ def _data_completeness(
     checks += 1
     fields += 1 if issue_signals else 0
     return fields / max(checks, 1)
+
+
+def _metric_num(latest_flat: dict[str, Any], *metric_names: str) -> float:
+    for name in metric_names:
+        target = f"metrics.{str(name).strip().lower()}"
+        for path, value in latest_flat.items():
+            if not _is_numeric(value):
+                continue
+            if str(path).strip().lower() == target:
+                return float(value)
+    return 0.0
+
+
+def _metric_bool(latest_flat: dict[str, Any], metric_name: str) -> bool:
+    target = f"metrics.{str(metric_name).strip().lower()}"
+    for path, value in latest_flat.items():
+        if str(path).strip().lower() != target:
+            continue
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _max_latest_numeric_for_tokens(*, latest_flat: dict[str, Any], include_tokens: tuple[str, ...]) -> float:
+    max_value = 0.0
+    for path, value in latest_flat.items():
+        if not _is_numeric(value):
+            continue
+        lowered = str(path).lower()
+        if not all(token in lowered for token in include_tokens):
+            continue
+        max_value = max(max_value, float(value))
+    return max_value
 
 
 def _find_numeric(flat: dict[str, Any], include: tuple[str, ...], exclude: tuple[str, ...]) -> float | None:

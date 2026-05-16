@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,7 +25,9 @@ from odb_autodba.utils.formatter import (
     render_planner_response,
     render_sql_id_deep_dive_report,
 )
-from odb_autodba.utils.sql_analysis import detect_history_metric_question
+from odb_autodba.utils.sql_analysis import detect_history_metric_question, looks_like_history_request
+
+LOGGER = logging.getLogger(__name__)
 
 
 def run_health_check(db_key: str | None = None) -> dict[str, Any]:
@@ -47,6 +51,11 @@ def run_health_check(db_key: str | None = None) -> dict[str, Any]:
         "summary": response.summary,
         "rendered_report": rendered_report,
         "supporting_data": supporting,
+        "issues": [issue.model_dump(mode="json") for issue in (response.issues or [])],
+        "remediation_proposal": response.remediation_proposal.model_dump(mode="json")
+        if response.remediation_proposal is not None
+        else None,
+        "remediation_review": supporting.get("review") if isinstance(supporting.get("review"), dict) else None,
         "root_cause": root_cause,
         "trace_path": trace_path,
         "report_path": report_path,
@@ -108,14 +117,48 @@ def get_active_sessions(db_key: str | None = None) -> dict[str, Any]:
     return _attach_correlation(result, db_key=resolved_db_key, context="blocking")
 
 
-def run_ai_investigation(query: str, db_key: str | None = None) -> dict[str, Any]:
+def run_ai_investigation(
+    query: str,
+    db_key: str | None = None,
+    *,
+    thread_id: str | None = None,
+    continue_context: bool | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    job_id: str | None = None,
+) -> dict[str, Any]:
     resolved_db_key = _resolve_db_key(db_key)
     prompt = (query or "").strip() or "Investigate Oracle performance issues"
-    if detect_history_metric_question(prompt):
+    question_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16] if prompt else ""
+    requested_thread_id = str(thread_id or "").strip()
+    thread_context_requested = bool(requested_thread_id or continue_context)
+    LOGGER.info(
+        "investigation_request_received db_key=%s question_present=%s question_len=%s question_hash=%s thread_id=%s continue_context=%s thread_memory_enabled=false",
+        resolved_db_key,
+        str(bool(prompt)).lower(),
+        len(prompt),
+        question_hash,
+        requested_thread_id,
+        str(continue_context if continue_context is not None else ""),
+    )
+    if thread_context_requested:
+        LOGGER.info(
+            "investigation_thread_context_ignored=true db_key=%s thread_id=%s continue_context=%s thread_memory_enabled=false",
+            resolved_db_key,
+            requested_thread_id,
+            str(continue_context if continue_context is not None else ""),
+        )
+    if looks_like_history_request(prompt) and detect_history_metric_question(prompt) and not _is_sql_id_metadata_investigation_prompt(prompt):
         return answer_history_metric_question(prompt, db_key=resolved_db_key)
     try:
         with db_key_context(resolved_db_key):
-            report = InvestigationAgent(db_key=resolved_db_key).investigate(prompt, db_key=resolved_db_key)
+            report = InvestigationAgent(db_key=resolved_db_key).investigate(
+                prompt,
+                db_key=resolved_db_key,
+            )
+        if not str(report.problem_statement or "").strip():
+            report.problem_statement = prompt
+        diagnostic_mode = _should_include_investigation_rca(prompt=prompt, report=report)
         supporting = {
             "question": prompt,
             "problem_statement": report.problem_statement,
@@ -123,34 +166,74 @@ def run_ai_investigation(query: str, db_key: str | None = None) -> dict[str, Any
             "evidence": list(report.evidence or []),
             "steps": [step.model_dump(mode="json") for step in (report.steps or [])],
             "trace_path": report.trace_path or "",
+            "investigation_planner_requested": bool(report.planner_requested),
+            "planner_provider": report.planner_provider,
+            "planner_model": report.planner_model,
+            "planner_elapsed_ms": report.planner_elapsed_ms,
+            "planner_steps_count": report.planner_steps_count,
+            "fallback_used": bool(report.fallback_used),
+            "fallback_reason": report.fallback_reason,
+            "plan_type": report.plan_type,
+            "diagnostic_mode": diagnostic_mode,
+            "thread_memory_enabled": False,
+            "thread_context_ignored": bool(thread_context_requested),
+            "thread_id_ignored": requested_thread_id,
+            "termination_reason": report.termination_reason,
+            "clarification_question": str(report.clarification_question or "").strip(),
         }
+        investigation_status = "needs_clarification" if str(report.termination_reason or "").strip() == "clarification_required" else "complete"
         actions = list(report.recommended_next_actions or [])
         base_report = render_investigation_final_report(report)
-        root_cause = infer_root_cause(
-            mode="investigation",
-            summary=report.summary,
-            supporting_data=supporting,
-            rendered_report=base_report,
+        root_cause: dict[str, Any] = {}
+        rendered = base_report
+        if diagnostic_mode:
+            root_cause = infer_root_cause(
+                mode="investigation",
+                summary=report.summary,
+                supporting_data=supporting,
+                rendered_report=base_report,
+            )
+            heading = _investigation_heading_for_query(prompt=prompt, root_cause=root_cause)
+            rendered = _append_root_cause_section(base_report, root_cause, heading=heading)
+        LOGGER.info(
+            "investigation_planner_requested=%s planner_provider=%s planner_model=%s planner_elapsed_ms=%s planner_steps_count=%s fallback_used=%s fallback_reason=%s diagnostic_mode=%s",
+            str(bool(report.planner_requested)).lower(),
+            str(report.planner_provider or ""),
+            str(report.planner_model or ""),
+            int(report.planner_elapsed_ms or 0),
+            int(report.planner_steps_count or 0),
+            str(bool(report.fallback_used)).lower(),
+            str(report.fallback_reason or ""),
+            str(bool(diagnostic_mode)).lower(),
         )
-        heading = _investigation_heading_for_query(prompt=prompt, root_cause=root_cause)
-        rendered = _append_root_cause_section(base_report, root_cause, heading=heading)
         result = {
             "ok": True,
             "db_key": resolved_db_key,
+            "problem_statement": prompt,
+            "question": prompt,
             "summary": report.summary,
+            "report_text": rendered,
             "rendered_report": rendered,
             "supporting_data": supporting,
             "root_cause": root_cause,
             "actions": actions,
             "trace_path": _extract_trace_path(supporting),
             "report_path": _extract_report_path(supporting),
+            "thread_id": requested_thread_id,
+            "thread_memory_enabled": False,
+            "status": investigation_status,
         }
-        return _attach_correlation(result, db_key=resolved_db_key, context=_context_from_question(prompt))
+        if diagnostic_mode:
+            return _attach_correlation(result, db_key=resolved_db_key, context=_context_from_question(prompt))
+        return result
     except Exception as exc:
         return {
             "ok": False,
             "db_key": resolved_db_key,
+            "problem_statement": prompt,
+            "question": prompt,
             "summary": "Investigation failed.",
+            "report_text": "",
             "rendered_report": "",
             "supporting_data": {},
             "root_cause": {
@@ -169,6 +252,8 @@ def run_ai_investigation(query: str, db_key: str | None = None) -> dict[str, Any
             "error_type": type(exc).__name__,
             "endpoint": "investigate",
             "actions": [],
+            "thread_id": requested_thread_id,
+            "thread_memory_enabled": False,
         }
 
 
@@ -364,6 +449,8 @@ def _render_general_history_metric_summary(
         "runs_scanned": len(traces),
         "matched_runs": len(traces_in_window),
         "fields": requested_fields,
+        "sample_count": evidence.get("sample_count"),
+        "field_summaries": _fallback_field_summaries(evidence=evidence),
         "fallback_used": False,
     }
 
@@ -626,6 +713,45 @@ def _render_focused_history_metric_report(
     return rendered, summary
 
 
+def _fallback_field_summaries(*, evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    numeric_samples = evidence.get("numeric_samples") if isinstance(evidence.get("numeric_samples"), dict) else {}
+    summaries: list[dict[str, Any]] = []
+    for field, raw_values in numeric_samples.items():
+        if not isinstance(raw_values, list) or not raw_values:
+            continue
+        values = [float(value) for value in raw_values]
+        recent_values = values[-3:] if len(values) >= 3 else values
+        average = sum(values) / len(values)
+        recent_average = sum(recent_values) / len(recent_values)
+        latest = values[-1]
+        minimum = min(values)
+        maximum = max(values)
+        summaries.append(
+            {
+                "field": str(field),
+                "sample_count": len(values),
+                "latest": round(latest, 3),
+                "current": round(latest, 3),
+                "average_normal": round(average, 3),
+                "recent_average": round(recent_average, 3),
+                "min": round(minimum, 3),
+                "max": round(maximum, 3),
+                "range": round(maximum - minimum, 3),
+                "state": _fallback_metric_state(field=str(field), latest=latest, average=average),
+            }
+        )
+    return summaries
+
+
+def _fallback_metric_state(*, field: str, latest: float, average: float) -> str:
+    threshold = 85.0 if field.endswith("_pct") else 1.0 if field.endswith("_count") else 120.0 if field.endswith(("_cpu_s", "_elapsed_s")) else None
+    if threshold is not None and latest >= threshold:
+        return "pressured"
+    if average and latest >= average * 1.2:
+        return "elevated"
+    return "normal"
+
+
 def analyze_awr(question: str | None = None, db_key: str | None = None) -> dict[str, Any]:
     resolved_db_key = _resolve_db_key(db_key)
     prompt = (question or "").strip() or "Analyze AWR from saved health runs."
@@ -881,6 +1007,50 @@ def _context_from_question(question: str) -> str:
     if any(token in text for token in ("sql", "plan hash", "sql_id")):
         return "sql"
     return "general"
+
+
+def _is_sql_id_metadata_investigation_prompt(prompt: str) -> bool:
+    text = str(prompt or "").strip().lower()
+    if "sql_id" not in text and "sql id" not in text:
+        return False
+    metadata_tokens = (
+        "memory or awr history",
+        "exists in memory or awr history",
+        "exists in memory",
+        "awr history",
+        "tables involved",
+        "indexes used",
+        "stats were last analyzed",
+        "stale or missing",
+        "plan objects",
+        "sql text",
+    )
+    return any(token in text for token in metadata_tokens)
+
+
+def _should_include_investigation_rca(*, prompt: str, report: Any) -> bool:
+    plan_type = str(getattr(report, "plan_type", "") or "").strip().lower()
+    if plan_type in {"inventory_read_only_lookup", "current_state", "list", "lookup", "read_only_lookup"}:
+        return False
+    if plan_type in {"diagnostic", "root_cause", "performance_diagnostic"}:
+        return True
+    text = str(prompt or "").strip().lower()
+    diagnostic_tokens = (
+        "root cause",
+        "diagnose",
+        "why",
+        "slow",
+        "bottleneck",
+        "regression",
+        "tune",
+        "high wait",
+        "latency",
+        "high cpu",
+        "performance issue",
+        "sql_id performance",
+        "blocking root cause",
+    )
+    return any(token in text for token in diagnostic_tokens)
 
 
 def _investigation_heading_for_query(*, prompt: str, root_cause: dict[str, Any]) -> str:

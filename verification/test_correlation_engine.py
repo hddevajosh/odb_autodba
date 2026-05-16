@@ -194,6 +194,10 @@ class CorrelationEngineTests(unittest.TestCase):
         contradictions = [str(item) for item in (corr.get("contradictions") or [])]
         self.assertTrue(any("local_app_host" in item for item in contradictions))
         self.assertNotEqual((corr.get("primary_cause") or {}).get("confidence"), "HIGH")
+        self.assertEqual((corr.get("primary_cause") or {}).get("confidence_reason"), "reduced due to contradictions")
+        self.assertTrue(
+            any("reduced due to contradictions" in str(item).lower() for item in ((corr.get("primary_cause") or {}).get("evidence") or []))
+        )
 
     def test_historical_recurrence_does_not_override_stronger_current_evidence(self) -> None:
         blocking = {"category": "blocking", "title": "Lock contention", "severity": "CRITICAL", "description": "blockers"}
@@ -258,6 +262,27 @@ class CorrelationEngineTests(unittest.TestCase):
         }
         rendered = render_correlation_section(corr)
         self.assertIn("## 🔴 Root Cause Correlation", rendered)
+
+    def test_inconclusive_render_uses_historical_watch_item_wording(self) -> None:
+        corr = {
+            "primary_cause": {
+                "category": "inconclusive",
+                "label": "SQL performance pattern",
+                "confidence": "LOW",
+                "score": 0.8,
+                "evidence": ["No dominant current incident signal."],
+            },
+            "contributing_factors": [],
+            "contradictions": [],
+            "missing_evidence": [],
+            "recommended_next_steps": [],
+            "sources_used": {"health_runs_used": 2, "history_index_entry_count": 1, "recurring_issue_index_count": 0},
+        }
+        rendered = render_correlation_section(corr)
+        self.assertIn("Historical watch item: SQL performance pattern", rendered)
+        self.assertIn("Decision: not current RCA", rendered)
+        self.assertIn("raw_score=0.80", rendered)
+        self.assertNotIn("Primary cause: SQL performance pattern", rendered)
 
     def test_service_result_includes_correlation(self) -> None:
         response = PlannerResponse(

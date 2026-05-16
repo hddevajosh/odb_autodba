@@ -1291,7 +1291,8 @@ class JsonlHistoryService:
                 and mapping.previous.begin_snap_id == mapping.current.begin_snap_id
                 and mapping.previous.end_snap_id == mapping.current.end_snap_id
             )
-            if same_window or bool((mapping.debug or {}).get("same_snap_selected")):
+            adjacent_mode = bool((mapping.debug or {}).get("same_snap_adjacent_interval_mode"))
+            if (same_window or bool((mapping.debug or {}).get("same_snap_selected"))) and not adjacent_mode:
                 notes.append("AWR snapshots mapped successfully but same-window comparison is weak.")
                 return awr_diff, notes, "awr_same_window_weak", debug_message
             if awr_diff.snapshot_quality and awr_diff.snapshot_quality.coverage_quality in {"LOW", "NONE"}:
@@ -1981,12 +1982,8 @@ class JsonlHistoryService:
         text_enriched = bool(awr_diff and awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available)
         if fallback_mode == "none" and awr_diff and awr_diff.available:
             if awr_diff.awr_mode == "single_window_interpretation":
-                if text_enriched:
-                    return "AWR used single-window interpretation with report-text enrichment; historical context was applied."
-                return "AWR used single-window interpretation; historical context was applied."
-            if text_enriched:
-                return "AWR workload comparison used run-pair snapshot windows and was enriched with AWR report-text summaries."
-            return "AWR workload comparison used run-pair snapshot windows."
+                return "AWR used structured DBA_HIST single-window context."
+            return "AWR used structured DBA_HIST adjacent-interval comparison."
         if fallback_mode == "awr_same_window_weak":
             if text_enriched:
                 return "AWR used single-window interpretation with report-text enrichment; comparison is not applicable."
@@ -2015,9 +2012,7 @@ class JsonlHistoryService:
         text_enriched = bool(awr_diff and awr_diff.awr_report_text_summary and awr_diff.awr_report_text_summary.available)
         if awr_diff and awr_diff.available:
             if awr_diff.awr_mode == "single_window_interpretation":
-                if text_enriched:
-                    return "AWR source: single-window analysis with report-text enrichment (comparison not applicable)"
-                return "AWR source: single-window analysis (comparison not applicable)"
+                return "AWR source: structured DBA_HIST single-window context"
             if fallback_mode == "awr_same_window_weak":
                 if text_enriched:
                     return "AWR source: single-window analysis with report-text enrichment (comparison not applicable)"
@@ -2026,9 +2021,7 @@ class JsonlHistoryService:
                 if text_enriched:
                     return "AWR source: available, partial metrics + report-text enrichment"
                 return "AWR source: available, partial metrics"
-            if text_enriched:
-                return "AWR source: available, run-pair diff + report-text enrichment"
-            return "AWR source: available, run-pair workload diff used"
+            return "AWR source: structured DBA_HIST adjacent-interval comparison"
         if fallback_mode == "awr_disabled":
             return "AWR source: disabled, JSONL fallback used"
         if fallback_mode == "awr_unavailable":

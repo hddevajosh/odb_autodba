@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any
 
@@ -39,6 +41,13 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
     db_status = _db_status()
     raw["db_status"] = db_status
     sections.append(_section("Database Status", _db_status_level(db_status), _db_status_summary(db_status), [db_status] if db_status else []))
+    role_mode = _database_role_mode(db_status)
+    raw["database_role_mode"] = role_mode
+    raw["standby_health_mode"] = bool(role_mode.get("standby_health_mode"))
+    raw["primary_style_checks_skipped_for_mounted_standby"] = bool(role_mode.get("primary_style_checks_skipped"))
+    sections.append(_database_role_mode_section(role_mode))
+    if role_mode.get("standby_health_mode"):
+        sections.append(_standby_role_open_mode_section(db_status=db_status, role_mode=role_mode))
 
     alert_check = _alert_log_check(hours)
     alert_rows = alert_check["rows"]
@@ -48,9 +57,15 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
     sections.append(alert_section)
     actions.extend(_alert_actions(alert_rows, hours))
 
-    storage_rows = _tablespace_rows()
+    storage_rows, storage_note = _tablespace_rows()
     raw["tablespaces"] = storage_rows
+    raw["tablespace_headline_source"] = (
+        "DBA_TABLESPACE_USAGE_METRICS" if not storage_note else "Fallback calculation used; DBA_TABLESPACE_USAGE_METRICS unavailable."
+    )
+    raw["tablespace_headline_note"] = storage_note
     tablespace_section = _tablespace_section(storage_rows)
+    if storage_note:
+        tablespace_section.notes.append(storage_note)
     anomaly_note = _tablespace_allocation_note(alert_rows=alert_rows, tablespace_rows=storage_rows)
     if anomaly_note:
         tablespace_section.notes.append(anomaly_note)
@@ -58,37 +73,57 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
         raw["tablespace_allocation_failure_with_low_pct"] = True
     sections.append(tablespace_section)
     actions.extend(_tablespace_actions(storage_rows))
+    allocation_rows = _tablespace_allocation_details()
+    raw["tablespace_allocation_details"] = allocation_rows
+    sections.append(_tablespace_allocation_section(allocation_rows))
 
     temp = _temp_summary()
     raw["temp"] = temp
-    sections.append(_temp_section(temp))
+    raw["temp_pct"] = _float((temp.get("capacity") or {}).get("temp_used_pct"))
+    sections.extend(_temp_sections(temp))
     actions.extend(_temp_actions(temp))
 
-    locks, lock_err = _lock_pairs()
-    raw["lock_pairs"] = locks
-    lock_section: HealthCheckSection
-    if lock_err and not locks:
+    locks: list[dict[str, Any]] = []
+    lock_err: str | None = None
+    if role_mode.get("primary_style_checks_skipped"):
         sections.append(
             _section(
                 "Locks And Blocking",
-                "WARNING",
-                "Blocking-session query could not be completed.",
+                "INFO",
+                "Skipped in mounted standby mode.",
                 [],
-                notes=[lock_err],
+                notes=["Primary-style blocking RCA is skipped in mounted standby mode unless recovery operations are impacted."],
             )
         )
     else:
-        lock_notes = [f"Query warning: {lock_err}"] if lock_err else []
-        lock_section = _section(
-            "Locks And Blocking",
-            "CRITICAL" if locks else "OK",
-            "No blocking sessions detected." if not locks else f"{len(locks)} blocked session(s) detected.",
-            locks[:10],
-            notes=lock_notes,
-        )
-        sections.append(lock_section)
-    if locks:
-        actions.append(ActionableHealthItem(category="blocking", title="Blocking locks detected", severity="CRITICAL", detail=f"{len(locks)} blocked session(s) found.", recommendation="Review blocker SQL and user before using the guarded remediation flow.", evidence=[_lock_evidence(row) for row in locks[:3]]))
+        locks, lock_err = _lock_pairs()
+        lock_section: HealthCheckSection
+        if lock_err and not locks:
+            sections.append(
+                _section(
+                    "Locks And Blocking",
+                    "WARNING",
+                    "Blocking-session query could not be completed.",
+                    [],
+                    notes=[lock_err],
+                )
+            )
+        else:
+            lock_notes = [f"Query warning: {lock_err}"] if lock_err else []
+            lock_status = _worst([str(row.get("blocking_severity") or "INFO") for row in locks]) if locks else "OK"
+            lock_section = _section(
+                "Locks And Blocking",
+                lock_status,
+                "No blocking sessions detected." if not locks else f"{len(locks)} blocked session(s) detected.",
+                locks[:10],
+                notes=lock_notes,
+            )
+            sections.append(lock_section)
+    raw["lock_pairs"] = locks
+    if locks and not role_mode.get("primary_style_checks_skipped"):
+        action_severity = _worst([str(row.get("blocking_severity") or "INFO") for row in locks])
+        if action_severity in {"CRITICAL", "WARNING"}:
+            actions.append(ActionableHealthItem(category="blocking", title="Blocking locks detected", severity=action_severity, detail=f"{len(locks)} blocked session(s) found.", recommendation="Review blocker SQL and user before using the guarded remediation flow.", evidence=[_lock_evidence(row) for row in locks[:3]]))
 
     invalids = _invalid_objects()
     raw["invalid_objects"] = invalids
@@ -98,8 +133,23 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
 
     redo = _redo_archive(hours)
     raw["redo_archive"] = redo
+    raw["redo"] = {"count": redo.get("switches_24h_total"), "rate_per_hr": redo.get("max_switches_per_hour")}
     sections.append(_redo_section(redo, hours))
     actions.extend(_redo_actions(redo, hours))
+
+    services = _services_and_routing(role_mode=role_mode)
+    raw["services"] = services
+    if role_mode.get("standby_health_mode"):
+        sections.append(_standby_services_section(services))
+    else:
+        sections.append(_services_section(services))
+    actions.extend(_services_actions(services))
+
+    if role_mode.get("standby_health_mode"):
+        standby = _standby_health_checks(hours=hours, role_mode=role_mode)
+        raw.update(standby.get("raw") or {})
+        sections.extend(standby.get("sections") or [])
+        actions.extend(standby.get("actions") or [])
 
     recovery = _recovery(hours)
     raw["recovery"] = recovery
@@ -112,25 +162,51 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
     if scheduler:
         actions.append(ActionableHealthItem(category="scheduler", title="Scheduler job failures", severity="CRITICAL", detail=f"{len(scheduler)} failed job run sample row(s) in the last {hours}h.", recommendation="Review failed job logs and fix job-specific errors.", evidence=[str(row) for row in scheduler[:3]]))
 
-    performance = _performance(hours)
-    raw["performance"] = performance
-    performance_sections = _performance_sections(performance)
-    sections.extend(performance_sections)
-    actions.extend(_performance_actions(performance, hours))
-    lock_wait_note = _lock_wait_without_blocker_note(
-        wait_rows=(performance.get("current_waits") or []) + (performance.get("awr_waits") or []),
-        has_blockers=bool(locks),
-    )
-    if lock_wait_note:
-        raw["blocking_interpretation_note"] = lock_wait_note
-        for section in sections:
-            if section.name in {"Locks And Blocking", "Current Wait Profile", "AWR Wait Events"}:
-                section.notes.append(lock_wait_note)
+    if role_mode.get("primary_style_checks_skipped"):
+        sections.extend(
+            [
+                _section("Performance Overview", "INFO", "Skipped in mounted standby mode.", notes=["Primary-style SQL/top-plan RCA is skipped in mounted standby mode."]),
+                _section("Current Wait Profile", "INFO", "Skipped in mounted standby mode."),
+                _section("Session Wait Correlation", "INFO", "Skipped in mounted standby mode."),
+                _section("AWR Wait Events", "INFO", "Skipped in mounted standby mode."),
+                _section("Cache Ratios", "INFO", "Skipped in mounted standby mode."),
+            ]
+        )
+        raw["performance"] = {"skipped": True, "reason": "mounted_physical_standby"}
+    else:
+        performance = _performance(hours)
+        raw["performance"] = performance
+        performance_sections = _performance_sections(performance)
+        if role_mode.get("standby_health_mode"):
+            for section in performance_sections:
+                section.status = "INFO"
+                section.notes.append("Read-only standby workload context: primary-style SQL regression/RCA is demoted.")
+        sections.extend(performance_sections)
+        if not role_mode.get("standby_health_mode"):
+            actions.extend(_performance_actions(performance, hours))
+        lock_wait_note = _lock_wait_without_blocker_note(
+            wait_rows=(performance.get("current_waits") or []) + (performance.get("awr_waits") or []),
+            has_blockers=bool(locks),
+        )
+        if lock_wait_note:
+            raw["blocking_interpretation_note"] = lock_wait_note
+            for section in sections:
+                if section.name in {"Locks And Blocking", "Current Wait Profile", "AWR Wait Events"}:
+                    section.notes.append(lock_wait_note)
 
     transactions = _transactions()
     raw["transactions"] = transactions
-    sections.append(_transaction_section(transactions))
-    actions.extend(_transaction_actions(transactions))
+    tx_section = _transaction_section(transactions)
+    if role_mode.get("primary_style_checks_skipped"):
+        tx_section.status = "INFO"
+        tx_section.summary = "Skipped in mounted standby mode."
+        tx_section.notes.append("DML/transaction workload RCA is skipped in mounted standby mode.")
+    elif role_mode.get("standby_health_mode"):
+        tx_section.status = "INFO"
+        tx_section.notes.append("Standby mode: transaction/undo findings are contextual only.")
+    sections.append(tx_section)
+    if not role_mode.get("standby_health_mode"):
+        actions.extend(_transaction_actions(transactions))
 
     memory = _memory_config()
     raw["memory_config"] = memory
@@ -141,6 +217,8 @@ def collect_extended_health(window_hours: int = 24) -> tuple[list[HealthCheckSec
     raw["init_params"] = init_params
     sections.append(_section("Init Parameters", "INFO", f"{len(init_params.get('non_default', []))} non-default parameter row(s), {len(init_params.get('key', []))} key parameter row(s).", init_params.get("key", [])[:25], notes=[f"Non-default parameters captured: {len(init_params.get('non_default', []))}"]))
 
+    raw["dba_trust_checks"] = _build_dba_trust_checks(raw=raw, sections=sections)
+    sections.append(_dba_trust_section(raw["dba_trust_checks"]))
     return sections, actions, raw
 
 
@@ -163,23 +241,40 @@ def _section(name: str, status: str, summary: str, rows: list[dict[str, Any]] | 
 
 
 def _db_status() -> dict[str, Any]:
-    row, err = _fetch_one(
+    rows, err = _fetch_all(
         """
-        select d.name as db_name, d.open_mode, d.database_role, d.log_mode,
-               i.instance_name, i.status as instance_status
-        from v$database d cross join v$instance i
+        select i.inst_id,
+               d.name as db_name,
+               d.open_mode,
+               d.database_role,
+               d.protection_mode,
+               d.protection_level,
+               d.switchover_status,
+               d.log_mode,
+               i.instance_name,
+               i.host_name,
+               i.status as instance_status,
+               i.thread# as thread,
+               i.parallel
+        from v$database d
+        cross join gv$instance i
+        order by i.inst_id
         """
     )
     if err:
         return {"error": err}
-    return row
+    if not rows:
+        return {}
+    out = dict(rows[0])
+    out["instances"] = rows
+    return out
 
 
 def _db_status_level(row: dict[str, Any]) -> str:
     if row.get("error"):
         return "CRITICAL"
     open_mode = str(row.get("open_mode") or "").upper()
-    return "OK" if open_mode.startswith("READ") or open_mode == "OPEN" else "CRITICAL"
+    return "OK" if open_mode.startswith("READ") or open_mode in {"OPEN", "MOUNTED"} else "CRITICAL"
 
 
 def _db_status_summary(row: dict[str, Any]) -> str:
@@ -264,111 +359,669 @@ def _alert_actions(rows: list[dict[str, Any]], hours: int) -> list[ActionableHea
     return [ActionableHealthItem(category="errors", title="Alert log ORA/TNS events", severity=worst, detail=f"{len(rows)} ORA/TNS alert log row(s) detected in the last {hours}h.", recommendation="Correlate alert log errors with workload, sessions, listener, and recent changes.", evidence=[f"{row.get('ts')} {row.get('code')} {row.get('message')}" for row in rows[:3]])]
 
 
-def _tablespace_rows() -> list[dict[str, Any]]:
+def _database_role_mode(db_status: dict[str, Any]) -> dict[str, Any]:
+    role = str(db_status.get("database_role") or "").strip()
+    open_mode = str(db_status.get("open_mode") or "").strip()
+    role_u = role.upper()
+    open_u = open_mode.upper()
+    standby_roles = {"PHYSICAL STANDBY", "LOGICAL STANDBY", "SNAPSHOT STANDBY"}
+    is_standby = role_u in standby_roles
+    is_physical_standby = role_u == "PHYSICAL STANDBY"
+    is_mounted_physical_standby = is_physical_standby and open_u == "MOUNTED"
+    return {
+        "role": role or "UNKNOWN",
+        "open_mode": open_mode or "UNKNOWN",
+        "role_upper": role_u,
+        "open_mode_upper": open_u,
+        "standby_health_mode": bool(is_standby),
+        "is_primary": role_u == "PRIMARY",
+        "is_standby": bool(is_standby),
+        "is_physical_standby": bool(is_physical_standby),
+        "is_mounted_physical_standby": bool(is_mounted_physical_standby),
+        "is_read_only_standby": bool(is_standby and open_u.startswith("READ ONLY")),
+        "primary_style_checks_skipped": bool(is_mounted_physical_standby),
+        "detected": bool(role_u),
+        "status": "OK" if role_u else "WARNING",
+    }
+
+
+def _database_role_mode_section(role_mode: dict[str, Any]) -> HealthCheckSection:
+    status = str(role_mode.get("status") or "WARNING")
+    summary = (
+        "Standby health mode enabled."
+        if role_mode.get("standby_health_mode")
+        else "Primary health mode enabled."
+    )
+    if status == "WARNING":
+        summary = "Database role detection unavailable; conservative logic applied."
+    row = {
+        "role": role_mode.get("role"),
+        "open_mode": role_mode.get("open_mode"),
+        "standby_health_mode": "enabled" if role_mode.get("standby_health_mode") else "disabled",
+        "primary_style_checks_skipped": "yes" if role_mode.get("primary_style_checks_skipped") else "no",
+    }
+    return _section("Database Role Mode", status, summary, [row])
+
+
+def _standby_role_open_mode_section(*, db_status: dict[str, Any], role_mode: dict[str, Any]) -> HealthCheckSection:
+    rows = [
+        {
+            "db_name": db_status.get("db_name"),
+            "database_role": db_status.get("database_role"),
+            "open_mode": db_status.get("open_mode"),
+            "protection_mode": db_status.get("protection_mode"),
+            "protection_level": db_status.get("protection_level"),
+            "switchover_status": db_status.get("switchover_status"),
+            "log_mode": db_status.get("log_mode"),
+        }
+    ]
+    expected_raw = os.getenv("ODB_AUTODBA_STANDBY_EXPECTED_OPEN_MODE", "").strip()
+    expected_modes = {part.strip().upper() for part in expected_raw.split(",") if part.strip()}
+    open_mode = str(db_status.get("open_mode") or "").upper()
+    status = "OK" if role_mode.get("detected") else "WARNING"
+    notes: list[str] = []
+    if expected_modes:
+        if open_mode not in expected_modes:
+            status = "CRITICAL" if role_mode.get("is_physical_standby") else "WARNING"
+            notes.append(f"Expected standby open mode(s): {sorted(expected_modes)}; current: {open_mode or 'UNKNOWN'}.")
+        else:
+            notes.append(f"Expected standby open mode check passed: {open_mode}.")
+    summary = "Database role/open mode captured for standby interpretation."
+    return _section("Standby Role / Open Mode", status, summary, rows, notes=notes)
+
+
+def _standby_health_checks(*, hours: int, role_mode: dict[str, Any]) -> dict[str, Any]:
+    sections: list[HealthCheckSection] = []
+    actions: list[ActionableHealthItem] = []
+    raw: dict[str, Any] = {}
+
+    managed_section, managed_raw = _standby_managed_recovery_section(role_mode=role_mode)
+    lag_section, lag_raw = _standby_lag_section()
+    gap_section, gap_raw = _standby_archive_gap_section()
+    dest_section, dest_raw = _standby_archive_dest_section()
+    dg_status_section, dg_status_raw = _standby_dataguard_status_section(hours=hours)
+    dg_alert_section, dg_alert_raw = _standby_alert_log_signals_section(hours=hours)
+    listener_section, listener_raw = _listener_connectivity_log_signals_section(hours=hours)
+
+    sections.extend(
+        [
+            managed_section,
+            lag_section,
+            gap_section,
+            dest_section,
+            dg_status_section,
+            dg_alert_section,
+            listener_section,
+        ]
+    )
+    raw["standby_managed_recovery"] = managed_raw
+    raw["standby_lag"] = lag_raw
+    raw["archive_gap"] = gap_raw
+    raw["archive_dest_status"] = dest_raw
+    raw["dataguard_status"] = dg_status_raw
+    raw["standby_alert_log_signals"] = dg_alert_raw
+    raw["listener_connectivity_signals"] = listener_raw
+
+    for section in sections:
+        if section.status in {"CRITICAL", "WARNING"}:
+            actions.append(
+                ActionableHealthItem(
+                    category="standby",
+                    title=section.name,
+                    severity=section.status,
+                    detail=section.summary,
+                    recommendation="Investigate Data Guard transport/apply chain before treating standby as healthy.",
+                    evidence=[str(row) for row in section.rows[:3]],
+                )
+            )
+    return {"sections": sections, "actions": actions[:6], "raw": raw}
+
+
+def _standby_managed_recovery_section(*, role_mode: dict[str, Any]) -> tuple[HealthCheckSection, dict[str, Any]]:
+    rows, err = _fetch_all(
+        """
+        select inst_id,
+               process,
+               status,
+               client_process,
+               thread#,
+               sequence#,
+               block#,
+               blocks
+        from gv$managed_standby
+        order by inst_id, process, thread#, sequence#
+        """
+    )
+    source = "gv$managed_standby"
+    if err and not rows:
+        rows, err = _fetch_all(
+            """
+            select cast(null as number) as inst_id,
+                   process,
+                   status,
+                   client_process,
+                   thread#,
+                   sequence#,
+                   block#,
+                   blocks
+            from v$managed_standby
+            order by process, thread#, sequence#
+            """
+        )
+        source = "v$managed_standby"
+
+    notes = [f"Source view: {source}"]
+    if err and not rows:
+        notes.append(f"Collector warning: {err}")
+        return _section("Managed Recovery Process", "INFO", "Managed recovery query unavailable due to privileges or view access.", [], notes=notes), {"checked": False, "source": source, "error": err}
+
+    has_mrp = any(str(row.get("process") or "").upper().startswith("MRP") for row in rows)
+    has_rfs = any(str(row.get("process") or "").upper().startswith("RFS") for row in rows)
+    has_gap = any(str(row.get("status") or "").upper() == "WAIT_FOR_GAP" for row in rows)
+    apply_expected = _env_flag("ODB_AUTODBA_STANDBY_APPLY_EXPECTED", default=bool(role_mode.get("is_physical_standby")))
+    transport_expected = _env_flag("ODB_AUTODBA_STANDBY_TRANSPORT_EXPECTED", default=bool(role_mode.get("is_physical_standby")))
+
+    status = "OK"
+    if apply_expected and not has_mrp:
+        status = "CRITICAL"
+    elif has_gap:
+        status = "CRITICAL"
+    elif transport_expected and not has_rfs:
+        status = "WARNING"
+
+    summary = "Managed recovery processes captured."
+    if apply_expected and not has_mrp:
+        summary = "MRP process is missing while apply is expected."
+    elif has_gap:
+        summary = "Managed recovery is waiting for gap."
+    elif transport_expected and not has_rfs:
+        summary = "RFS process not observed while transport is expected."
+    return _section("Managed Recovery Process", status, summary, rows[:50], notes=notes), {
+        "checked": True,
+        "source": source,
+        "has_mrp": has_mrp,
+        "has_rfs": has_rfs,
+        "has_gap": has_gap,
+        "apply_expected": apply_expected,
+        "transport_expected": transport_expected,
+    }
+
+
+def _standby_lag_section() -> tuple[HealthCheckSection, dict[str, Any]]:
+    warn_seconds = _as_int(os.getenv("ODB_AUTODBA_STANDBY_LAG_WARN_SECONDS")) or 300
+    crit_seconds = _as_int(os.getenv("ODB_AUTODBA_STANDBY_LAG_CRIT_SECONDS")) or 1800
+    rows, err = _fetch_all(
+        """
+        select name,
+               value,
+               unit,
+               time_computed,
+               datum_time
+        from v$dataguard_stats
+        where name in ('transport lag', 'apply lag', 'apply finish time', 'estimated startup time')
+        order by name
+        """
+    )
+    notes: list[str] = [f"Lag thresholds: warning>{warn_seconds}s, critical>{crit_seconds}s."]
+    if err and not rows:
+        notes.append(f"Collector warning: {err}")
+        return _section("Data Guard Lag", "INFO", "Data Guard lag metrics unavailable due to privileges.", [], notes=notes), {"checked": False, "error": err}
+
+    out: list[dict[str, Any]] = []
+    statuses: list[str] = []
+    for row in rows:
+        name = str(row.get("name") or "")
+        parsed = _parse_dataguard_interval_seconds(str(row.get("value") or ""))
+        severity = "INFO"
+        if name in {"apply lag", "transport lag"} and parsed is not None:
+            if parsed > crit_seconds:
+                severity = "CRITICAL"
+            elif parsed > warn_seconds:
+                severity = "WARNING"
+            else:
+                severity = "OK"
+        elif name in {"apply lag", "transport lag"} and parsed is None:
+            notes.append(f"Could not parse lag value for {name}; raw value retained.")
+        statuses.append(severity)
+        out.append({**row, "parsed_seconds": parsed, "severity": severity})
+    status = _worst(statuses or ["INFO"])
+    summary = "Data Guard lag metrics captured."
+    return _section("Data Guard Lag", status, summary, out, notes=notes), {"checked": True, "rows": out}
+
+
+def _standby_archive_gap_section() -> tuple[HealthCheckSection, dict[str, Any]]:
+    rows, err = _fetch_all(
+        """
+        select thread#,
+               low_sequence#,
+               high_sequence#
+        from v$archive_gap
+        order by thread#
+        """
+    )
+    if err and not rows:
+        return _section("Archive Gap", "INFO", "Archive gap query unavailable due to privileges.", [], notes=[f"Collector warning: {err}"]), {"checked": False, "error": err}
+    if rows:
+        note = "Resolve archive gap before treating standby as healthy. Check primary archive availability, FAL_SERVER/FAL_CLIENT, network, and archive destination errors."
+        return _section("Archive Gap", "CRITICAL", "Archive gap detected.", rows, notes=[note]), {"checked": True, "has_gap": True}
+    return _section("Archive Gap", "OK", "No archive gap rows returned.", []), {"checked": True, "has_gap": False}
+
+
+def _standby_archive_dest_section() -> tuple[HealthCheckSection, dict[str, Any]]:
+    rows, err = _fetch_all(
+        """
+        select dest_id,
+               status,
+               type,
+               database_mode,
+               recovery_mode,
+               protection_mode,
+               destination,
+               error,
+               archived_thread#,
+               archived_seq#,
+               applied_thread#,
+               applied_seq#
+        from v$archive_dest_status
+        where status <> 'INACTIVE'
+        order by dest_id
+        """
+    )
+    if err and not rows:
+        return _section("Archive Destination Status", "INFO", "Archive destination status unavailable due to privileges.", [], notes=[f"Collector warning: {err}"]), {"checked": False, "error": err}
+    status = "OK"
+    for row in rows:
+        row_status = str(row.get("status") or "").upper()
+        row_error = str(row.get("error") or "").strip()
+        if row_status == "ERROR" or (row_error and row_error not in {"0", "-", "(null)", "NULL"}):
+            status = "CRITICAL"
+            break
+        if row_status not in {"VALID"} and status != "CRITICAL":
+            status = "WARNING"
+    summary = "Archive destinations validated."
+    return _section("Archive Destination Status", status, summary, rows[:50]), {"checked": True, "rows": rows}
+
+
+def _standby_dataguard_status_section(*, hours: int) -> tuple[HealthCheckSection, dict[str, Any]]:
+    rows, err = _fetch_all(
+        """
+        select to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp,
+               severity,
+               facility,
+               error_code,
+               message
+        from v$dataguard_status
+        where timestamp >= sysdate - (:window_hours / 24)
+          and (
+               severity in ('Error', 'Fatal', 'Warning')
+               or error_code is not null
+               or upper(message) like '%GAP%'
+               or upper(message) like '%ERROR%'
+               or upper(message) like '%FAILED%'
+          )
+        order by timestamp desc
+        fetch first 50 rows only
+        """,
+        {"window_hours": hours},
+    )
+    if err and not rows:
+        return _section("Data Guard Status Messages", "INFO", "Data Guard status messages unavailable due to privileges.", [], notes=[f"Collector warning: {err}"]), {"checked": False, "error": err}
+    status = "OK"
+    for row in rows:
+        sev = str(row.get("severity") or "").upper()
+        if sev in {"FATAL", "ERROR"}:
+            status = "CRITICAL"
+            break
+        if sev == "WARNING" and status != "CRITICAL":
+            status = "WARNING"
+    summary = "No recent Data Guard error/fatal messages." if not rows else f"{len(rows)} Data Guard status message row(s) found in last {hours}h."
+    return _section("Data Guard Status Messages", status, summary, rows), {"checked": True, "rows": rows}
+
+
+def _standby_alert_log_signals_section(*, hours: int) -> tuple[HealthCheckSection, dict[str, Any]]:
+    rows, err = _fetch_all(
+        """
+        select to_char(originating_timestamp, 'YYYY-MM-DD HH24:MI:SS') as originating_timestamp,
+               component_id,
+               message_type,
+               message_level,
+               substr(message_text, 1, 1000) as message_text
+        from v$diag_alert_ext
+        where originating_timestamp >= systimestamp - numtodsinterval(:window_hours, 'HOUR')
+          and regexp_like(message_text, 'ORA-|TNS-|FAL|MRP|RFS|Data Guard|standby|archive gap|media recovery|managed recovery', 'i')
+        order by originating_timestamp desc
+        fetch first 100 rows only
+        """,
+        {"window_hours": hours},
+    )
+    if err and not rows:
+        return _section("Standby Alert Log Signals", "INFO", "Standby alert signal query unavailable due to privileges.", [], notes=[f"Collector warning: {err}"]), {"checked": False, "error": err}
+
+    severities: list[str] = []
+    for row in rows:
+        message = str(row.get("message_text") or "")
+        code = _extract_error_code(message) or ""
+        severity = _ora_severity(code) if code else "INFO"
+        text = message.lower()
+        if any(token in text for token in ("fatal", "failed", "archive gap", "media recovery", "error")) and severity != "CRITICAL":
+            severity = "WARNING"
+        if any(token in text for token in ("wait_for_gap", "mrp", "fal", "tns-")) and severity == "INFO":
+            severity = "WARNING"
+        row["severity"] = severity
+        severities.append(severity)
+    status = _worst(severities or ["OK"])
+    summary = "No standby alert-log signals found." if not rows else f"{len(rows)} standby-oriented alert-log row(s) captured."
+    return _section("Standby Alert Log Signals", status, summary, rows), {"checked": True, "rows": rows}
+
+
+def _listener_connectivity_log_signals_section(*, hours: int) -> tuple[HealthCheckSection, dict[str, Any]]:
+    listener_log_path = os.getenv("ODB_AUTODBA_LISTENER_LOG_PATH", "").strip()
+    if not listener_log_path or not os.path.exists(listener_log_path):
+        row = {
+            "source": "os_adr",
+            "severity": "INFO",
+            "message": "Listener log check skipped; OS/ADR access not available.",
+        }
+        return _section("Listener / Connectivity Log Signals", "INFO", "Listener log check skipped; OS/ADR access not available.", [row]), {"checked": False, "skipped_no_os_access": True}
+
+    try:
+        with open(listener_log_path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()[-2000:]
+    except Exception as exc:
+        row = {"source": listener_log_path, "severity": "INFO", "message": f"Listener log check skipped; unable to read file: {exc}"}
+        return _section("Listener / Connectivity Log Signals", "INFO", "Listener log read failed; check file permissions.", [row]), {"checked": False, "read_error": str(exc)}
+
+    patterns = ("tns-", "refused", "no listener", "service not registered", "unknown service", "handler")
+    matches: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        lower = line.lower()
+        if any(token in lower for token in patterns):
+            sev = "WARNING"
+            if "no listener" in lower or "service not registered" in lower or "unknown service" in lower:
+                sev = "CRITICAL"
+            matches.append({"source": listener_log_path, "severity": sev, "message": line.strip()[:1000]})
+        if len(matches) >= 50:
+            break
+    if not matches:
+        return _section("Listener / Connectivity Log Signals", "OK", f"Listener log checked ({hours}h horizon heuristic); no error signals found.", [{"source": listener_log_path, "severity": "OK", "message": "No TNS/listener registration errors found."}]), {"checked": True, "rows": []}
+    status = _worst([str(row.get("severity") or "INFO") for row in matches])
+    return _section("Listener / Connectivity Log Signals", status, f"{len(matches)} listener/connectivity signal row(s) found.", matches), {"checked": True, "rows": matches}
+
+
+def _parse_dataguard_interval_seconds(value: str) -> float | None:
+    text = (value or "").strip()
+    if not text or text in {"UNKNOWN", "UNDEFINED", "-"}:
+        return None
+    match = re.match(r"^\+?(\d+)\s+(\d+):(\d+):(\d+)$", text)
+    if match:
+        days, hours, mins, secs = (int(match.group(index)) for index in range(1, 5))
+        return float(days * 86400 + hours * 3600 + mins * 60 + secs)
+    simple = re.match(r"^(\d+):(\d+):(\d+)$", text)
+    if simple:
+        hours, mins, secs = (int(simple.group(index)) for index in range(1, 4))
+        return float(hours * 3600 + mins * 60 + secs)
+    return None
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _tablespace_rows() -> tuple[list[dict[str, Any]], str | None]:
+    rows, err = _fetch_all(
+        """
+        select tablespace_name,
+               round(used_space * 100 / nullif(tablespace_size, 0), 2) as pct_used,
+               round((tablespace_size - used_space) * 100 / nullif(tablespace_size, 0), 2) as pct_free
+        from dba_tablespace_usage_metrics
+        order by pct_used desc
+        """
+    )
+    if not err and rows:
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            pct_used = _bounded_pct(_float(row.get("pct_used")))
+            pct_free = _bounded_pct(_float(row.get("pct_free")))
+            if pct_used is None or pct_free is None:
+                calc_used, calc_free = _tablespace_pct_from_metrics(
+                    used_space=_float(row.get("used_space")),
+                    tablespace_size=_float(row.get("tablespace_size")),
+                )
+                if pct_used is None:
+                    pct_used = calc_used
+                if pct_free is None:
+                    pct_free = calc_free
+            normalized.append(
+                {
+                    **row,
+                    "pct_used": pct_used,
+                    "pct_free": pct_free,
+                    "used_pct": pct_used if pct_used is not None else 0.0,
+                }
+            )
+        return normalized, None
+
+    fallback_rows = _tablespace_rows_fallback()
+    return fallback_rows, "Fallback calculation used; DBA_TABLESPACE_USAGE_METRICS unavailable."
+
+
+def _tablespace_rows_fallback() -> list[dict[str, Any]]:
     rows, _ = _fetch_all(
         """
-        with file_alloc as (
+        with df as (
             select tablespace_name,
-                   round(sum(bytes) / 1024 / 1024, 2) as allocated_mb,
-                   round(sum(case when autoextensible = 'YES' and maxbytes > bytes then maxbytes else bytes end) / 1024 / 1024, 2) as max_mb,
-                   sum(case when autoextensible = 'YES' then 1 else 0 end) as autoext_count
+                   sum(bytes) as allocated_bytes,
+                   sum(case when autoextensible = 'YES' and nvl(maxbytes, 0) > bytes then maxbytes else bytes end) as max_bytes
             from dba_data_files
             group by tablespace_name
         ),
-        usage_metrics as (
-            select tablespace_name,
-                   round(used_percent, 2) as allocated_used_pct,
-                   round(used_space * 8, 2) as used_mb
-            from dba_tablespace_usage_metrics
+        fs as (
+            select tablespace_name, sum(bytes) as free_bytes
+            from dba_free_space
+            group by tablespace_name
         )
-        select t.tablespace_name,
-               nvl(u.allocated_used_pct, 0) as used_pct,
-               a.allocated_mb as allocated_mb,
-               nvl(u.used_mb, round(nvl(a.allocated_mb, 0) * (nvl(u.allocated_used_pct, 0) / 100), 2)) as used_mb,
-               round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_allocated_mb,
-               nvl(u.allocated_used_pct, 0) as allocated_used_pct,
-               a.max_mb as max_mb,
-               round(greatest(nvl(a.max_mb, nvl(a.allocated_mb, 0)) - nvl(u.used_mb, 0), 0), 2) as max_free_mb,
-               case
-                   when nvl(a.max_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.max_mb) * 100, 2)
-                   when nvl(a.allocated_mb, 0) > 0 then round((nvl(u.used_mb, 0) / a.allocated_mb) * 100, 2)
-                   else null
-               end as max_used_pct,
-               case when nvl(a.autoext_count, 0) > 0 then 'YES' else 'NO' end as autoextensible,
-               round(greatest(nvl(a.allocated_mb, 0) - nvl(u.used_mb, 0), 0), 2) as free_mb,
-               a.allocated_mb as total_mb
-        from dba_tablespaces t
-        left join file_alloc a on a.tablespace_name = t.tablespace_name
-        left join usage_metrics u on u.tablespace_name = t.tablespace_name
-        where t.contents <> 'TEMPORARY'
-        order by nvl(u.allocated_used_pct, 0) desc, t.tablespace_name
+        select df.tablespace_name,
+               round(case when df.allocated_bytes > 0 then ((df.allocated_bytes - nvl(fs.free_bytes, 0)) / df.allocated_bytes) * 100 end, 2) as pct_used,
+               round(case when df.allocated_bytes > 0 then (nvl(fs.free_bytes, 0) / df.allocated_bytes) * 100 end, 2) as pct_free
+        from df
+        left join fs on fs.tablespace_name = df.tablespace_name
+        order by pct_used desc
         """
     )
-    return rows
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        pct_used = _bounded_pct(_float(row.get("pct_used")))
+        pct_free = _bounded_pct(_float(row.get("pct_free")))
+        out.append(
+            {
+                **row,
+                "pct_used": pct_used,
+                "pct_free": pct_free,
+                "used_pct": pct_used if pct_used is not None else 0.0,
+            }
+        )
+    return out
+
+
+def _tablespace_pct_from_metrics(*, used_space: float | None, tablespace_size: float | None) -> tuple[float | None, float | None]:
+    if used_space is None or tablespace_size is None or tablespace_size <= 0:
+        return None, None
+    pct_used = _bounded_pct(round((used_space * 100.0) / tablespace_size, 2))
+    pct_free = _bounded_pct(round(((tablespace_size - used_space) * 100.0) / tablespace_size, 2))
+    return pct_used, pct_free
 
 
 def _tablespace_section(rows: list[dict[str, Any]]) -> HealthCheckSection:
     if not rows:
         return _section("Tablespace Usage", "INFO", "Tablespace usage metrics were not available.")
     worst = rows[0]
-    pct = _float(worst.get("used_pct"))
-    return _section("Tablespace Usage", _pct_status(pct, warn=80, crit=90), f"Highest usage is {pct:.2f}% on {worst.get('tablespace_name')}." if pct is not None else "Tablespace rows captured.", rows[:10])
+    pct = _float(worst.get("pct_used"))
+    warn, crit = _tablespace_thresholds()
+    return _section("Tablespace Usage", _pct_status(pct, warn=warn, crit=crit), f"Highest usage is {pct:.2f}% on {worst.get('tablespace_name')}." if pct is not None else "Tablespace rows captured.", rows[:10])
 
 
 def _tablespace_actions(rows: list[dict[str, Any]]) -> list[ActionableHealthItem]:
     actions = []
+    warn, crit = _tablespace_thresholds()
     for row in rows:
-        pct = _float(row.get("used_pct")) or 0.0
-        if pct < 80:
+        pct = _float(row.get("pct_used")) or 0.0
+        if pct < warn:
             continue
-        severity = "CRITICAL" if pct >= 90 else "WARNING"
+        severity = "CRITICAL" if pct >= crit else "WARNING"
         tablespace = str(row.get("tablespace_name") or "unknown")
         actions.append(ActionableHealthItem(category="storage", title=f"Tablespace {tablespace} high usage", severity=severity, detail=f"{pct:.2f}% used.", recommendation="Review growth, largest segments, autoextend settings, and available storage before extending."))
     return actions
 
 
+def _tablespace_allocation_details() -> list[dict[str, Any]]:
+    rows, _ = _fetch_all(
+        """
+        with df as (
+            select tablespace_name,
+                   sum(bytes) as allocated_bytes,
+                   sum(
+                       case
+                           when autoextensible = 'YES'
+                            and nvl(maxbytes, 0) > bytes
+                           then maxbytes
+                           else bytes
+                       end
+                   ) as max_bytes,
+                   case
+                       when max(case when autoextensible = 'YES' then 1 else 0 end) = 1
+                       then 'YES'
+                       else 'NO'
+                   end as autoextensible
+            from dba_data_files
+            group by tablespace_name
+        ),
+        fs as (
+            select tablespace_name,
+                   sum(bytes) as free_bytes
+            from dba_free_space
+            group by tablespace_name
+        )
+        select df.tablespace_name,
+               round(df.allocated_bytes / 1024 / 1024 / 1024, 2) as allocated_gb,
+               round((df.allocated_bytes - nvl(fs.free_bytes, 0)) / 1024 / 1024 / 1024, 2) as used_allocated_gb,
+               round(nvl(fs.free_bytes, 0) / 1024 / 1024 / 1024, 2) as free_allocated_gb,
+               round(df.max_bytes / 1024 / 1024 / 1024, 2) as max_gb,
+               round(
+                   case
+                       when df.allocated_bytes > 0
+                       then ((df.allocated_bytes - nvl(fs.free_bytes, 0)) / df.allocated_bytes) * 100
+                   end, 2
+               ) as allocated_used_pct,
+               round(
+                   case
+                       when df.max_bytes > 0
+                       then ((df.allocated_bytes - nvl(fs.free_bytes, 0)) / df.max_bytes) * 100
+                   end, 2
+               ) as max_used_pct,
+               df.autoextensible
+        from df
+        left join fs
+               on fs.tablespace_name = df.tablespace_name
+        order by allocated_used_pct desc
+        """
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        max_used_pct = _float(row.get("max_used_pct"))
+        anomaly = bool(max_used_pct is not None and max_used_pct > 100.0)
+        out.append({**row, "allocation_anomaly": anomaly})
+    return out
+
+
+def _tablespace_allocation_section(rows: list[dict[str, Any]]) -> HealthCheckSection:
+    if not rows:
+        return _section("Tablespace Allocation Details", "INFO", "Tablespace allocation details were not available.")
+    status = "OK"
+    if any(bool(row.get("allocation_anomaly")) for row in rows):
+        status = "WARNING"
+    return _section(
+        "Tablespace Allocation Details",
+        status,
+        "Allocation details are informational and are not used for headline tablespace severity.",
+        rows[:20],
+    )
+
+
 def _temp_summary() -> dict[str, Any]:
-    pct_row, pct_err = _fetch_one(
+    capacity_rows, pct_err = _fetch_all(
         """
         select tablespace_name,
-               round(100 * (1 - free_space / nullif(tablespace_size, 0)), 2) as used_pct
+               round(tablespace_size/1024/1024/1024,2) as temp_allocated_gb,
+               round(allocated_space/1024/1024/1024,2) as temp_current_allocated_gb,
+               round(free_space/1024/1024/1024,2) as temp_free_gb,
+               round((tablespace_size - free_space)/1024/1024/1024,2) as temp_used_gb,
+               round(
+                   case
+                       when tablespace_size > 0
+                       then ((tablespace_size - free_space) / tablespace_size) * 100
+                   end, 2
+               ) as temp_used_pct
         from dba_temp_free_space
-        order by used_pct desc
-        fetch first 1 rows only
+        order by temp_used_pct desc
         """
     )
     consumers, _ = _fetch_all(
         """
-        select s.sid, s.serial# as serial_num, nvl(s.username,'-') as username,
-               nvl(s.program,'-') as program, nvl(s.module,'N/A') as module,
-               nvl(s.sql_id,'N/A') as sql_id,
-               round(sum(t.blocks * ts.block_size)/1024/1024/1024, 2) as gb_used
-        from v$tempseg_usage t
-        join v$session s on t.session_addr = s.saddr
-        join dba_tablespaces ts on t.tablespace = ts.tablespace_name
-        group by s.sid, s.serial#, s.username, s.program, s.module, s.sql_id
-        order by sum(t.blocks * ts.block_size) desc
-        fetch first 10 rows only
+        select u.inst_id,
+               s.sid,
+               s.serial# as serial_num,
+               s.username,
+               s.sql_id,
+               s.module,
+               u.tablespace,
+               round(sum(u.blocks * ts.block_size)/1024/1024,2) as temp_used_mb
+        from gv$tempseg_usage u
+        join gv$session s
+          on s.inst_id = u.inst_id
+         and s.saddr = u.session_addr
+        join dba_tablespaces ts
+          on ts.tablespace_name = u.tablespace
+        group by u.inst_id, s.sid, s.serial#, s.username, s.sql_id, s.module, u.tablespace
+        order by temp_used_mb desc
+        fetch first 20 rows only
         """
     )
-    return {"usage": pct_row, "usage_error": pct_err, "top_consumers": consumers}
+    top = capacity_rows[0] if capacity_rows else {}
+    return {"capacity_rows": capacity_rows, "capacity": top, "usage_error": pct_err, "top_consumers": consumers}
 
 
-def _temp_section(temp: dict[str, Any]) -> HealthCheckSection:
-    usage = temp.get("usage") or {}
-    pct = _float(usage.get("used_pct"))
+def _temp_sections(temp: dict[str, Any]) -> list[HealthCheckSection]:
+    usage = temp.get("capacity") or {}
+    pct = _float(usage.get("temp_used_pct"))
     if pct is None:
-        return _section("Temp Usage", "INFO", "TEMP usage percentage was not available.", temp.get("top_consumers", []), notes=[str(temp.get("usage_error"))] if temp.get("usage_error") else [])
-    summary = f"TEMP usage is {pct:.2f}% for {usage.get('tablespace_name') or 'TEMP'}."
-    consumers = temp.get("top_consumers") or []
-    if consumers:
-        first = consumers[0]
-        summary += f" Top consumer is SID {first.get('sid')} SQL_ID {first.get('sql_id')} using {first.get('gb_used')} GB."
-    return _section("Temp Usage", _pct_status(pct, warn=50, crit=80), summary, consumers[:10])
+        capacity = _section(
+            "Temp Tablespace Capacity",
+            "INFO",
+            "TEMP usage percentage was not available.",
+            temp.get("capacity_rows", []),
+            notes=[str(temp.get("usage_error"))] if temp.get("usage_error") else [],
+        )
+    else:
+        capacity = _section(
+            "Temp Tablespace Capacity",
+            _pct_status(pct, warn=50, crit=80),
+            f"TEMP usage is {pct:.2f}% for {usage.get('tablespace_name') or 'TEMP'}.",
+            temp.get("capacity_rows", [])[:20],
+        )
+    consumers = _section(
+        "Temp Session Consumers",
+        "INFO",
+        f"{len(temp.get('top_consumers') or [])} active TEMP consumer row(s) captured.",
+        (temp.get("top_consumers") or [])[:20],
+    )
+    return [capacity, consumers]
 
 
 def _temp_actions(temp: dict[str, Any]) -> list[ActionableHealthItem]:
-    pct = _float((temp.get("usage") or {}).get("used_pct"))
+    pct = _float((temp.get("capacity") or {}).get("temp_used_pct"))
     if pct is None or pct < 50:
         return []
     severity = "CRITICAL" if pct >= 80 else "WARNING"
@@ -378,16 +1031,108 @@ def _temp_actions(temp: dict[str, Any]) -> list[ActionableHealthItem]:
 def _lock_pairs() -> tuple[list[dict[str, Any]], str | None]:
     rows, err = _fetch_all(
         """
-        select w.inst_id as waiter_inst_id, w.sid as waiter_sid, w.serial# as waiter_serial,
-               nvl(w.username,'-') as waiter_user, nvl(w.sql_id,'-') as waiter_sql_id,
-               nvl(w.event,'-') as waiter_event, w.seconds_in_wait,
-               b.inst_id as blocker_inst_id, b.sid as blocker_sid, b.serial# as blocker_serial,
-               nvl(b.username,'-') as blocker_user, nvl(b.sql_id,'-') as blocker_sql_id,
-               nvl(b.module,'-') as blocker_module, nvl(b.program,'-') as blocker_program
-        from gv$session w
-        join gv$session b on b.inst_id = w.blocking_instance and b.sid = w.blocking_session
-        where w.blocking_session is not null
-        order by w.seconds_in_wait desc
+        with blocked as (
+            select s.inst_id as blocked_inst_id,
+                   s.sid as blocked_sid,
+                   s.serial# as blocked_serial,
+                   s.username as blocked_user,
+                   s.sql_id as blocked_sql_id,
+                   s.module as blocked_module,
+                   s.program as blocked_program,
+                   s.event as blocked_event,
+                   s.wait_class as blocked_wait_class,
+                   s.seconds_in_wait as blocked_seconds_in_wait,
+                   s.blocking_instance as blocker_inst_id,
+                   s.blocking_session as blocker_sid,
+                   s.final_blocking_instance,
+                   s.final_blocking_session,
+                   s.row_wait_obj#
+            from gv$session s
+            where s.type = 'USER'
+              and s.username is not null
+              and (s.blocking_session is not null or s.final_blocking_session is not null)
+        ),
+        blocker as (
+            select s.inst_id,
+                   s.sid,
+                   s.serial#,
+                   s.username,
+                   s.sql_id,
+                   s.module,
+                   s.program,
+                   s.machine,
+                   s.status,
+                   s.event,
+                   s.wait_class,
+                   s.seconds_in_wait,
+                   s.taddr,
+                   case
+                       when s.type = 'BACKGROUND'
+                            or regexp_like(nvl(s.program,'x'), '\\((DBW|CKPT|LGWR|PMON|SMON|MMON|MMNL|ARC|RVWR|CJQ|VKTM|LREG|MMAN|DBRM|GEN|DIAG|VKRM)[0-9]*\\)')
+                       then 'BACKGROUND_PROCESS'
+                       when s.username is null
+                       then 'UNKNOWN_OR_BACKGROUND'
+                       when s.status = 'INACTIVE' and s.taddr is not null
+                       then 'IDLE_IN_TRANSACTION_BLOCKER'
+                       else 'FOREGROUND_SESSION'
+                   end as blocker_classification
+            from gv$session s
+        ),
+        txn as (
+            select inst_id, ses_addr, start_date, used_ublk, used_urec
+            from gv$transaction
+        )
+        select b.blocked_inst_id as waiter_inst_id,
+               b.blocked_sid as waiter_sid,
+               b.blocked_serial as waiter_serial,
+               b.blocked_user as waiter_user,
+               b.blocked_sql_id as waiter_sql_id,
+               b.blocked_event as waiter_event,
+               b.blocked_wait_class as waiter_wait_class,
+               b.blocked_seconds_in_wait as seconds_in_wait,
+               nvl(b.blocker_inst_id, b.final_blocking_instance) as blocker_inst_id,
+               nvl(b.blocker_sid, b.final_blocking_session) as blocker_sid,
+               bl.serial# as blocker_serial,
+               bl.username as blocker_user,
+               bl.sql_id as blocker_sql_id,
+               bl.module as blocker_module,
+               bl.program as blocker_program,
+               bl.machine as blocker_machine,
+               bl.status as blocker_status,
+               bl.wait_class as blocker_wait_class,
+               bl.blocker_classification,
+               o.owner as object_owner,
+               o.object_name,
+               o.object_type,
+               round((sysdate - t.start_date) * 24 * 60, 2) as blocker_txn_age_min,
+               case
+                   when b.blocked_seconds_in_wait >= 60
+                        and b.blocked_wait_class in ('Application','Concurrency')
+                        and bl.blocker_classification in ('FOREGROUND_SESSION','IDLE_IN_TRANSACTION_BLOCKER')
+                   then 'CRITICAL'
+                   when b.blocked_seconds_in_wait >= 10
+                        and b.blocked_wait_class in ('Application','Concurrency','Configuration')
+                        and nvl(bl.blocker_classification, '?') <> 'BACKGROUND_PROCESS'
+                   then 'WARNING'
+                   else 'INFO'
+               end as blocking_severity,
+               case
+                   when b.blocked_seconds_in_wait < 10 then 'transient_or_moving_block'
+                   when bl.blocker_classification = 'BACKGROUND_PROCESS' then 'background_process_not_application_blocker'
+                   when b.blocked_wait_class = 'Idle' then 'idle_wait_not_blocking_pressure'
+                   when bl.blocker_classification = 'IDLE_IN_TRANSACTION_BLOCKER' then 'idle_transaction_blocker'
+                   else 'foreground_blocking_chain'
+               end as blocking_reason
+        from blocked b
+        left join blocker bl
+               on bl.inst_id = nvl(b.blocker_inst_id, b.final_blocking_instance)
+              and bl.sid = nvl(b.blocker_sid, b.final_blocking_session)
+        left join txn t
+               on t.inst_id = bl.inst_id
+              and t.ses_addr = bl.taddr
+        left join dba_objects o
+               on o.object_id = b.row_wait_obj#
+        order by b.blocked_seconds_in_wait desc
         fetch first 20 rows only
         """
     )
@@ -422,7 +1167,50 @@ def _invalid_objects() -> list[dict[str, Any]]:
 
 
 def _redo_archive(hours: int) -> dict[str, Any]:
-    redo, _ = _fetch_one("select count(*) as redo_switches from v$log_history where first_time >= sysdate - (:hours/24)", {"hours": hours})
+    groups, _ = _fetch_all(
+        """
+        select thread#,
+               group#,
+               sequence#,
+               bytes/1024/1024 as size_mb,
+               members,
+               archived,
+               status
+        from v$log
+        order by thread#, group#
+        """
+    )
+    switches, _ = _fetch_all(
+        """
+        select thread#,
+               count(*) as switches_24h,
+               round(count(*)/24,2) as switches_per_hour
+        from v$log_history
+        where first_time >= sysdate - 1
+        group by thread#
+        order by thread#
+        """
+    )
+    redo_waits, _ = _fetch_all(
+        """
+        select inst_id,
+               event,
+               wait_class,
+               total_waits,
+               round(time_waited_micro/1000000,2) as time_waited_s,
+               round(case when total_waits > 0 then time_waited_micro/1000/total_waits else 0 end,2) as avg_wait_ms
+        from gv$system_event
+        where event in (
+            'log file sync',
+            'log file parallel write',
+            'log file switch completion',
+            'log file switch (checkpoint incomplete)',
+            'log file switch (archiving needed)',
+            'log file switch (private strand flush incomplete)'
+        )
+        order by time_waited_micro desc
+        """
+    )
     archive_dest, err = _fetch_one(
         """
         select case
@@ -438,23 +1226,63 @@ def _redo_archive(hours: int) -> dict[str, Any]:
         """
     )
     log_mode, _ = _fetch_one("select log_mode from v$database")
-    count = int(redo.get("redo_switches") or 0) if redo else None
-    return {"redo_switches": count, "redo_per_hour": (count / hours if count is not None else None), "log_mode": log_mode.get("log_mode"), "archive_dest": archive_dest.get("archive_dest"), "archive_dest_error": err}
+    max_rate = max((_float(row.get("switches_per_hour")) or 0.0 for row in switches), default=0.0)
+    total_switches_24h = sum((_as_int(row.get("switches_24h")) or 0 for row in switches))
+    return {
+        "log_groups": groups,
+        "switches_by_thread": switches,
+        "redo_waits": redo_waits,
+        "switches_24h_total": total_switches_24h,
+        "max_switches_per_hour": max_rate,
+        "log_mode": log_mode.get("log_mode"),
+        "archive_dest": archive_dest.get("archive_dest"),
+        "archive_dest_error": err,
+    }
 
 
 def _redo_section(redo: dict[str, Any], hours: int) -> HealthCheckSection:
-    rate = _float(redo.get("redo_per_hour"))
-    status = "INFO" if rate is None else ("CRITICAL" if rate > 5 else "WARNING" if rate > 1 else "OK")
-    summary = f"{redo.get('redo_switches')} redo switch(es) in the last {hours}h ({rate:.2f}/hr)." if rate is not None else "Redo switch rate was not available."
+    rate = _float(redo.get("max_switches_per_hour"))
+    waits = redo.get("redo_waits") or []
+    checkpoint_wait = _event_wait_ms(waits, "log file switch (checkpoint incomplete)")
+    sync_wait = _event_wait_ms(waits, "log file sync")
+    parallel_wait = _event_wait_ms(waits, "log file parallel write")
+    archive_wait = _event_wait_ms(waits, "log file switch (archiving needed)")
+
+    status = "INFO"
+    if checkpoint_wait is not None and checkpoint_wait > 1000:
+        status = "CRITICAL"
+    elif any(value is not None and value > 20 for value in (sync_wait, parallel_wait)) or (archive_wait is not None and archive_wait > 1000):
+        status = "WARNING"
+    elif rate is not None and rate > 12:
+        status = "WARNING"
+    elif rate is not None and rate > 6 and _small_redo_logs(redo):
+        status = "WARNING"
+
+    rate_label = f"{rate:.2f}" if rate is not None else "n/a"
+    summary = (
+        "Redo switch rate is informational; checkpoint/log file waits determine severity. "
+        f"24h switches={redo.get('switches_24h_total')}, max switches/hr={rate_label}. "
+        f"log file sync avg={sync_wait if sync_wait is not None else '-'} ms, "
+        f"log file parallel write avg={parallel_wait if parallel_wait is not None else '-'} ms, "
+        f"checkpoint incomplete avg={checkpoint_wait if checkpoint_wait is not None else '-'} ms."
+    )
     summary += f" Log mode: {redo.get('log_mode') or 'unknown'}; archive destination: {redo.get('archive_dest') or 'not found'}."
-    return _section("Redo And Archiving", status, summary, [redo])
+    return _section("Redo And Archiving", status, summary, (redo.get("switches_by_thread") or []) + waits[:10])
 
 
 def _redo_actions(redo: dict[str, Any], hours: int) -> list[ActionableHealthItem]:
     actions = []
-    rate = _float(redo.get("redo_per_hour"))
-    if rate is not None and rate > 1:
-        actions.append(ActionableHealthItem(category="redo", title="Elevated redo switch rate", severity="CRITICAL" if rate > 5 else "WARNING", detail=f"Redo switch rate is {rate:.2f}/hr over {hours}h.", recommendation="Review redo log sizing and workload spikes."))
+    rate = _float(redo.get("max_switches_per_hour"))
+    waits = redo.get("redo_waits") or []
+    checkpoint_wait = _event_wait_ms(waits, "log file switch (checkpoint incomplete)")
+    sync_wait = _event_wait_ms(waits, "log file sync")
+    parallel_wait = _event_wait_ms(waits, "log file parallel write")
+    if checkpoint_wait is not None and checkpoint_wait > 1000:
+        actions.append(ActionableHealthItem(category="redo", title="Checkpoint-related log switch waits", severity="CRITICAL", detail=f"log file switch (checkpoint incomplete) avg wait is {checkpoint_wait:.2f} ms.", recommendation="Increase redo log size and review checkpoint throughput."))
+    elif any(value is not None and value > 20 for value in (sync_wait, parallel_wait)):
+        actions.append(ActionableHealthItem(category="redo", title="Commit/redo write latency elevated", severity="WARNING", detail=f"log file sync={sync_wait or 0:.2f} ms, log file parallel write={parallel_wait or 0:.2f} ms.", recommendation="Investigate redo I/O latency and commit frequency."))
+    elif rate is not None and rate > 12:
+        actions.append(ActionableHealthItem(category="redo", title="High redo switch rate", severity="WARNING", detail=f"Max redo switch rate is {rate:.2f}/hr.", recommendation="Review redo log sizing and workload spikes."))
     if not redo.get("archive_dest"):
         actions.append(ActionableHealthItem(category="archive", title="Archive destination not found", severity="CRITICAL", detail="No valid primary archive destination was discovered.", recommendation="Verify archive destination configuration and FRA settings."))
     return actions
@@ -515,15 +1343,27 @@ def _scheduler_failures(hours: int) -> list[dict[str, Any]]:
 def _performance(hours: int) -> dict[str, Any]:
     plan_churn, _ = _fetch_all(
         """
-        select sql_id, count(distinct plan_hash_value) as plans
-        from v$sql
-        where last_active_time > sysdate - (:hours/24)
+        select sql_id,
+               count(distinct plan_hash_value) as distinct_plans,
+               sum(executions_delta) as executions,
+               round(sum(elapsed_time_delta)/1000000,2) as elapsed_s,
+               round(
+                   case when sum(executions_delta) > 0
+                   then sum(elapsed_time_delta)/1000000/sum(executions_delta)
+                   end, 4
+               ) as elapsed_per_exec_s
+        from dba_hist_sqlstat
+        where snap_id in (
+            select snap_id
+            from dba_hist_snapshot
+            where begin_interval_time >= sysdate - 1
+        )
+          and plan_hash_value <> 0
         group by sql_id
         having count(distinct plan_hash_value) > 1
-        order by plans desc
-        fetch first 10 rows only
-        """,
-        {"hours": hours},
+        order by elapsed_s desc
+        fetch first 20 rows only
+        """
     )
     stale, stale_err = _fetch_all(
         """
@@ -552,13 +1392,16 @@ def _performance(hours: int) -> dict[str, Any]:
         """
         with ash as (
           select sql_id, count(*) as oncpu_samples
-          from v$active_session_history
+          from gv$active_session_history
           where sample_time > sysdate - (:hours/24)
             and session_state = 'ON CPU'
             and sql_id is not null
           group by sql_id
         )
-        select sql_id, round(100.0 * oncpu_samples / nullif(sum(oncpu_samples) over (), 0), 2) as cpu_pct
+        select sql_id,
+               oncpu_samples,
+               sum(oncpu_samples) over () as total_oncpu_samples,
+               round(100.0 * oncpu_samples / nullif(sum(oncpu_samples) over (), 0), 2) as cpu_pct
         from ash
         where oncpu_samples > 0
         order by oncpu_samples desc
@@ -568,35 +1411,53 @@ def _performance(hours: int) -> dict[str, Any]:
     )
     current_waits, wait_err = _fetch_all(
         """
-        select *
-        from (
-          select event, wait_class,
-                 round(time_waited/100, 3) as time_waited_s,
-                 total_waits,
-                 round(average_wait, 3) as avg_wait_ms
-          from v$eventmetric
-          where wait_class <> 'Idle'
-          order by time_waited desc
-        )
-        where rownum <= 10
+        select inst_id,
+               event,
+               wait_class,
+               total_waits,
+               time_waited,
+               round(case when total_waits > 0 then (time_waited / total_waits) else 0 end, 2) as avg_wait_ms
+        from gv$eventmetric
+        where wait_class <> 'Idle'
+        order by time_waited desc
+        fetch first 20 rows only
         """
     )
     if wait_err:
         current_waits, _ = _fetch_all(
             """
-            select *
-            from (
-              select event, wait_class,
-                     round(time_waited_micro/1e6, 3) as time_waited_s,
-                     total_waits,
-                     round(average_wait, 3) as avg_wait_ms
-              from v$system_event
-              where wait_class <> 'Idle'
-              order by time_waited_micro desc
-            )
-            where rownum <= 10
+            select inst_id,
+                   event,
+                   wait_class,
+                   total_waits,
+                   round(time_waited_micro/1000000,2) as time_waited_s,
+                   round(case when total_waits > 0 then time_waited_micro/1000/total_waits else 0 end,2) as avg_wait_ms
+            from gv$system_event
+            where wait_class <> 'Idle'
+            order by time_waited_micro desc
+            fetch first 20 rows only
             """
         )
+    session_waits, _ = _fetch_all(
+        """
+        select s.inst_id,
+               s.event,
+               s.wait_class,
+               s.sql_id,
+               s.module,
+               s.username,
+               count(*) as session_count,
+               max(s.seconds_in_wait) as max_seconds_in_wait
+        from gv$session s
+        where s.type = 'USER'
+          and s.username is not null
+          and s.status = 'ACTIVE'
+          and nvl(s.wait_class,'Idle') <> 'Idle'
+        group by s.inst_id, s.event, s.wait_class, s.sql_id, s.module, s.username
+        order by session_count desc, max_seconds_in_wait desc
+        fetch first 20 rows only
+        """
+    )
     top_elapsed, _ = _fetch_all(
         """
         select *
@@ -606,7 +1467,7 @@ def _performance(hours: int) -> dict[str, Any]:
                  round(cpu_time/1e6, 3) as cpu_s,
                  buffer_gets, disk_reads, rows_processed,
                  round((elapsed_time/1e6)/nullif(executions,0), 3) as ela_per_exec_s
-          from v$sqlstats
+          from gv$sqlstats
           where sql_id is not null
           order by elapsed_time desc
         )
@@ -629,7 +1490,17 @@ def _performance(hours: int) -> dict[str, Any]:
         """,
         {"hours": hours},
     )
-    return {"plan_churn": plan_churn, "stale_stats": stale, "cache": cache, "top_cpu_sql": top_cpu, "current_waits": current_waits, "top_elapsed_sql": top_elapsed, "awr_waits": awr_waits}
+    return {
+        "plan_churn": plan_churn,
+        "stale_stats": stale,
+        "cache": cache,
+        "top_cpu_sql": top_cpu,
+        "current_waits": current_waits,
+        "session_waits": session_waits,
+        "top_elapsed_sql": top_elapsed,
+        "awr_waits": awr_waits,
+        "current_waits_unavailable": bool(wait_err),
+    }
 
 
 def _performance_sections(perf: dict[str, Any]) -> list[HealthCheckSection]:
@@ -638,14 +1509,31 @@ def _performance_sections(perf: dict[str, Any]) -> list[HealthCheckSection]:
     stale = perf.get("stale_stats") or []
     top_cpu = perf.get("top_cpu_sql") or {}
     top_cpu_pct = _float(top_cpu.get("cpu_pct"))
-    perf_status = _worst(["WARNING" if plan_churn else "OK", "WARNING" if stale else "OK", "CRITICAL" if top_cpu_pct is not None and top_cpu_pct >= 50 else "WARNING" if top_cpu else "OK"])
+    total_oncpu = _float(top_cpu.get("total_oncpu_samples"))
+    ash_sample_min = 20.0
+    if top_cpu and top_cpu_pct is not None and (total_oncpu or 0.0) >= ash_sample_min:
+        top_cpu_status = "CRITICAL" if top_cpu_pct >= 50 else "WARNING"
+    elif top_cpu:
+        top_cpu_status = "INFO"
+    else:
+        top_cpu_status = "OK"
+    perf_status = _worst(["WARNING" if plan_churn else "OK", "WARNING" if stale else "OK", top_cpu_status])
     summary_parts = [
         f"{len(plan_churn)} SQL_ID(s) with plan churn.",
         f"{len(stale)} stale-stat table sample row(s).",
-        f"Top ASH CPU SQL: {top_cpu.get('sql_id')} at {top_cpu_pct:.2f}%." if top_cpu_pct is not None else "Top ASH CPU SQL unavailable.",
+        (
+            f"Top ASH CPU SQL: {top_cpu.get('sql_id')} at {top_cpu_pct:.2f}% "
+            f"(ON CPU samples={int(total_oncpu or 0)})."
+            if top_cpu_pct is not None
+            else "Top ASH CPU SQL unavailable."
+        ),
     ]
+    if top_cpu and (total_oncpu or 0.0) < ash_sample_min:
+        summary_parts.append("Top SQL concentration observed, but ASH sample count is too low for warning.")
     sections.append(_section("Performance Overview", perf_status, " ".join(summary_parts), (perf.get("top_elapsed_sql") or [])[:10]))
-    sections.append(_section("Current Wait Profile", "INFO" if perf.get("current_waits") else "OK", f"{len(perf.get('current_waits') or [])} current non-idle wait row(s).", perf.get("current_waits") or []))
+    wait_notes = ["Current wait metric unavailable from GV$EVENTMETRIC; fallback used GV$SYSTEM_EVENT (since instance startup)."] if perf.get("current_waits_unavailable") else []
+    sections.append(_section("Current Wait Profile", "INFO" if perf.get("current_waits") else "OK", f"{len(perf.get('current_waits') or [])} current non-idle wait row(s).", perf.get("current_waits") or [], notes=wait_notes))
+    sections.append(_section("Session Wait Correlation", "INFO" if perf.get("session_waits") else "OK", f"{len(perf.get('session_waits') or [])} active non-idle session wait row(s).", perf.get("session_waits") or []))
     sections.append(_section("AWR Wait Events", "INFO" if perf.get("awr_waits") else "OK", f"{len(perf.get('awr_waits') or [])} AWR wait event row(s) above threshold.", perf.get("awr_waits") or []))
     sections.append(_section("Cache Ratios", _cache_status(perf.get("cache") or {}), _cache_summary(perf.get("cache") or {}), [perf.get("cache") or {}]))
     return sections
@@ -659,12 +1547,10 @@ def _performance_actions(perf: dict[str, Any], hours: int) -> list[ActionableHea
         actions.append(ActionableHealthItem(category="statistics", title="Stale or missing table statistics", severity="WARNING", detail=f"{len(perf.get('stale_stats') or [])} stale-stat table sample row(s).", recommendation="Review optimizer statistics freshness for application schemas.", evidence=[str(row) for row in (perf.get("stale_stats") or [])[:3]]))
     top_cpu = perf.get("top_cpu_sql") or {}
     pct = _float(top_cpu.get("cpu_pct"))
-    if pct is not None:
+    total_oncpu = _float(top_cpu.get("total_oncpu_samples"))
+    ash_sample_min = 20.0
+    if pct is not None and (total_oncpu or 0.0) >= ash_sample_min:
         actions.append(ActionableHealthItem(category="sql", title="ASH top CPU SQL concentration", severity="CRITICAL" if pct >= 50 else "WARNING", detail=f"SQL_ID {top_cpu.get('sql_id')} accounts for {pct:.2f}% of ON CPU ASH samples in {hours}h.", recommendation="Run SQL_ID deep dive and inspect execution plan, waits, and row-source behavior."))
-    cache = perf.get("cache") or {}
-    cache_status = _cache_status(cache)
-    if cache_status in {"WARNING", "CRITICAL"}:
-        actions.append(ActionableHealthItem(category="cache", title="Low cache hit ratio", severity=cache_status, detail=_cache_summary(cache), recommendation="Review memory pressure, parsing behavior, SQL reuse, and physical I/O."))
     return actions
 
 
@@ -674,8 +1560,8 @@ def _transactions() -> dict[str, Any]:
         select s.sid, s.serial# as serial_num, nvl(s.username,'-') as username,
                round((sysdate - t.start_date)*24*60, 2) as minutes,
                nvl(s.sql_id,'N/A') as sql_id
-        from v$transaction t
-        join v$session s on s.saddr = t.ses_addr
+        from gv$transaction t
+        join gv$session s on s.inst_id = t.inst_id and s.saddr = t.ses_addr
         where (sysdate - t.start_date) * 24 * 60 > 60
         order by minutes desc
         fetch first 10 rows only
@@ -724,9 +1610,9 @@ def _memory_config() -> dict[str, Any]:
           select s.sid, s.serial# as serial_num, nvl(s.username,'-') as username,
                  nvl(s.module,'-') as module, nvl(s.program,'-') as program,
                  nvl(s.sql_id,'-') as sql_id, round(ss.value/100, 2) as cpu_seconds
-          from v$session s
-          join v$sesstat ss on ss.sid = s.sid
-          join v$statname sn on sn.statistic# = ss.statistic#
+          from gv$session s
+          join gv$sesstat ss on ss.inst_id = s.inst_id and ss.sid = s.sid
+          join gv$statname sn on sn.inst_id = ss.inst_id and sn.statistic# = ss.statistic#
           where sn.name = 'CPU used by this session'
             and s.type = 'USER'
           order by ss.value desc
@@ -739,9 +1625,9 @@ def _memory_config() -> dict[str, Any]:
         with temp_usage as (
           select session_addr,
                  round(sum(blocks * ts.block_size) / 1024 / 1024, 2) as temp_used_mb
-          from v$tempseg_usage t
+          from gv$tempseg_usage t
           join dba_tablespaces ts on ts.tablespace_name = t.tablespace
-          group by session_addr
+          group by inst_id, session_addr
         )
         select * from (
           select s.sid, s.serial# as serial_num, nvl(s.username,'-') as username,
@@ -751,9 +1637,9 @@ def _memory_config() -> dict[str, Any]:
                  round(p.pga_used_mem/1024/1024, 2) as pga_used_mb,
                  round(p.pga_alloc_mem/1024/1024, 2) as pga_alloc_mb,
                  nvl(tu.temp_used_mb, 0) as temp_used_mb
-          from v$session s
-          join v$process p on p.addr = s.paddr
-          left join temp_usage tu on tu.session_addr = s.saddr
+          from gv$session s
+          join gv$process p on p.inst_id = s.inst_id and p.addr = s.paddr
+          left join temp_usage tu on tu.inst_id = s.inst_id and tu.session_addr = s.saddr
           where s.type = 'USER'
           order by p.pga_used_mem desc
         )
@@ -851,21 +1737,23 @@ def _cache_ratios() -> dict[str, Any]:
 
 
 def _cache_status(cache: dict[str, Any]) -> str:
-    statuses = []
-    buffer_hit = _float(cache.get("buffer_hit_pct"))
-    library_hit = _float(cache.get("library_hit_pct"))
-    dictionary_hit = _float(cache.get("dictionary_hit_pct"))
-    if buffer_hit is not None:
-        statuses.append("CRITICAL" if buffer_hit < 90 else "WARNING" if buffer_hit < 95 else "OK")
-    if library_hit is not None:
-        statuses.append("CRITICAL" if library_hit < 85 else "WARNING" if library_hit < 90 else "OK")
-    if dictionary_hit is not None:
-        statuses.append("CRITICAL" if dictionary_hit < 85 else "WARNING" if dictionary_hit < 90 else "OK")
-    return _worst(statuses or ["INFO"])
+    # Cache ratios are context-only and must not be escalated standalone.
+    return "INFO"
 
 
 def _cache_summary(cache: dict[str, Any]) -> str:
-    return f"Buffer={_fmt_pct(cache.get('buffer_hit_pct'))}, Library={_fmt_pct(cache.get('library_hit_pct'))}, Dictionary={_fmt_pct(cache.get('dictionary_hit_pct'))}."
+    buffer_hit = _float(cache.get("buffer_hit_pct"))
+    context_line = (
+        "Cache ratios are healthy/context only."
+        if buffer_hit is not None and buffer_hit >= 90.0
+        else "Low buffer cache ratio observed, but insufficient correlated I/O evidence to call root cause."
+    )
+    return (
+        f"Buffer={_fmt_pct(cache.get('buffer_hit_pct'))}, "
+        f"Library={_fmt_pct(cache.get('library_hit_pct'))}, "
+        f"Dictionary={_fmt_pct(cache.get('dictionary_hit_pct'))}. "
+        f"{context_line}"
+    )
 
 
 def _tablespace_allocation_note(*, alert_rows: list[dict[str, Any]], tablespace_rows: list[dict[str, Any]]) -> str | None:
@@ -895,6 +1783,297 @@ def _lock_wait_without_blocker_note(*, wait_rows: list[dict[str, Any]], has_bloc
     )
 
 
+def _services_and_routing(*, role_mode: dict[str, Any] | None = None) -> dict[str, Any]:
+    active_rows, active_err = _fetch_all(
+        """
+        select s.inst_id,
+               s.name,
+               s.network_name,
+               s.con_id,
+               c.name as container_name,
+               to_char(s.creation_date, 'YYYY-MM-DD HH24:MI:SS') as creation_date
+        from gv$active_services s
+        left join v$containers c
+               on c.con_id = s.con_id
+        order by s.inst_id, s.name
+        """
+    )
+    source = "gv$active_services"
+    if active_err and not active_rows:
+        active_rows, active_err = _fetch_all(
+            """
+            select cast(null as number) as inst_id,
+                   s.name,
+                   s.network_name,
+                   s.con_id,
+                   c.name as container_name,
+                   to_char(s.creation_date, 'YYYY-MM-DD HH24:MI:SS') as creation_date
+            from v$active_services s
+            left join v$containers c
+                   on c.con_id = s.con_id
+            order by s.name
+            """
+        )
+        source = "v$active_services"
+
+    configured_rows, configured_err = _fetch_all(
+        """
+        select inst_id,
+               name,
+               network_name,
+               con_id,
+               goal,
+               clb_goal,
+               aq_ha_notifications
+        from gv$services
+        order by inst_id, name
+        """
+    )
+    if configured_err and "ORA-00904" in configured_err.upper() and "AQ_HA_NOTIFICATIONS" in configured_err.upper():
+        fallback_rows, fallback_err = _fetch_all(
+            """
+            select inst_id,
+                   name,
+                   network_name,
+                   con_id,
+                   goal,
+                   clb_goal
+            from gv$services
+            order by inst_id, name
+            """
+        )
+        if fallback_rows and not fallback_err:
+            configured_rows = fallback_rows
+            configured_err = f"{configured_err}; fallback query used without AQ_HA_NOTIFICATIONS."
+
+    context = role_mode or {}
+    expected = _expected_services()
+    evaluated = _evaluate_services(
+        active_rows=active_rows,
+        expected=expected,
+        role_mode=context,
+    )
+    return {
+        "active_services": active_rows,
+        "configured_services": configured_rows,
+        "expected_services": expected,
+        "evaluation": evaluated,
+        "source": source,
+        "active_error": active_err,
+        "configured_error": configured_err,
+        "role_mode": context,
+    }
+
+
+def _services_section(services: dict[str, Any]) -> HealthCheckSection:
+    evaluation = services.get("evaluation") or {}
+    severity = str(evaluation.get("severity") or "INFO")
+    rows = evaluation.get("rows") or []
+    summary = str(evaluation.get("summary") or "Service routing evaluation completed.")
+    notes: list[str] = []
+    if services.get("active_error"):
+        notes.append(f"Active service query warning: {services.get('active_error')}")
+    if services.get("configured_error"):
+        notes.append(f"Configured service query warning: {services.get('configured_error')}")
+    notes.append(f"Active service source: {services.get('source')}")
+    return _section("Services And Routing", severity, summary, rows, notes=notes)
+
+
+def _standby_services_section(services: dict[str, Any]) -> HealthCheckSection:
+    section = _services_section(services)
+    section.name = "Standby Active Services"
+    return section
+
+
+def _services_actions(services: dict[str, Any]) -> list[ActionableHealthItem]:
+    evaluation = services.get("evaluation") or {}
+    severity = str(evaluation.get("severity") or "INFO")
+    if severity not in {"CRITICAL", "WARNING"}:
+        return []
+    findings = evaluation.get("findings") or []
+    return [
+        ActionableHealthItem(
+            category="services",
+            title="Service routing mismatch",
+            severity=severity,
+            detail=str(evaluation.get("summary") or "Service routing issue detected."),
+            recommendation="Validate service registration and instance placement against expected services.",
+            evidence=[str(item) for item in findings[:5]],
+        )
+    ]
+
+
+def _expected_services() -> list[dict[str, Any]]:
+    raw = os.getenv("ODB_AUTODBA_EXPECTED_SERVICES", "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        expected_instances = item.get("expected_instances")
+        if not isinstance(expected_instances, list):
+            expected_instances = []
+        out.append(
+            {
+                "name": name,
+                "required": bool(item.get("required", True)),
+                "expected_instances": [int(x) for x in expected_instances if _as_int(x) is not None],
+            }
+        )
+    return out
+
+
+def _evaluate_services(
+    *,
+    active_rows: list[dict[str, Any]],
+    expected: list[dict[str, Any]],
+    role_mode: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = role_mode or {}
+    standby_mode = bool(context.get("standby_health_mode"))
+    mounted_physical_standby = bool(context.get("is_mounted_physical_standby"))
+    read_only_standby = bool(context.get("is_read_only_standby"))
+    filtered = [row for row in active_rows if not _is_internal_service(str(row.get("name") or ""))]
+    findings: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for row in filtered:
+        rows.append(
+            {
+                "inst_id": row.get("inst_id"),
+                "service_name": row.get("name"),
+                "name": row.get("name"),
+                "network_name": row.get("network_name"),
+                "con_id": row.get("con_id"),
+                "container_name": row.get("container_name"),
+                "status": "ACTIVE",
+                "finding": "discovered",
+            }
+        )
+    if not filtered:
+        findings.append("No non-internal active services were discovered.")
+
+    severity = "INFO"
+    if not active_rows:
+        severity = "WARNING"
+    if not filtered:
+        if mounted_physical_standby and not expected:
+            severity = "INFO"
+        elif standby_mode and read_only_standby:
+            severity = "WARNING"
+        else:
+            severity = "WARNING"
+
+    if expected:
+        expected_map = {str(item.get("name") or "").upper(): item for item in expected}
+        active_by_name: dict[str, set[int]] = {}
+        for row in filtered:
+            name = str(row.get("name") or "").upper()
+            if not name:
+                continue
+            active_by_name.setdefault(name, set()).add(_as_int(row.get("inst_id")) or 0)
+
+        for name, item in expected_map.items():
+            required = bool(item.get("required", True))
+            expected_instances = {int(x) for x in (item.get("expected_instances") or [])}
+            active_instances = active_by_name.get(name, set())
+            if required and not active_instances:
+                severity = "CRITICAL"
+                findings.append(f"Required service {name} is missing.")
+                rows.append({"inst_id": None, "service_name": name, "name": name, "network_name": None, "con_id": None, "container_name": None, "status": "MISSING", "finding": "required service missing"})
+                continue
+            if expected_instances and active_instances:
+                if not expected_instances.issubset(active_instances):
+                    severity = "CRITICAL" if required else "WARNING"
+                    findings.append(f"Service {name} is active on fewer than expected instances.")
+                unexpected = active_instances - expected_instances
+                if unexpected:
+                    severity = "WARNING" if severity != "CRITICAL" else severity
+                    findings.append(f"Service {name} is active on unexpected instance(s): {sorted(unexpected)}.")
+    else:
+        findings.append("No expected_services config provided; reporting discovered services only.")
+
+    if not active_rows:
+        summary = "No active services returned from service views."
+    else:
+        summary = f"{len(filtered)} non-internal active service row(s) discovered."
+    if mounted_physical_standby and not expected and not filtered:
+        summary = "Mounted standby with no non-internal services is informational when no expected service config exists."
+    return {"severity": severity, "summary": summary, "rows": rows[:50], "findings": findings}
+
+
+def _is_internal_service(name: str) -> bool:
+    upper = str(name or "").upper()
+    return upper.startswith("SYS$") or upper in {"SYS$BACKGROUND", "SYS$USERS"}
+
+
+def _build_dba_trust_checks(*, raw: dict[str, Any], sections: list[HealthCheckSection]) -> dict[str, Any]:
+    tablespace_rows = raw.get("tablespaces") or []
+    tablespace_unit_ok = all(_float(row.get("pct_used")) is None or 0.0 <= (_float(row.get("pct_used")) or 0.0) <= 100.0 for row in tablespace_rows)
+    awr_valid = True
+    awr_mode = str(raw.get("awr_mode") or "")
+    if awr_mode == "SAME_SNAPSHOT_WINDOW":
+        awr_valid = False
+    services = raw.get("services") or {}
+    expected_services = services.get("expected_services") if isinstance(services, dict) else []
+    role_mode = raw.get("database_role_mode") if isinstance(raw.get("database_role_mode"), dict) else {}
+    has_inst_id = any(
+        (_as_int(row.get("inst_id")) is not None)
+        for row in (services.get("active_services") or []) + (raw.get("temp", {}).get("top_consumers") or []) + (raw.get("lock_pairs") or [])
+        if isinstance(row, dict)
+    )
+    listener_raw = raw.get("listener_connectivity_signals") if isinstance(raw.get("listener_connectivity_signals"), dict) else {}
+    if listener_raw.get("skipped_no_os_access"):
+        listener_checked = "skipped_no_os_access"
+    else:
+        listener_checked = "yes" if listener_raw else "no"
+    standby_mode = bool(role_mode.get("standby_health_mode"))
+    standby_recovery = raw.get("standby_managed_recovery") if isinstance(raw.get("standby_managed_recovery"), dict) else {}
+    standby_lag = raw.get("standby_lag") if isinstance(raw.get("standby_lag"), dict) else {}
+    archive_gap = raw.get("archive_gap") if isinstance(raw.get("archive_gap"), dict) else {}
+    dg_status = raw.get("dataguard_status") if isinstance(raw.get("dataguard_status"), dict) else {}
+    return {
+        "rac_mode_detected": "yes" if (bool((raw.get("db_status") or {}).get("instances")) and len((raw.get("db_status") or {}).get("instances") or []) > 1) else "no",
+        "runtime_views_used": "GV$",
+        "inst_id_included": "yes" if has_inst_id else "no",
+        "service_check_performed": "yes" if bool(raw.get("services")) else "no",
+        "expected_service_validation": "yes" if bool(expected_services) else "no",
+        "active_sessions_split_true_active_idle_active": "yes",
+        "blocking_severity_used_seconds_in_wait": "yes",
+        "blocking_severity_used_blocker_classification": "yes",
+        "awr_comparison_valid": "yes" if awr_valid else "no",
+        "tablespace_headline_source": raw.get("tablespace_headline_source") or "DBA_TABLESPACE_USAGE_METRICS",
+        "tablespace_headline_percent_validation_passed": "yes" if tablespace_unit_ok else "no",
+        "tablespace_optional_allocation_unit_validation_passed": "yes" if not any(bool(row.get("allocation_anomaly")) for row in (raw.get("tablespace_allocation_details") or [])) else "no",
+        "temp_capacity_separated_from_temp_consumers": "yes",
+        "sql_id_wrapper_detection_enabled": "yes",
+        "cache_ratio_standalone_critical_disabled": "yes",
+        "redo_switch_standalone_warning_disabled": "yes",
+        "standby_mode_detected": "yes" if standby_mode else "no",
+        "standby_apply_checked": "yes" if standby_recovery.get("checked") else "no",
+        "standby_lag_checked": "yes" if standby_lag.get("checked") else "no",
+        "archive_gap_checked": "yes" if archive_gap.get("checked") else "no",
+        "dataguard_status_checked": "yes" if dg_status.get("checked") else "no",
+        "standby_services_checked": "yes" if standby_mode and bool(raw.get("services")) else ("no" if standby_mode else "n/a"),
+        "listener_log_checked": listener_checked,
+        "primary_style_checks_skipped_for_mounted_standby": "yes" if raw.get("primary_style_checks_skipped_for_mounted_standby") else "no",
+    }
+
+
+def _dba_trust_section(checks: dict[str, Any]) -> HealthCheckSection:
+    rows = [{"check": key, "value": value} for key, value in checks.items()]
+    return _section("DBA Trust Checks", "INFO", "Collector trust and interpretation guardrails status.", rows)
+
+
 def _ora_severity(code: str) -> str:
     upper = (code or "").upper()
     critical = {"ORA-00600", "ORA-00700", "ORA-07445", "ORA-04030", "ORA-04031", "ORA-03113", "ORA-03135", "ORA-01555"}
@@ -904,6 +2083,36 @@ def _ora_severity(code: str) -> str:
     if upper in warning:
         return "WARNING"
     return "INFO"
+
+
+def _tablespace_thresholds() -> tuple[float, float]:
+    warn = _float(os.getenv("ODB_AUTODBA_TABLESPACE_WARN_PCT")) or 85.0
+    crit = _float(os.getenv("ODB_AUTODBA_TABLESPACE_CRIT_PCT")) or 97.0
+    if crit <= warn:
+        crit = warn + 1.0
+    return warn, crit
+
+
+def _bounded_pct(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(max(0.0, min(100.0, value)), 2)
+
+
+def _event_wait_ms(rows: list[dict[str, Any]], event_name: str) -> float | None:
+    for row in rows:
+        if str(row.get("event") or "").lower() == event_name.lower():
+            return _float(row.get("avg_wait_ms"))
+    return None
+
+
+def _small_redo_logs(redo: dict[str, Any]) -> bool:
+    groups = redo.get("log_groups") or []
+    sizes = [_float(row.get("size_mb")) for row in groups]
+    sizes = [size for size in sizes if size is not None]
+    if not sizes:
+        return False
+    return max(sizes) < 1024.0
 
 
 def _extract_error_code(message: str) -> str | None:
@@ -931,6 +2140,15 @@ def _float(value: Any) -> float | None:
         return None
     try:
         return float(value)
+    except Exception:
+        return None
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
     except Exception:
         return None
 

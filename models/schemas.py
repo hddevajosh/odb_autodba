@@ -3,17 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 MetricStatus = Literal["OK", "WARNING", "CRITICAL"]
 ReviewConfidence = Literal["LOW", "MEDIUM", "HIGH"]
 BlockerClassification = Literal[
-    "application_session",
+    "foreground_session",
     "idle_in_transaction_blocker",
-    "batch_job",
-    "dbms_scheduler",
-    "maintenance_session",
-    "sys_or_background",
+    "background_process",
+    "unknown_or_background",
     "unknown",
 ]
 PlannerResponseMode = Literal[
@@ -27,8 +25,12 @@ RemediationExecutionStatus = Literal["not_started", "succeeded", "failed", "skip
 
 
 class InstanceInfo(BaseModel):
+    inst_id: int | None = None
     instance_name: str = ""
     host_name: str = ""
+    instance_status: str = ""
+    thread: int | None = None
+    parallel: str | None = None
     version: str = ""
     startup_time: str = ""
     db_name: str = ""
@@ -43,6 +45,10 @@ class InstanceInfo(BaseModel):
 class SessionSummary(BaseModel):
     total_sessions: int = 0
     active_sessions: int = 0
+    active_total: int = 0
+    true_active_non_idle: int = 0
+    active_idle_waiting: int = 0
+    on_cpu_sessions: int = 0
     inactive_sessions: int = 0
     blocked_sessions: int = 0
     blocking_sessions: int = 0
@@ -57,8 +63,11 @@ class SessionRow(BaseModel):
     username: str | None = None
     status: str | None = None
     sql_id: str | None = None
+    prev_sql_id: str | None = None
+    action: str | None = None
     event: str | None = None
     wait_class: str | None = None
+    state: str | None = None
     module: str | None = None
     program: str | None = None
     machine: str | None = None
@@ -66,6 +75,9 @@ class SessionRow(BaseModel):
     last_call_et: int | None = None
     blocking_instance: int | None = None
     blocking_session: int | None = None
+    final_blocking_instance: int | None = None
+    final_blocking_session: int | None = None
+    activity_class: str | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -130,8 +142,14 @@ class BlockingChain(BaseModel):
     object_owner: str | None = None
     object_name: str | None = None
     object_type: str | None = None
+    blocker_txn_start_date: str | None = None
+    blocker_txn_age_min: float | None = None
+    blocker_undo_blocks: int | None = None
+    blocker_undo_records: int | None = None
     blocker_sql_text: str | None = None
     blocked_sql_text: str | None = None
+    blocking_severity: str | None = None
+    blocking_reason: str | None = None
     blocker_classification: BlockerClassification = "unknown"
     evidence_complete: bool = False
 
@@ -222,7 +240,9 @@ class TopSqlRow(BaseModel):
 
 class TablespaceUsageRow(BaseModel):
     tablespace_name: str
-    used_pct: float
+    pct_used: float | None = None
+    pct_free: float | None = None
+    used_pct: float = 0.0
     allocated_mb: float | None = None
     used_mb: float | None = None
     free_allocated_mb: float | None = None
@@ -238,10 +258,15 @@ class TablespaceUsageRow(BaseModel):
 
 
 class TempUsageRow(BaseModel):
+    inst_id: int | None = None
+    sid: int | None = None
+    serial_num: int | None = None
     username: str | None = None
     sql_id: str | None = None
+    module: str | None = None
     segtype: str | None = None
     mb_used: float | None = None
+    temp_used_mb: float | None = None
     tablespace: str | None = None
 
 
@@ -503,6 +528,7 @@ class SqlClassification(BaseModel):
         "dictionary_sql",
         "maintenance_sql",
         "recursive_sql",
+        "plsql_wrapper",
         "unknown",
     ] = "unknown"
     confidence: Literal["LOW", "MEDIUM", "HIGH"] = "LOW"
@@ -566,6 +592,7 @@ class SqlIdDeepDive(BaseModel):
     execution_plan: FormattedPlanSection = Field(default_factory=FormattedPlanSection)
     lock_analysis: dict[str, Any] = Field(default_factory=dict)
     plan_analysis: dict[str, Any] = Field(default_factory=dict)
+    plan_advisor: dict[str, Any] = Field(default_factory=dict)
     history_analysis: dict[str, Any] = Field(default_factory=dict)
     risk_summary: dict[str, Any] = Field(default_factory=dict)
     dba_recommendation: SqlDbaRecommendation = Field(default_factory=SqlDbaRecommendation)
@@ -666,6 +693,8 @@ class AwrCapabilities(BaseModel):
 
 class AwrSnapshotWindowMapping(BaseModel):
     dbid: int | None = None
+    instance_number: int | None = None
+    startup_time: str | None = None
     begin_snap_id: int | None = None
     end_snap_id: int | None = None
     matched_snap_id: int | None = None
@@ -673,8 +702,11 @@ class AwrSnapshotWindowMapping(BaseModel):
     end_time: str | None = None
     matched_begin_time: str | None = None
     matched_end_time: str | None = None
+    duration_minutes: float | None = None
     instance_count: int = 0
     instance_rows_found: int = 0
+    window_use: Literal["rca", "baseline", "structured_delta", "context_only"] = "context_only"
+    window_reason: str | None = None
     mapping_quality: Literal["HIGH", "MEDIUM", "LOW", "NONE"] = "NONE"
     notes: list[str] = Field(default_factory=list)
 
@@ -827,9 +859,14 @@ class AwrAshState(BaseModel):
 
 
 class AwrSnapshotQuality(BaseModel):
+    window_quality: Literal["HIGH", "MEDIUM", "LOW", "NONE"] = "NONE"
+    usage: Literal["rca", "context_only"] = "context_only"
+    reason: str = ""
     coverage_quality: Literal["HIGH", "MEDIUM", "LOW", "NONE"] = "NONE"
     comparability_score: float = 0.0
     confidence: ReviewConfidence = "LOW"
+    diagnostic_rows: list[dict[str, Any]] = Field(default_factory=list)
+    window_rows: list[dict[str, Any]] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -868,6 +905,7 @@ class AwrStateDiff(BaseModel):
     ash_state: AwrAshState = Field(default_factory=AwrAshState)
     snapshot_quality: AwrSnapshotQuality = Field(default_factory=AwrSnapshotQuality)
     awr_report_text_summary: AwrReportTextSummary = Field(default_factory=AwrReportTextSummary)
+    structured_sections: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -1300,6 +1338,192 @@ class InvestigationStep(BaseModel):
     result_columns: list[str] = Field(default_factory=list)
     result_rows: list[dict[str, Any]] = Field(default_factory=list)
     result_truncated: bool = False
+    correction_attempts: list["InvestigationSQLAttemptRecord"] = Field(default_factory=list)
+    final_attempt_count: int = 1
+    finding: str = ""
+    evidence_source: Literal["SQL", "Hybrid"] = "SQL"
+    historical_context_used: bool = False
+    investigation_mode: str = "read_only_lookup"
+    confidence: str = "MEDIUM"
+    inference_confidence: str = "MEDIUM"
+    termination_reason: str = ""
+
+
+class InvestigationSQLAttemptRecord(BaseModel):
+    attempt_no: int = 1
+    attempt: int = 1
+    sql: str = ""
+    repaired: bool = False
+    validation_ok: bool = False
+    execution_status: Literal["success", "error", "validation_error", "skipped"] = "skipped"
+    status: Literal["success", "error", "validation_error", "skipped"] = "skipped"
+    recoverable: bool = False
+    error: str = ""
+    error_code: str = ""
+    repair_reason: str = ""
+
+
+class InvestigationStepDecision(BaseModel):
+    analysis: str = ""
+    next_action: Literal["run_sql", "conclude", "clarify"] = "run_sql"
+    sql: str | None = None
+    goal: str = ""
+    hypothesis: str | None = None
+    is_final: bool = False
+    confidence: float = 0.5
+    required_evidence_status: dict[str, bool] = Field(default_factory=dict)
+    clarification_question: str | None = None
+    final_answer: str | None = None
+    recommended_actions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_payload(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+
+        data: dict[str, Any] = dict(payload)
+        sql_alternate_keys = ("query", "statement", "sql_text", "next_sql")
+        if not str(data.get("sql") or "").strip():
+            for key in sql_alternate_keys:
+                candidate = str(data.get(key) or "").strip()
+                if candidate:
+                    data["sql"] = candidate
+                    break
+
+        if not str(data.get("analysis") or "").strip():
+            for key in ("reason", "thought", "rationale"):
+                candidate = str(data.get(key) or "").strip()
+                if candidate:
+                    data["analysis"] = candidate
+                    break
+
+        if not str(data.get("goal") or "").strip():
+            for key in ("objective", "description"):
+                candidate = str(data.get(key) or "").strip()
+                if candidate:
+                    data["goal"] = candidate
+                    break
+
+        if not str(data.get("final_answer") or "").strip():
+            answer = str(data.get("answer") or "").strip()
+            if answer:
+                data["final_answer"] = answer
+
+        data["next_action"] = cls._normalize_next_action(data.get("next_action") or data.get("action"))
+        data["required_evidence_status"] = cls._normalize_required_evidence_status(data.get("required_evidence_status"))
+        data["recommended_actions"] = cls._normalize_recommended_actions(data.get("recommended_actions"))
+        data["confidence"] = cls._normalize_confidence(data.get("confidence"))
+        return data
+
+    @field_validator("next_action", mode="before")
+    @classmethod
+    def _normalize_next_action_field(cls, value: Any) -> str:
+        return cls._normalize_next_action(value)
+
+    @field_validator("required_evidence_status", mode="before")
+    @classmethod
+    def _normalize_required_evidence_status_field(cls, value: Any) -> dict[str, bool]:
+        return cls._normalize_required_evidence_status(value)
+
+    @field_validator("recommended_actions", mode="before")
+    @classmethod
+    def _normalize_recommended_actions_field(cls, value: Any) -> list[str]:
+        return cls._normalize_recommended_actions(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence_field(cls, value: Any) -> float:
+        return cls._normalize_confidence(value)
+
+    @classmethod
+    def _normalize_next_action(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        text = text.replace("-", "_").replace(" ", "_")
+        aliases = {
+            "run": "run_sql",
+            "runsql": "run_sql",
+            "sql": "run_sql",
+            "execute_sql": "run_sql",
+            "execute": "run_sql",
+            "query": "run_sql",
+            "final": "conclude",
+            "final_answer": "conclude",
+            "answer": "conclude",
+            "done": "conclude",
+            "ask_clarification": "clarify",
+            "clarification": "clarify",
+            "ask": "clarify",
+        }
+        if text in {"run_sql", "conclude", "clarify"}:
+            return text
+        if text in aliases:
+            return aliases[text]
+        if "clar" in text:
+            return "clarify"
+        if "final" in text or "conclud" in text or "answer" in text or "done" in text:
+            return "conclude"
+        if "sql" in text or "query" in text or "run" in text or "execute" in text:
+            return "run_sql"
+        return "clarify"
+
+    @classmethod
+    def _normalize_required_evidence_status(cls, value: Any) -> dict[str, bool]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return {str(key): bool(flag) for key, flag in value.items() if str(key).strip()}
+        if isinstance(value, list):
+            normalized: dict[str, bool] = {}
+            for item in value:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("key") or item.get("evidence") or "").strip()
+                    if not name:
+                        continue
+                    marker = item.get("satisfied")
+                    if marker is None:
+                        marker = item.get("value")
+                    normalized[name] = bool(marker)
+                    continue
+                if isinstance(item, str):
+                    name = item.strip()
+                    if name:
+                        normalized[name] = False
+            return normalized
+        return {}
+
+    @classmethod
+    def _normalize_recommended_actions(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    @classmethod
+    def _normalize_confidence(cls, value: Any) -> float:
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if numeric > 1.0 and numeric <= 100.0:
+                numeric = numeric / 100.0
+            return max(0.0, min(1.0, numeric))
+        text = str(value or "").strip().lower()
+        if not text:
+            return 0.5
+        confidence_map = {"high": 0.85, "medium": 0.6, "low": 0.3}
+        if text in confidence_map:
+            return confidence_map[text]
+        try:
+            numeric = float(text)
+            if numeric > 1.0 and numeric <= 100.0:
+                numeric = numeric / 100.0
+            return max(0.0, min(1.0, numeric))
+        except Exception:
+            return 0.5
 
 
 class InvestigationReport(BaseModel):
@@ -1310,6 +1534,28 @@ class InvestigationReport(BaseModel):
     recommended_next_actions: list[str] = Field(default_factory=list)
     steps: list[InvestigationStep] = Field(default_factory=list)
     trace_path: str | None = None
+    plan_type: str = "diagnostic"
+    planner_provider: str = "deterministic_fallback"
+    planner_model: str = "deterministic"
+    planner_elapsed_ms: int = 0
+    planner_steps_count: int = 0
+    planner_requested: bool = False
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    planner_notes: list[str] = Field(default_factory=list)
+    evidence_source: Literal["SQL", "Hybrid"] = "SQL"
+    historical_context_used: bool = False
+    investigation_mode: str = "read_only_lookup"
+    confidence: str = "MEDIUM"
+    inference_confidence: str = "MEDIUM"
+    termination_reason: str = ""
+    required_evidence_status: dict[str, bool] = Field(default_factory=dict)
+    clarification_question: str = ""
+    sql_execution_count: int = 0
+    sql_execution_cap: int = 0
+    thread_id: str = ""
+    thread_continued: bool = False
+    thread_context_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class PostActionValidationPlan(BaseModel):
