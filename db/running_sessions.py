@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from odb_autodba.db.connection import fetch_all, fetch_one
+from odb_autodba.db.sql_text import get_sql_text
 from odb_autodba.models.schemas import BlockingChain, HostProcessRow, SessionProcessCorrelationRow, SessionRow
 
 
@@ -289,7 +290,14 @@ where rownum <= :lim
 
 
 def get_running_sessions_inventory() -> list[SessionRow]:
-    return [SessionRow(**row) for row in fetch_all(ACTIVE_SESSIONS_SQL)]
+    rows = fetch_all(ACTIVE_SESSIONS_SQL)
+    sql_text_cache: dict[str, str | None] = {}
+    enriched_rows: list[SessionRow] = []
+    for row in rows:
+        payload = dict(row)
+        payload["sql_text"] = _safe_sql_text(payload.get("sql_id"), cache=sql_text_cache)
+        enriched_rows.append(SessionRow(**payload))
+    return enriched_rows
 
 
 def get_active_session_summary() -> dict[str, int]:
@@ -353,9 +361,16 @@ def map_top_processes_to_sessions(process_rows: list[HostProcessRow]) -> tuple[l
 
 def get_top_session_resource_candidates(limit: int = 10) -> list[dict[str, Any]]:
     try:
-        return fetch_all(TOP_SESSION_RESOURCE_SQL, {"lim": int(limit)})
+        rows = fetch_all(TOP_SESSION_RESOURCE_SQL, {"lim": int(limit)})
     except Exception:
         return []
+    sql_text_cache: dict[str, str | None] = {}
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        payload["sql_text"] = _safe_sql_text(payload.get("sql_id"), cache=sql_text_cache)
+        enriched.append(payload)
+    return enriched
 
 
 def _fetch_blocking_rows() -> list[dict[str, Any]]:
@@ -363,6 +378,30 @@ def _fetch_blocking_rows() -> list[dict[str, Any]]:
         return fetch_all(BLOCKING_SQL)
     except Exception:
         return []
+
+
+def _safe_sql_text(sql_id: Any, *, cache: dict[str, str | None]) -> str | None:
+    normalized = str(sql_id or "").strip()
+    if not normalized or normalized.lower() in {"-", "none", "n/a", "null"}:
+        return None
+    cache_key = normalized.lower()
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        text = get_sql_text(normalized)
+    except Exception:
+        text = None
+    cache[cache_key] = _normalized_sql_text(text)
+    return cache[cache_key]
+
+
+def _normalized_sql_text(text: str | None, *, max_length: int = 240) -> str | None:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        return normalized[: max_length - 1] + "…"
+    return normalized
 
 
 def _is_evidence_complete(row: dict[str, Any]) -> bool:

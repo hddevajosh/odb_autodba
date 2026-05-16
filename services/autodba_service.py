@@ -97,24 +97,16 @@ def get_active_sessions(db_key: str | None = None) -> dict[str, Any]:
         response = PlannerAgent(db_key=resolved_db_key).handle_message("Show active sessions", db_key=resolved_db_key)
     supporting = _coerce_supporting_data(response)
     base_report = render_planner_response(response)
-    root_cause = infer_root_cause(
-        mode="sessions",
-        summary=response.summary,
-        supporting_data=supporting,
-        rendered_report=base_report,
-    )
-    rendered_report = _append_root_cause_section(base_report, root_cause)
     result = {
         "ok": True,
         "db_key": resolved_db_key,
         "summary": response.summary,
-        "rendered_report": rendered_report,
+        "rendered_report": base_report,
         "supporting_data": supporting,
-        "root_cause": root_cause,
         "trace_path": _extract_trace_path(supporting),
         "report_path": _extract_report_path(supporting),
     }
-    return _attach_correlation(result, db_key=resolved_db_key, context="blocking")
+    return result
 
 
 def run_ai_investigation(

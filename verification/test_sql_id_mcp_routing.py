@@ -58,11 +58,13 @@ class SqlIdMcpRoutingTests(unittest.TestCase):
     def test_active_sessions_report_includes_sql_id_analysis_hint(self) -> None:
         report = PlannerAgent()._render_active_sessions_response(
             active_rows=[{"sid": 11, "sql_id": "daxra005nhfz2"}],
-            blocking_rows=[],
-            resource_rows=[],
         )
-        self.assertIn("To analyze a SQL_ID, ask:", report)
-        self.assertIn("`analyze sql_id <sql_id>`", report)
+        self.assertNotIn("## SQL_ID Analysis Hint", report)
+        self.assertTrue(
+            report.rstrip().endswith(
+                "Tip: analyze SQL with `analyze sql_id <sql_id>` (sample: daxra005nhfz2)."
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -530,6 +530,8 @@ def render_health_snapshot_report(snapshot: HealthSnapshot) -> str:
     ]
     moved_interpretive_notes: list[str] = []
     for section in snapshot.health_sections:
+        if str(section.name or "").strip() == "DBA Trust Checks":
+            continue
         inline_notes, interpretive_notes = _partition_section_notes(section.name, section.notes)
         moved_interpretive_notes.extend(interpretive_notes)
         lines.extend(_render_health_section(section, notes_override=inline_notes))

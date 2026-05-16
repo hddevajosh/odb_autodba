@@ -63,6 +63,7 @@ class SessionRow(BaseModel):
     username: str | None = None
     status: str | None = None
     sql_id: str | None = None
+    sql_text: str | None = None
     prev_sql_id: str | None = None
     action: str | None = None
     event: str | None = None

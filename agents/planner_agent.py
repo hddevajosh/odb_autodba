@@ -6,7 +6,7 @@ import re
 from odb_autodba.db.connection import db_key_context
 from odb_autodba.db.health_checks import collect_health_snapshot
 from odb_autodba.db.query_deep_dive import build_sql_id_deep_dive_report, extract_queryid_from_text
-from odb_autodba.db.running_sessions import get_blocking_chains, get_running_sessions_inventory, get_top_session_resource_candidates
+from odb_autodba.db.running_sessions import get_running_sessions_inventory
 from odb_autodba.history.service import HistoryService
 from odb_autodba.models.schemas import PlannerResponse
 from odb_autodba.rag.trace_store import append_health_run_trace
@@ -54,41 +54,17 @@ class PlannerAgent:
             if looks_like_active_sessions_request(user_text or ""):
                 try:
                     active_rows = [row.model_dump(mode="json") for row in get_running_sessions_inventory()]
-                    blocking_rows = [row.model_dump(mode="json") for row in get_blocking_chains()]
-                    resource_rows = get_top_session_resource_candidates(limit=10)
-                    body = self._render_active_sessions_response(
-                        active_rows=active_rows,
-                        blocking_rows=blocking_rows,
-                        resource_rows=resource_rows,
-                    )
+                    body = self._render_active_sessions_response(active_rows=active_rows)
                     return PlannerResponse(
                         mode="focused_domain_report",
                         summary=f"Active session snapshot collected ({len(active_rows)} active session(s)).",
                         body_markdown=body,
                         recommendations=[
                             "Use `Analyze SQL_ID <sql_id>` on top active SQL to deep dive plan and wait behavior.",
-                            "Investigate blockers first if blocking chains are present.",
                         ],
                         supporting_data={
                             "active_sessions": {
                                 "active_count": len(active_rows),
-                                "blocking_count": len(blocking_rows),
-                                "blocking_critical_count": sum(
-                                    1
-                                    for row in blocking_rows
-                                    if str((row or {}).get("blocking_severity") or "").upper() == "CRITICAL"
-                                ),
-                                "blocking_warning_count": sum(
-                                    1
-                                    for row in blocking_rows
-                                    if str((row or {}).get("blocking_severity") or "").upper() == "WARNING"
-                                ),
-                                "blocking_info_count": sum(
-                                    1
-                                    for row in blocking_rows
-                                    if str((row or {}).get("blocking_severity") or "").upper() == "INFO"
-                                ),
-                                "resource_candidates_count": len(resource_rows),
                             }
                         },
                     )
@@ -417,13 +393,13 @@ class PlannerAgent:
             return []
         return [{"metric": key, "value": value} for key, value in payload.items()]
 
-    def _render_active_sessions_response(self, *, active_rows: list[dict], blocking_rows: list[dict], resource_rows: list[dict]) -> str:
+    def _render_active_sessions_response(self, *, active_rows: list[dict]) -> str:
         sql_ids: list[str] = []
         seen: set[str] = set()
-        for row in active_rows + blocking_rows + resource_rows:
+        for row in active_rows:
             if not isinstance(row, dict):
                 continue
-            for key in ("sql_id", "blocker_sql_id", "blocked_sql_id"):
+            for key in ("sql_id",):
                 value = str(row.get(key) or "").strip().lower()
                 if not value or value in {"-", "n/a", "none"} or value in seen:
                     continue
@@ -433,47 +409,56 @@ class PlannerAgent:
                     break
             if len(sql_ids) >= 5:
                 break
+        sql_hint = "Tip: analyze SQL with `analyze sql_id <sql_id>`."
+        if sql_ids:
+            sql_hint = f"Tip: analyze SQL with `analyze sql_id <sql_id>` (sample: {', '.join(sql_ids)})."
         lines = [
             "# Active Sessions",
             "",
             f"- Active sessions: {len(active_rows)}",
-            f"- Blocking chains: {len(blocking_rows)}",
-            f"- High-resource session candidates: {len(resource_rows)}",
-            "",
-            "## SQL_ID Analysis Hint",
-            "To analyze a SQL_ID, ask: `analyze sql_id <sql_id>`",
-            (
-                "Sample SQL_IDs from this snapshot: " + ", ".join(sql_ids)
-                if sql_ids
-                else "Sample SQL_IDs from this snapshot: none detected."
-            ),
             "",
             "## Active Session Inventory",
-            self._fixed_table_from_rows(active_rows[:25]) if active_rows else "No active user sessions were found.",
+            self._fixed_table_from_rows(
+                active_rows[:25],
+                preferred_keys=["inst_id", "sid", "serial_num", "username", "status", "sql_id", "sql_text", "event"],
+                key_widths={"sql_text": 48},
+            )
+            if active_rows
+            else "No active user sessions were found.",
             "",
-            "## Blocking Chains",
-            self._fixed_table_from_rows(blocking_rows[:20]) if blocking_rows else "No blocking chains were found.",
-            "",
-            "## Top Session Resource Candidates",
-            self._fixed_table_from_rows(resource_rows[:20]) if resource_rows else "No high-resource session candidates were found.",
+            sql_hint,
         ]
         return "\n".join(lines)
 
-    def _fixed_table_from_rows(self, rows):
+    def _fixed_table_from_rows(
+        self,
+        rows,
+        preferred_keys: list[str] | None = None,
+        key_widths: dict[str, int] | None = None,
+    ):
         if not rows:
             return ""
-        keys = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for key, value in row.items():
-                if key not in keys and value not in (None, "", []):
-                    keys.append(key)
+        if preferred_keys:
+            keys = [
+                key
+                for key in preferred_keys
+                if any(isinstance(row, dict) and row.get(key) not in (None, "", []) for row in rows)
+            ]
+        else:
+            keys = []
+        if not keys:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for key, value in row.items():
+                    if key not in keys and value not in (None, "", []):
+                        keys.append(key)
+                    if len(keys) >= 8:
+                        break
                 if len(keys) >= 8:
                     break
-            if len(keys) >= 8:
-                break
-        columns = [(key, 18) for key in keys]
+        width_map = key_widths or {}
+        columns = [(key, int(width_map.get(key, 18))) for key in keys[:8]]
         return self._fixed_table(rows, columns)
 
     def _fixed_table(self, rows, columns):

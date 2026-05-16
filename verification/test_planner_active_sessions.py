@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from odb_autodba.agents.planner_agent import PlannerAgent
-from odb_autodba.models.schemas import BlockingChain, SessionRow
+from odb_autodba.models.schemas import SessionRow
 
 
 class PlannerActiveSessionsTests(unittest.TestCase):
@@ -17,32 +17,13 @@ class PlannerActiveSessionsTests(unittest.TestCase):
                 username="APP",
                 status="ACTIVE",
                 sql_id="abc12345",
+                sql_text="select * from app.orders where order_id = :1",
                 event="db file sequential read",
                 wait_class="User I/O",
                 module="app",
             )
         ]
-        blocking = [
-            BlockingChain(
-                blocker_inst_id=1,
-                blocker_sid=10,
-                blocker_serial=20,
-                blocker_user="APP",
-                blocked_inst_id=1,
-                blocked_sid=42,
-                blocked_serial=11,
-                blocked_user="APP",
-            )
-        ]
-        resource_rows = [{"inst_id": 1, "sid": 42, "sql_id": "abc12345", "cpu_seconds": 12.3}]
-
         with patch("odb_autodba.agents.planner_agent.get_running_sessions_inventory", return_value=active), patch(
-            "odb_autodba.agents.planner_agent.get_blocking_chains",
-            return_value=blocking,
-        ), patch(
-            "odb_autodba.agents.planner_agent.get_top_session_resource_candidates",
-            return_value=resource_rows,
-        ), patch(
             "odb_autodba.agents.planner_agent.collect_health_snapshot",
             side_effect=AssertionError("health snapshot should not be used"),
         ):
@@ -52,6 +33,10 @@ class PlannerActiveSessionsTests(unittest.TestCase):
         self.assertIn("Active session snapshot collected", response.summary)
         self.assertIn("# Active Sessions", response.body_markdown)
         self.assertIn("Active Session Inventory", response.body_markdown)
+        self.assertIn("sql_text", response.body_markdown)
+        self.assertIn("select * from app.orders", response.body_markdown)
+        self.assertNotIn("Blocking Chains", response.body_markdown)
+        self.assertNotIn("Top Session Resource Candidates", response.body_markdown)
         self.assertEqual((response.supporting_data.get("active_sessions") or {}).get("active_count"), 1)
 
 

@@ -131,10 +131,10 @@ class ServiceLayerTests(unittest.TestCase):
             payload = get_active_sessions(db_key="prod_db")
         self.assertTrue(payload.get("ok"))
         self.assertEqual(payload.get("db_key"), "prod_db")
-        self.assertIn("## 🔴 Root Cause Analysis", payload.get("rendered_report") or "")
-        self.assertIn("## 🔴 Root Cause Correlation", payload.get("rendered_report") or "")
-        self._assert_root_cause_shape(payload)
-        self._assert_correlation_shape(payload)
+        self.assertNotIn("## 🔴 Root Cause Analysis", payload.get("rendered_report") or "")
+        self.assertNotIn("## 🔴 Root Cause Correlation", payload.get("rendered_report") or "")
+        self.assertNotIn("root_cause", payload)
+        self.assertNotIn("correlation", payload)
         self.assertIn("active_sessions", payload.get("supporting_data") or {})
 
     def test_investigation_returns_structured_output(self) -> None:
