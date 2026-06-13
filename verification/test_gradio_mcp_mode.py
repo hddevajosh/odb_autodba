@@ -148,6 +148,94 @@ class GradioMcpModeTests(unittest.TestCase):
         planner_mock.assert_not_called()
         self.assertIn("# Historical CPU Consumption", out[0][-1]["content"])
 
+    def test_local_health_prompt_uses_service_layer_not_planner_direct(self) -> None:
+        service_payload = {
+            "ok": True,
+            "db_key": "prod__db__1521__pdb1",
+            "summary": "Oracle health check completed.",
+            "rendered_report": (
+                "# Oracle AutoDBA Report\n\n"
+                "## Root Cause Analysis\n\n"
+                "- cause\n\n"
+                "## Root Cause Correlation\n\n"
+                "- corr"
+            ),
+            "supporting_data": {"review": {"status": "approved", "guardrail_checks_passed": [], "guardrail_checks_failed": []}},
+            "remediation_proposal": {
+                "title": "Observe only",
+                "action_type": "observe",
+                "severity": "low",
+                "rationale": "diagnostic",
+                "target": {},
+            },
+            "remediation_review": {
+                "status": "approved",
+                "rationale": "safe",
+                "guardrail_checks_passed": [],
+                "guardrail_checks_failed": [],
+            },
+        }
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=False), patch(
+            "odb_autodba.frontend.gradio_app.run_health_check",
+            return_value=service_payload,
+        ) as health_mock, patch(
+            "odb_autodba.frontend.gradio_app._process_user_message_with_response"
+        ) as planner_mock:
+            out = gradio_app._submit_message("Check health of my Oracle database", [], {}, "prod__db__1521__pdb1")
+        health_mock.assert_called_once_with(db_key="prod__db__1521__pdb1")
+        planner_mock.assert_not_called()
+        assistant = out[0][-1]["content"]
+        self.assertIn("# Oracle AutoDBA Report", assistant)
+        self.assertIn("## Root Cause Analysis", assistant)
+        self.assertIn("## Root Cause Correlation", assistant)
+
+    def test_local_active_sessions_prompt_uses_service_layer(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=False), patch(
+            "odb_autodba.frontend.gradio_app.get_active_sessions",
+            return_value={
+                "ok": True,
+                "db_key": "prod__db__1521__pdb1",
+                "rendered_report": "# Active Sessions",
+                "supporting_data": {},
+            },
+        ) as sessions_mock, patch(
+            "odb_autodba.frontend.gradio_app._process_user_message_with_response"
+        ) as planner_mock:
+            out = gradio_app._submit_message("show active sessions", [], {}, "prod__db__1521__pdb1")
+        sessions_mock.assert_called_once_with(db_key="prod__db__1521__pdb1")
+        planner_mock.assert_not_called()
+        self.assertIn("# Active Sessions", out[0][-1]["content"])
+
+    def test_local_history_prompt_uses_service_layer(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=False), patch(
+            "odb_autodba.frontend.gradio_app.get_historical_trends",
+            return_value={
+                "ok": True,
+                "db_key": "prod__db__1521__pdb1",
+                "rendered_report": "# Oracle Historical Trend Analysis",
+                "supporting_data": {},
+            },
+        ) as history_mock, patch(
+            "odb_autodba.frontend.gradio_app._process_user_message_with_response"
+        ) as planner_mock:
+            out = gradio_app._submit_message("Show historical trends", [], {}, "prod__db__1521__pdb1")
+        history_mock.assert_called_once_with(db_key="prod__db__1521__pdb1")
+        planner_mock.assert_not_called()
+        self.assertIn("# Oracle Historical Trend Analysis", out[0][-1]["content"])
+
+    def test_local_unknown_prompt_keeps_planner_fallback(self) -> None:
+        with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=False), patch(
+            "odb_autodba.frontend.gradio_app._process_user_message_with_response",
+            return_value=gradio_app.PlannerResponse(
+                mode="focused_domain_report",
+                summary="Fallback",
+                body_markdown="# Planner Fallback",
+            ),
+        ) as planner_mock:
+            out = gradio_app._submit_message("why is db slow lately?", [], {}, "prod__db__1521__pdb1")
+        planner_mock.assert_called_once_with("why is db slow lately?", db_key="prod__db__1521__pdb1")
+        self.assertIn("# Planner Fallback", out[0][-1]["content"])
+
     def test_mcp_investigation_displays_inline_report_text_when_present(self) -> None:
         hydrated = (
             "# AI Investigation Result\n\n"
@@ -187,7 +275,7 @@ class GradioMcpModeTests(unittest.TestCase):
             "odb_autodba.frontend.gradio_app.mcp_fallback_local_enabled", return_value=True
         ), patch("odb_autodba.frontend.gradio_app._submit_message_local", return_value=local):
             out = gradio_app._submit_message("Check health", [], {}, "prod__db__1521__pdb1")
-        self.assertIn("fallback", out[0][-1]["content"].lower())
+        self.assertIn("Execution mode: local fallback after MCP failure.", out[0][-1]["content"])
 
     def test_mcp_unreachable_fallback_false_returns_friendly_error(self) -> None:
         with patch("odb_autodba.frontend.gradio_app.use_mcp_enabled", return_value=True), patch(

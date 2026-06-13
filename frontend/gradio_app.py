@@ -27,6 +27,9 @@ from odb_autodba.services.autodba_service import (
     analyze_blocking_sessions,
     analyze_sql_id,
     answer_history_metric_question,
+    get_active_sessions,
+    get_historical_trends,
+    run_health_check,
 )
 from odb_autodba.tools.action_executor import execute_remediation_action
 from odb_autodba.tools.action_history import append_action_record, load_action_records, render_action_history_markdown
@@ -159,6 +162,64 @@ def _execution_mode_label() -> str:
 
 def _process_user_message_with_response(message: str, db_key: str | None = None) -> PlannerResponse:
     return _planner().handle_message(message, db_key=db_key)
+
+
+def _service_report_text(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("rendered_report", "report_markdown", "body_markdown"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    fallback = str(payload.get("summary") or payload.get("error") or "").strip()
+    return fallback or "No rendered report or summary was provided."
+
+
+def _local_service_response(
+    *,
+    message: str,
+    payload: dict[str, Any],
+    chat_state: list[dict],
+    selected_db_key: str | None,
+    route: str | None,
+    target_label: str | None,
+):
+    assistant_content = _service_report_text(payload)
+    if route == "health" and target_label:
+        assistant_content = _with_target_notice(assistant_content, target_label)
+    if "active session" in (message or "").lower():
+        assistant_content += "\n\nIf you want deep SQL analysis, use command: `Analyze SQL_ID <sql_id>` to analyze."
+    chat_state = chat_state + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": assistant_content},
+    ]
+    response_payload = _ensure_guardrail_review_payload(dict(payload))
+    response_state = {"response": response_payload}
+    review_data = (response_payload.get("supporting_data") or {}).get("review")
+    proposal = _proposal_from_response_payload(response_payload)
+    review = _review_from_response_payload(response_payload)
+    LOGGER.info(
+        "local_service_state db_key=%s route=%s action_id=%s action_type=%s guardrail_decision=%s guardrail_passed=%s guardrail_failed=%s",
+        (selected_db_key or "").strip(),
+        route or "unknown",
+        _proposal_action_id(proposal),
+        proposal.action_type if proposal else "",
+        str(review.status).lower() if review else "unknown",
+        len(review.guardrail_checks_passed) if review else 0,
+        len(review.guardrail_checks_failed) if review else 0,
+    )
+    remediation_md = render_remediation_card_markdown(proposal, review_data)
+    execute_interactive = _execute_enabled_for_payload(response_payload, confirmed=False)
+    return (
+        chat_state,
+        chat_state,
+        response_state,
+        remediation_md,
+        False,
+        gr.update(interactive=execute_interactive),
+        "",
+        _action_history_markdown(selected_db_key),
+    )
 
 
 def _dynamic_target_defaults() -> dict[str, str]:
@@ -412,7 +473,7 @@ def _submit_message_local(
     if sql_id:
         try:
             payload = analyze_sql_id(sql_id, db_key=selected_db_key)
-            assistant_content = str(payload.get("rendered_report") or "").strip() or str(payload.get("summary") or "")
+            assistant_content = _service_report_text(payload)
         except Exception as exc:
             assistant_content = (
                 f"# SQL_ID Analysis\n\n"
@@ -435,54 +496,63 @@ def _submit_message_local(
         )
     if route == "history_metric_question":
         payload = answer_history_metric_question(message, db_key=selected_db_key)
-        assistant_content = str(payload.get("rendered_report") or "").strip() or str(payload.get("summary") or "")
-        chat_state = chat_state + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": assistant_content},
-        ]
-        return (
-            chat_state,
-            chat_state,
-            {},
-            "No remediation proposed for the current analysis.",
-            False,
-            gr.update(interactive=False),
-            "",
-            _action_history_markdown(selected_db_key),
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
         )
     if route == "awr_analysis":
         payload = analyze_awr(message, db_key=selected_db_key)
-        assistant_content = str(payload.get("rendered_report") or "").strip() or str(payload.get("summary") or "")
-        chat_state = chat_state + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": assistant_content},
-        ]
-        return (
-            chat_state,
-            chat_state,
-            {},
-            "No remediation proposed for the current analysis.",
-            False,
-            gr.update(interactive=False),
-            "",
-            _action_history_markdown(selected_db_key),
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
         )
     if route == "blocking_analysis":
         payload = analyze_blocking_sessions(db_key=selected_db_key)
-        assistant_content = str(payload.get("rendered_report") or "").strip() or str(payload.get("summary") or "")
-        chat_state = chat_state + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": assistant_content},
-        ]
-        return (
-            chat_state,
-            chat_state,
-            {},
-            "No remediation proposed for the current analysis.",
-            False,
-            gr.update(interactive=False),
-            "",
-            _action_history_markdown(selected_db_key),
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
+        )
+    if route == "health":
+        payload = run_health_check(db_key=selected_db_key)
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
+        )
+    if route == "sessions":
+        payload = get_active_sessions(db_key=selected_db_key)
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
+        )
+    if route == "history":
+        payload = get_historical_trends(db_key=selected_db_key)
+        return _local_service_response(
+            message=message,
+            payload=payload,
+            chat_state=chat_state,
+            selected_db_key=selected_db_key,
+            route=route,
+            target_label=target_label,
         )
     response = _process_user_message_with_response(message, db_key=selected_db_key)
     assistant_content = render_planner_response(response)
@@ -533,7 +603,11 @@ def _submit_investigation(message: str, chat_state: list[dict], selected_db_key:
                 {"role": "user", "content": f"Investigate: {message}"},
                 {
                     "role": "assistant",
-                    "content": f"{render_investigation_final_report(report)}\n\n{mcp_limitation}",
+                    "content": (
+                        f"{render_investigation_final_report(report)}\n\n"
+                        "Execution mode: local fallback because MCP could not use the selected target.\n\n"
+                        f"{mcp_limitation}"
+                    ),
                 },
             ]
             return chat_state, chat_state
@@ -581,7 +655,11 @@ def _submit_investigation(message: str, chat_state: list[dict], selected_db_key:
                 {"role": "user", "content": f"Investigate: {message}"},
                 {
                     "role": "assistant",
-                    "content": f"{render_investigation_final_report(report)}\n\nMCP job failed/unavailable; used local direct mode fallback.",
+                    "content": (
+                        f"{render_investigation_final_report(report)}\n\n"
+                        "Execution mode: local fallback after MCP failure.\n\n"
+                        "MCP job failed/unavailable; used local direct mode fallback."
+                    ),
                 },
             ]
             return chat_state, chat_state
@@ -1171,7 +1249,11 @@ def _submit_message_with_target(
                 if chatbot and isinstance(chatbot[-1], dict):
                     chatbot[-1] = {
                         **chatbot[-1],
-                        "content": f"{chatbot[-1].get('content')}\n\n{mcp_limitation}",
+                        "content": (
+                            f"{chatbot[-1].get('content')}\n\n"
+                            "Execution mode: local fallback because MCP could not use the selected target.\n\n"
+                            f"{mcp_limitation}"
+                        ),
                     }
                 return (
                     chatbot,
@@ -1211,7 +1293,11 @@ def _submit_message_with_target(
                 if chatbot and isinstance(chatbot[-1], dict):
                     chatbot[-1] = {
                         **chatbot[-1],
-                        "content": f"{chatbot[-1].get('content')}\n\nMCP job failed/unavailable; used local direct mode fallback.",
+                        "content": (
+                            f"{chatbot[-1].get('content')}\n\n"
+                            "Execution mode: local fallback after MCP failure.\n\n"
+                            "MCP job failed/unavailable; used local direct mode fallback."
+                        ),
                     }
                 return (
                     chatbot,
